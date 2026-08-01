@@ -134,20 +134,25 @@ necessary:
 ```powershell
 codex mcp add micro-emu-rp2040 `
   -- npm.cmd --silent --prefix D:\Programming\micro-emu `
-  run bridge:run -- -- --port COM7 --mcp
+  run bridge:run -- -- --port auto --mcp
 ```
 
 The two `--` separators after `bridge:run` are intentional: one is consumed by
 npm and the other is forwarded to the bridge script. The explicit `--mcp` flag
 starts the STDIO MCP transport.
 
+Use port auto for MCP. The bridge resolves the present VID_303A&PID_8360 CDC
+interface through the existing PnP detector, so a COM-number change after
+reconnecting the RP2040 does not require editing Codex configuration. If the
+CDC session drops, the MCP process keeps its STDIO session open and retries
+discovery and the firmware ping with backoff.
 The same server can be configured directly in `%USERPROFILE%\.codex\config.toml`
 or in a trusted project-scoped `.codex/config.toml`:
 
 ```toml
 [mcp_servers.micro_emu_rp2040]
 command = "npm.cmd"
-args = ["--silent", "run", "bridge:run", "--", "--", "--port", "COM7", "--mcp"]
+args = ["--silent", "run", "bridge:run", "--", "--", "--port", "auto", "--mcp"]
 cwd = "D:\\Programming\\micro-emu"
 startup_timeout_sec = 20
 tool_timeout_sec = 60
@@ -160,7 +165,7 @@ by `Get-Command npm.cmd`, or run the compiled bridge directly:
 ```toml
 [mcp_servers.micro_emu_rp2040]
 command = "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe"
-args = ["--port", "COM7", "--mcp"]
+args = ["--port", "auto", "--mcp"]
 cwd = "D:\\Programming\\micro-emu"
 ```
 

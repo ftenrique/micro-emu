@@ -1,13 +1,98 @@
 use crate::wire::{Frame, FrameDecoder};
+#[cfg(windows)]
+use serde_json::Value;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(windows)]
+use std::process::Command;
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
+
+pub const AUTO_PORT: &str = "auto";
 
 pub enum SerialEvent {
     Frame(Frame),
     ProtocolError(String),
     Disconnected(String),
+}
+
+pub fn resolve_port(requested: &str) -> Result<String, String> {
+    if !requested.eq_ignore_ascii_case(AUTO_PORT) {
+        return Ok(requested.to_owned());
+    }
+
+    #[cfg(windows)]
+    {
+        return discover_rp2040_port();
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err("automatic RP2040 port discovery is only supported on Windows".to_owned())
+    }
+}
+
+#[cfg(windows)]
+fn discover_rp2040_port() -> Result<String, String> {
+    let script = discovery_script_path().ok_or_else(|| {
+        "could not locate tools/find-rp2040-port.ps1 for automatic port discovery".to_owned()
+    })?;
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script)
+        .output()
+        .map_err(|error| format!("could not run RP2040 port discovery: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "RP2040 port discovery failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = stdout.trim_start_matches('\u{feff}');
+    let result: Value = serde_json::from_str(json)
+        .map_err(|error| format!("RP2040 port discovery returned invalid JSON: {error}"))?;
+    let ports = result
+        .get("ports")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("port").and_then(Value::as_str))
+        .filter(|port| !port.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    match ports.as_slice() {
+        [port] => Ok(port.clone()),
+        [] => Err("no present RP2040 CDC port found (VID_303A&PID_8360)".to_owned()),
+        _ => Err(format!(
+            "multiple present RP2040 CDC ports found: {}",
+            ports.join(", ")
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn discovery_script_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("tools").join("find-rp2040-port.ps1"));
+    }
+    if let Ok(current_exe) = std::env::current_exe() {
+        for ancestor in current_exe.ancestors() {
+            candidates.push(ancestor.join("tools").join("find-rp2040-port.ps1"));
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 pub fn open(port: &str) -> Result<File, String> {
@@ -136,4 +221,19 @@ fn set_dtr(file: &File) -> Result<(), String> {
 #[cfg(not(windows))]
 fn set_dtr(_file: &File) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_port_is_preserved() {
+        assert_eq!(resolve_port("COM12").unwrap(), "COM12");
+    }
+
+    #[test]
+    fn auto_port_marker_is_stable() {
+        assert_eq!(AUTO_PORT, "auto");
+    }
 }

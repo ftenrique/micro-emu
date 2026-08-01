@@ -81,7 +81,7 @@ Register it with Codex CLI. Replace `COM7` and the project path as needed:
 ```powershell
 codex mcp add micro-emu-rp2040 `
   -- npm.cmd --silent --prefix D:\Programming\micro-emu `
-  run bridge:run -- -- --port COM7 --mcp
+  run bridge:run -- -- --port auto --mcp
 ```
 
 The equivalent `%USERPROFILE%\.codex\config.toml` entry is:
@@ -89,7 +89,7 @@ The equivalent `%USERPROFILE%\.codex\config.toml` entry is:
 ```toml
 [mcp_servers.micro_emu_rp2040]
 command = "npm.cmd"
-args = ["--silent", "run", "bridge:run", "--", "--", "--port", "COM7", "--mcp"]
+args = ["--silent", "run", "bridge:run", "--", "--", "--port", "auto", "--mcp"]
 cwd = "D:\\Programming\\micro-emu"
 startup_timeout_sec = 20
 tool_timeout_sec = 60
@@ -102,7 +102,7 @@ to the compiled executable:
 ```toml
 [mcp_servers.micro_emu_rp2040]
 command = "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe"
-args = ["--port", "COM7", "--mcp"]
+args = ["--port", "auto", "--mcp"]
 cwd = "D:\\Programming\\micro-emu"
 ```
 
@@ -118,6 +118,9 @@ The available MCP tools are `bridge_status`, `emit_key`,
 `send_codex_message`, `set_thread_status`, `set_rgb_config`, and
 `device_status`.
 
+Use port auto for MCP. It resolves the present RP2040 CDC interface by VID/PID
+and refreshes the resolved COM port after a disconnect. The bridge keeps the
+MCP STDIO process alive while it retries the serial handshake with backoff.
 Codex owns the MCP bridge process. Do not run another bridge instance against
 the same COM port at the same time.
 ## Optional hardware validation

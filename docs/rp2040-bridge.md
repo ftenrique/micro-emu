@@ -180,8 +180,11 @@ AJAZZ.
 - El descriptor USB completo de 275 bytes sigue pendiente de captura.
 - No se emulan todavía cadenas o descriptores adicionales no publicados.
 - El protocolo CDC no transporta prompts ni cuerpos de tareas en los logs.
-- Una desconexión finaliza el proceso; la reconexión automática se añadirá
-  después de superar la puerta de reconocimiento de ChatGPT.
+- El modo MCP acepta port auto, detecta el CDC presente por VID/PID y reintenta
+  el handshake si el puerto se desconecta o cambia de nÃºmero.
+- La sesiÃ³n STDIO de MCP permanece abierta durante la reconexiÃ³n; las llamadas
+  recibidas mientras el hardware vuelve a estar disponible reciben un error
+  transitorio y Codex puede reintentarlas.
 
 
 ## Ejecución estable

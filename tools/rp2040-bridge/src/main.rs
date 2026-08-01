@@ -13,6 +13,7 @@ use std::env;
 use std::fs::File;
 use std::io::{self, IsTerminal};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 struct Options {
@@ -36,12 +37,12 @@ fn parse_options() -> Result<Options, String> {
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--" => {},
+            "--" => {}
             "--port" => {
                 port = Some(
                     arguments
                         .next()
-                        .ok_or_else(|| "--port requires COMx".to_owned())?,
+                        .ok_or_else(|| "--port requires COMx or auto".to_owned())?,
                 );
             }
             "--no-ajazz" => no_ajazz = true,
@@ -53,7 +54,7 @@ fn parse_options() -> Result<Options, String> {
                     .map_err(|_| "--listen must be an integer".to_owned())?;
                 if seconds > 3600 {
                     return Err(
-                        "--listen must be from 0 to 3600 seconds (0 = unlimited)".to_owned(),
+                        "--listen must be from 0 to 3600 seconds (0 = unlimited)".to_owned()
                     );
                 }
                 listen_seconds = (seconds > 0).then_some(seconds);
@@ -79,7 +80,7 @@ fn parse_options() -> Result<Options, String> {
             "--legacy" => legacy = true,
             "--help" | "-h" => {
                 println!(
-                    "rp2040-bridge --port COMx [--no-ajazz] [--listen 0..3600 (0=unlimited)] \
+                    "rp2040-bridge --port COMx|auto [--no-ajazz] [--listen 0..3600 (0=unlimited)] \
                      [--emit AG00] [--emit-after 0..3600] [--mcp|--legacy]"
                 );
                 std::process::exit(0);
@@ -248,9 +249,14 @@ fn codex_report_trace(report: &[u8], sequence: u16) -> Value {
     })
 }
 
+struct SerialRuntime {
+    writer: Option<File>,
+    receiver: Receiver<SerialEvent>,
+    reader_thread: Option<JoinHandle<()>>,
+}
+
 struct BridgeRuntime {
-    writer: File,
-    serial_rx: Receiver<SerialEvent>,
+    serial: SerialRuntime,
     sequence: u16,
     ajazz: Option<AjazzDevice>,
     firmware: String,
@@ -259,30 +265,62 @@ struct BridgeRuntime {
     radial_state: RadialState,
 }
 
-fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
-    let mut writer = serial::open(&options.port)?;
+fn open_serial_runtime(
+    requested_port: &str,
+) -> Result<(SerialRuntime, String, String, u16), String> {
+    let port = serial::resolve_port(requested_port)?;
+    let mut writer = serial::open(&port)?;
     let reader = writer
         .try_clone()
         .map_err(|error| format!("could not clone RP2040 port: {error}"))?;
-    let (serial_tx, serial_rx) = mpsc::channel();
-    let _reader_thread = serial::start_reader(reader, serial_tx);
+    let (serial_tx, receiver) = mpsc::channel();
+    let reader_thread = serial::start_reader(reader, serial_tx);
     let mut sequence = 1_u16;
-    let firmware = wait_for_firmware(&serial_rx, &mut writer, &mut sequence)?;
+    let firmware = wait_for_firmware(&receiver, &mut writer, &mut sequence)?;
+    Ok((
+        SerialRuntime {
+            writer: Some(writer),
+            receiver,
+            reader_thread: Some(reader_thread),
+        },
+        firmware,
+        port,
+        sequence,
+    ))
+}
+
+fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
+    let (serial, firmware, port, sequence) = open_serial_runtime(&options.port)?;
     let ajazz = if options.no_ajazz {
         None
     } else {
         Some(AjazzDevice::connect()?)
     };
     Ok(BridgeRuntime {
-        writer,
-        serial_rx,
+        serial,
         sequence,
         ajazz,
         firmware,
-        port: options.port.clone(),
+        port,
         codex_decoder: CodexDecoder::default(),
         radial_state: RadialState::default(),
     })
+}
+
+fn replace_serial_runtime(bridge: &mut BridgeRuntime, options: &Options) -> Result<(), String> {
+    drop(bridge.serial.writer.take());
+    if let Some(reader_thread) = bridge.serial.reader_thread.take() {
+        let _ = reader_thread.join();
+    }
+    let (serial, firmware, port, sequence) = open_serial_runtime(&options.port)?;
+    bridge.serial.writer = serial.writer;
+    bridge.serial.receiver = serial.receiver;
+    bridge.serial.reader_thread = serial.reader_thread;
+    bridge.sequence = sequence;
+    bridge.firmware = firmware;
+    bridge.port = port;
+    bridge.codex_decoder = CodexDecoder::default();
+    Ok(())
 }
 
 fn bridge_status(bridge: &BridgeRuntime, mode: &str) -> Value {
@@ -315,13 +353,21 @@ fn run_legacy(options: Options) -> Result<(), String> {
                 .as_deref()
                 .expect("emit deadline requires a key");
             for message in messages_for_synthetic_key(key)? {
-                send_codex_message(&mut bridge.writer, &mut bridge.sequence, &message)?;
+                send_codex_message(
+                    bridge
+                        .serial
+                        .writer
+                        .as_mut()
+                        .expect("serial writer is present"),
+                    &mut bridge.sequence,
+                    &message,
+                )?;
                 std::thread::sleep(Duration::from_millis(50));
             }
             println!("{}", json!({"type": "synthetic-event", "key": key}));
             synthetic_emit_at = None;
         }
-        while let Ok(event) = bridge.serial_rx.try_recv() {
+        while let Ok(event) = bridge.serial.receiver.try_recv() {
             match event {
                 SerialEvent::Frame(frame) if frame.frame_type == FrameType::CodexOutputReport => {
                     println!("{}", codex_report_trace(&frame.payload, frame.sequence));
@@ -331,16 +377,19 @@ fn run_legacy(options: Options) -> Result<(), String> {
                                 process_codex_message(
                                     message,
                                     &mut bridge.ajazz,
-                                    &mut bridge.writer,
+                                    bridge
+                                        .serial
+                                        .writer
+                                        .as_mut()
+                                        .expect("serial writer is present"),
                                     &mut bridge.sequence,
                                     true,
                                 )?;
                             }
                         }
-                        Err(error) => println!(
-                            "{}",
-                            json!({"type": "codex-report-error", "error": error})
-                        ),
+                        Err(error) => {
+                            println!("{}", json!({"type": "codex-report-error", "error": error}))
+                        }
                     }
                 }
                 SerialEvent::Frame(frame) if frame.frame_type == FrameType::Log => println!(
@@ -360,8 +409,19 @@ fn run_legacy(options: Options) -> Result<(), String> {
         if let Some(device) = &mut bridge.ajazz {
             for event in device.poll(25)? {
                 if let Some(message) = bridge.radial_state.event(event) {
-                    send_codex_message(&mut bridge.writer, &mut bridge.sequence, &message)?;
-                    println!("{}", json!({"type": "ajazz-event", "event": format!("{event:?}")}));
+                    send_codex_message(
+                        bridge
+                            .serial
+                            .writer
+                            .as_mut()
+                            .expect("serial writer is present"),
+                        &mut bridge.sequence,
+                        &message,
+                    )?;
+                    println!(
+                        "{}",
+                        json!({"type": "ajazz-event", "event": format!("{event:?}")})
+                    );
                 }
             }
         } else {
@@ -379,7 +439,15 @@ fn tool_arguments(request: &Value) -> &Value {
 
 fn send_tool_message(bridge: &mut BridgeRuntime, message: &Value) -> Result<usize, String> {
     let reports = frame_json(message)?.len();
-    send_codex_message(&mut bridge.writer, &mut bridge.sequence, message)?;
+    send_codex_message(
+        bridge
+            .serial
+            .writer
+            .as_mut()
+            .expect("serial writer is present"),
+        &mut bridge.sequence,
+        message,
+    )?;
     Ok(reports)
 }
 
@@ -399,11 +467,20 @@ fn call_tool(request: &Value, bridge: &mut BridgeRuntime) -> Value {
                 Ok(messages) => {
                     let count = messages.len();
                     let send_result = messages.iter().try_for_each(|message| {
-                        send_codex_message(&mut bridge.writer, &mut bridge.sequence, message)?;
+                        send_codex_message(
+                            bridge
+                                .serial
+                                .writer
+                                .as_mut()
+                                .expect("serial writer is present"),
+                            &mut bridge.sequence,
+                            message,
+                        )?;
                         std::thread::sleep(Duration::from_millis(50));
                         Ok::<(), String>(())
                     });
-                    send_result.map(|_| mcp::text_result(json!({"key": key, "messagesSent": count})))
+                    send_result
+                        .map(|_| mcp::text_result(json!({"key": key, "messagesSent": count})))
                 }
                 Err(error) => Err(error),
             }
@@ -458,7 +535,11 @@ fn handle_mcp_request(request: Value, bridge: &mut BridgeRuntime) -> Result<(), 
     let id = request.get("id");
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         if id.is_some() {
-            mcp::write_message(&mcp::error_response(id, -32600, "MCP request requires method"))?;
+            mcp::write_message(&mcp::error_response(
+                id,
+                -32600,
+                "MCP request requires method",
+            ))?;
         }
         return Ok(());
     };
@@ -479,11 +560,52 @@ fn handle_mcp_request(request: Value, bridge: &mut BridgeRuntime) -> Result<(), 
         "tools/list" => mcp::tools(),
         "tools/call" => call_tool(&request, bridge),
         _ => {
-            mcp::write_message(&mcp::error_response(Some(id), -32601, format!("unknown MCP method: {method}")))?;
+            mcp::write_message(&mcp::error_response(
+                Some(id),
+                -32601,
+                format!("unknown MCP method: {method}"),
+            ))?;
             return Ok(());
         }
     };
     mcp::write_message(&mcp::response(id, result))
+}
+
+fn reconnect_mcp(
+    bridge: &mut BridgeRuntime,
+    options: &Options,
+    input: &Receiver<Result<Value, String>>,
+) -> Result<bool, String> {
+    let mut delay = Duration::from_millis(500);
+    loop {
+        while let Ok(message) = input.try_recv() {
+            match message {
+                Ok(request) => {
+                    if let Some(id) = request.get("id") {
+                        mcp::write_message(&mcp::error_response(
+                            Some(id),
+                            -32001,
+                            "RP2040 bridge is reconnecting",
+                        ))?;
+                    }
+                }
+                Err(error) if error == "MCP client closed stdin" => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+
+        match replace_serial_runtime(bridge, options) {
+            Ok(()) => {
+                eprintln!("{}", bridge_status(bridge, "mcp-reconnected"));
+                return Ok(true);
+            }
+            Err(error) => {
+                eprintln!("RP2040 bridge reconnect pending: {error}");
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
 }
 
 fn run_mcp(options: Options) -> Result<(), String> {
@@ -498,7 +620,9 @@ fn run_mcp(options: Options) -> Result<(), String> {
                 Err(error) => return Err(error),
             }
         }
-        while let Ok(event) = bridge.serial_rx.try_recv() {
+
+        let mut disconnected = None;
+        while let Ok(event) = bridge.serial.receiver.try_recv() {
             match event {
                 SerialEvent::Frame(frame) if frame.frame_type == FrameType::CodexOutputReport => {
                     match bridge.codex_decoder.feed(&frame.payload) {
@@ -507,7 +631,11 @@ fn run_mcp(options: Options) -> Result<(), String> {
                                 process_codex_message(
                                     message,
                                     &mut bridge.ajazz,
-                                    &mut bridge.writer,
+                                    bridge
+                                        .serial
+                                        .writer
+                                        .as_mut()
+                                        .expect("serial writer is present"),
                                     &mut bridge.sequence,
                                     false,
                                 )?;
@@ -521,13 +649,32 @@ fn run_mcp(options: Options) -> Result<(), String> {
                 }
                 SerialEvent::Frame(_) => {}
                 SerialEvent::ProtocolError(error) => eprintln!("bridge protocol error: {error}"),
-                SerialEvent::Disconnected(error) => return Err(error),
+                SerialEvent::Disconnected(error) => {
+                    disconnected = Some(error);
+                    break;
+                }
             }
         }
+        if let Some(error) = disconnected {
+            eprintln!("RP2040 bridge disconnected: {error}");
+            if !reconnect_mcp(&mut bridge, &options, &input)? {
+                return Ok(());
+            }
+            continue;
+        }
+
         if let Some(device) = &mut bridge.ajazz {
             for event in device.poll(25)? {
                 if let Some(message) = bridge.radial_state.event(event) {
-                    send_codex_message(&mut bridge.writer, &mut bridge.sequence, &message)?;
+                    send_codex_message(
+                        bridge
+                            .serial
+                            .writer
+                            .as_mut()
+                            .expect("serial writer is present"),
+                        &mut bridge.sequence,
+                        &message,
+                    )?;
                 }
             }
         } else {
@@ -553,7 +700,10 @@ mod tests {
     #[test]
     fn rpc_ack_preserves_vendor_call_id() {
         let message = json!({"method": "v.oai.rgbcfg", "params": {}, "id": 893});
-        assert_eq!(rpc_ack_response(&message), Some(json!({"result": true, "id": 893})));
+        assert_eq!(
+            rpc_ack_response(&message),
+            Some(json!({"result": true, "id": 893}))
+        );
     }
 
     #[test]
@@ -569,4 +719,3 @@ fn main() {
         std::process::exit(1);
     }
 }
-
