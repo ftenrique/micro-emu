@@ -1,0 +1,64 @@
+{
+  "$schema": "../schema/device-profile.schema.json",
+  "profileVersion": 1,
+  "status": "pending-hardware",
+  "model": "AKP03",
+  "revision": null,
+  "vendorId": null,
+  "productId": null,
+  "knownFamilyIdentities": [
+    {
+      "model": "AKP03",
+      "vendorId": "0x0300",
+      "productId": "0x1001",
+      "source": "https://github.com/4ndv/opendeck-akp03"
+    },
+    {
+      "model": "AKP03E",
+      "vendorId": "0x0300",
+      "productId": "0x1002",
+      "source": "https://github.com/4ndv/opendeck-akp03"
+    },
+    {
+      "model": "AKP03R",
+      "vendorId": "0x0300",
+      "productId": "0x1003",
+      "source": "https://github.com/4ndv/opendeck-akp03"
+    },
+    {
+      "model": "AKP03E rev. 2",
+      "vendorId": "0x0300",
+      "productId": "0x3002",
+      "source": "https://github.com/4ndv/opendeck-akp03"
+    },
+    {
+      "model": "AKP03R rev. 2",
+      "vendorId": "0x0300",
+      "productId": "0x3003",
+      "source": "https://github.com/4ndv/opendeck-akp03"
+    }
+  ],
+  "firmware": null,
+  "transport": "USB",
+  "interfaces": [],
+  "inputReportBytes": null,
+  "outputReportBytes": null,
+  "featureReportBytes": null,
+  "lcd": {
+    "keyCount": 6,
+    "width": null,
+    "height": null,
+    "pixelFormat": null,
+    "writeProtocolVerified": false
+  },
+  "controls": {
+    "lcdKeys": 6,
+    "encoders": null,
+    "buttons": null
+  },
+  "oemSoftwareClosedDuringProbe": null,
+  "canOpenFromUserProcess": null,
+  "canReadInputs": null,
+  "canUpdateOneDisplay": null,
+  "evidence": []
+}

@@ -1,0 +1,17 @@
+artifacts/
+node_modules/
+coverage/
+graphify-out/
+*.log
+*.user
+*.suo
+.vs/
+**/bin/
+**/obj/
+**/target/
+driver/**/x64/
+driver/**/Debug/
+driver/**/Release/
+firmware/**/build/
+.toolchains/
+.codex/

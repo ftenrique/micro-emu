@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "picoSdk": {
+    "version": "2.3.0",
+    "repository": "https://github.com/raspberrypi/pico-sdk.git",
+    "commit": "98a542c1a62fb549ffb5d66a3e5892b06276b670"
+  },
+  "tinyUsb": {
+    "repository": "https://github.com/hathach/tinyusb.git",
+    "commit": "86ad6e56c1700e85f1c5678607a762cfe3aa2f47"
+  },
+  "picotool": {
+    "version": "2.3.0",
+    "repository": "https://github.com/raspberrypi/picotool.git",
+    "commit": "6f6458d792b93685a11423b244a585eaa99eafcf"
+  },
+  "armGnuToolchain": {
+    "version": "14.2.rel1",
+    "url": "https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-mingw-w64-x86_64-arm-none-eabi.zip",
+    "sha256": "f074615953f76036e9a51b87f6577fdb4ed8e77d3322a6f68214e92e7859888f"
+  }
+}

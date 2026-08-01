@@ -1,0 +1,25 @@
+Codex Micro / AJAZZ interoperability prototype
+================================================
+
+This project includes independently adapted interoperability information from:
+
+FreeMicro
+Copyright (c) 2026 Eli Benveniste
+https://github.com/eliBenven/freemicro
+Licensed under the MIT License.
+
+The following interface facts are attributed to FreeMicro:
+
+- Codex Micro USB VID 0x303A and PID 0x8360.
+- Vendor Usage Page 0xFF00, Report ID 6, and 63-byte reports.
+- The observed 216-byte HID report descriptor in
+  protocol/descriptors/codex-micro-report-descriptor.hex.
+- The [0x02][length][data] framing, CRLF message terminator, JSON-RPC method
+  names, event identifiers, lighting fields, and known effect values.
+
+The FreeMicro license text is reproduced in
+docs/third-party/freemicro-LICENSE.txt.
+
+Codex, Codex Micro, ChatGPT, AJAZZ, and AKP03 may be trademarks of their
+respective owners. This project is independent and is not endorsed by OpenAI,
+AJAZZ, or the FreeMicro authors.

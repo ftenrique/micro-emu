@@ -1,0 +1,15 @@
+{
+  "description": "Compact device.status request, CRLF terminated and zero padded",
+  "message": {
+    "m": "device.status",
+    "id": 1
+  },
+  "payloadUtf8": "{\"m\":\"device.status\",\"id\":1}",
+  "usbReportsHex": [
+    "021e7b226d223a226465766963652e737461747573222c226964223a317d0d0a00000000000000000000000000000000000000000000000000000000000000"
+  ],
+  "bleReportsHex": [
+    "06021e7b226d223a226465766963652e737461747573222c226964223a317d0d0a00000000000000000000000000000000000000000000000000000000000000"
+  ],
+  "provenance": "Derived from the framing contract documented by FreeMicro; independently serialized by this project."
+}

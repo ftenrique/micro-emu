@@ -1,0 +1,41 @@
+{
+  "name": "codex-micro-ajazz",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Codex Micro protocol core, AJAZZ adapter and RP2040 USB bridge.",
+  "exports": {
+    ".": "./protocol/index.js",
+    "./descriptors": "./protocol/descriptors/index.js"
+  },
+  "scripts": {
+    "test": "node --test tests/protocol/*.test.js",
+    "test:protocol": "node --test tests/protocol/*.test.js",
+    "inventory": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/inventory-windows.ps1",
+    "preflight": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/preflight-device-test.ps1",
+    "verify:descriptor": "node tools/verify-descriptor.mjs",
+    "descriptor:generate:rp2040": "node tools/generate-rp2040-descriptor.mjs",
+    "doctor:build": "dotnet build tools/ajazz-doctor/AjazzDoctor.csproj -c Release",
+    "doctor": "dotnet run --project tools/ajazz-doctor/AjazzDoctor.csproj -c Release --no-build -- --vid 0300 --pid 3002",
+    "hardware:build": "cargo build --manifest-path tools/ajazz-hardware-test/Cargo.toml --release --offline",
+    "hardware:test": "cargo run --manifest-path tools/ajazz-hardware-test/Cargo.toml --release --offline --",
+    "rp2040:setup": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/setup-rp2040-toolchain.ps1",
+    "monitor:build": "dotnet build tools/protocol-monitor/ProtocolMonitor.csproj -c Release",
+    "monitor:self-test": "dotnet run --project tools/protocol-monitor/ProtocolMonitor.csproj -c Release --no-build -- --self-test",
+    "rp2040:check": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/check-rp2040-toolchain.ps1",
+    "rp2040:build": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-rp2040.ps1",
+    "rp2040:verify": "node tools/verify-rp2040-artifact.mjs",
+    "rp2040:flash": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/flash-rp2040.ps1",
+    "rp2040:port": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/find-rp2040-port.ps1",
+    "firmware:host-test": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-firmware-host.ps1",
+    "bridge:build": "cargo build --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline",
+    "bridge:test": "cargo test --manifest-path tools/rp2040-bridge/Cargo.toml --offline",
+    "bridge:run": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline --",
+    "driver:check": "powershell -NoProfile -ExecutionPolicy Bypass -File driver/vhf-spike/scripts/check-toolchain.ps1",
+    "driver:build": "powershell -NoProfile -ExecutionPolicy Bypass -File driver/vhf-spike/scripts/build-driver.ps1"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
