@@ -1,18 +1,18 @@
 # Deployment
 
-Este proyecto se despliega como una combinación de firmware para una placa
-RP2040 y un puente Rust que se ejecuta en Windows. No hay un servidor web ni
-un paquete npm que publicar.
+This project is deployed as a combination of firmware for an RP2040 board and
+a Rust bridge that runs on Windows. There is no web server or npm package to
+publish.
 
-## Requisitos
+## Requirements
 
-- Windows PowerShell 5.1 o posterior.
-- Node.js 20 o posterior.
-- Rust 1.85 o posterior con Cargo.
-- Una placa RP2040 Zero y el cable USB.
-- Aproximadamente 1,3 GiB libres en `D:` para el toolchain aislado del RP2040.
+- Windows PowerShell 5.1 or later.
+- Node.js 20 or later.
+- Rust 1.85 or later with Cargo.
+- An RP2040 Zero board and a USB cable.
+- Approximately 1.3 GiB of free space on `D:` for the isolated RP2040 toolchain.
 
-## Desde un checkout limpio
+## From a clean checkout
 
 ```powershell
 git clone https://github.com/ftenrique/micro-emu.git
@@ -23,13 +23,13 @@ npm run bridge:test
 npm run bridge:build
 ```
 
-Los comandos anteriores validan el núcleo del protocolo y compilan el puente
-sin tocar el dispositivo.
+These commands validate the protocol core and build the bridge without
+accessing the device.
 
-## Compilar y verificar el firmware
+## Build and verify the firmware
 
-La primera ejecución instala el toolchain RP2040 dentro de la ubicación
-aislada definida por el proyecto:
+The first setup run installs the RP2040 toolchain in the isolated project
+location:
 
 ```powershell
 npm run rp2040:setup
@@ -38,59 +38,58 @@ npm run rp2040:build
 npm run rp2040:verify
 ```
 
-`rp2040:verify` comprueba que el artefacto generado corresponde al descriptor
-esperado. No continúes si falla alguna de estas comprobaciones.
+`rp2040:verify` checks that the generated artifact matches the expected
+descriptor. Do not continue if any of these checks fail.
 
-## Flashear la placa
+## Flash the board
 
-1. Desconecta la placa RP2040.
-2. Mantén pulsado el botón `BOOTSEL` mientras conectas el USB.
-3. Ejecuta `npm run rp2040:flash` y sigue las indicaciones del script.
-4. Desconecta y vuelve a conectar la placa normalmente.
-5. Ejecuta `npm run rp2040:port` para localizar el puerto serie.
+1. Disconnect the RP2040 board.
+2. Hold the `BOOTSEL` button while connecting the USB cable.
+3. Run `npm run rp2040:flash` and follow the script prompts.
+4. Disconnect and reconnect the board normally.
+5. Run `npm run rp2040:port` to locate the serial port.
 
-El script de flasheo está pensado para una placa RP2040 Zero. Comprueba el
-modelo y la unidad detectada antes de confirmar cualquier escritura.
+The flashing script targets an RP2040 Zero board. Check the board model and the
+detected drive before confirming any write operation.
 
-## Ejecutar el puente
+## Run the bridge
 
-Inicia el puente usando el puerto serie devuelto por el paso anterior:
+Start the bridge using the serial port reported by the previous step:
 
 ```powershell
 npm run bridge:run -- -- --port COM7
 ```
 
-Reemplaza `COM7` por el puerto real. El puente presenta la interfaz HID+CDC y
-transporta los mensajes del protocolo; debe permanecer abierto durante la
-sesión de prueba.
+Replace `COM7` with the actual port. The bridge exposes the HID+CDC interface
+and transports protocol messages; it must remain open during the test session.
 
-## Validación física opcional
+## Optional hardware validation
 
-Con el software OEM del teclado cerrado, valida el dispositivo AJAZZ con:
+With the keyboard OEM software closed, validate the AJAZZ device with:
 
 ```powershell
 npm run hardware:test -- --listen 45
 ```
 
-Este comando escribe seis cuadros en las LCD y lee teclas, encoders y
-pulsaciones. Es una prueba de hardware y no debe ejecutarse contra un
-dispositivo que no sea el perfil compatible documentado.
+This command writes six tiles to the LCDs and reads keys, encoders, and encoder
+clicks. It is a hardware test and should not be run against a device other than
+the documented compatible profile.
 
-## Problemas frecuentes
+## Troubleshooting
 
-- **No aparece el puerto:** vuelve a conectar la placa en modo normal y
-  ejecuta `npm run rp2040:port` de nuevo.
-- **Falla la compilación del firmware:** ejecuta `npm run rp2040:check` y
-  repite `npm run rp2040:setup` si falta el toolchain.
-- **El teclado no reacciona:** cierra el software OEM y confirma que se usa la
-  colección vendor `MI_00 / FFA0:0001`, descrita en
+- **The port does not appear:** reconnect the board in normal mode and run
+  `npm run rp2040:port` again.
+- **The firmware build fails:** run `npm run rp2040:check` and repeat
+  `npm run rp2040:setup` if the toolchain is missing.
+- **The keyboard does not react:** close the OEM software and confirm that the
+  vendor collection `MI_00 / FFA0:0001` is being used, as described in
   [docs/hardware-profile.md](docs/hardware-profile.md).
-- **El puente no conecta:** verifica el puerto, el cable USB y que ningún otro
-  proceso tenga abierta la conexión serie.
+- **The bridge does not connect:** check the port, USB cable, and that no other
+  process has opened the serial connection.
 
-## Publicar una nueva versión
+## Publish a new version
 
-Antes de crear un tag, ejecuta todas las comprobaciones locales:
+Run all local checks before creating a tag:
 
 ```powershell
 npm test
@@ -103,6 +102,6 @@ git tag v0.1.0
 git push origin main --follow-tags
 ```
 
-Actualiza el número de versión del tag cuando corresponda. Los artefactos de
-hardware y los inventarios locales no deben incluirse en el commit salvo que
-estén expresamente documentados y sean reproducibles.
+Update the tag version when appropriate. Hardware artifacts and local inventory
+files should not be included in a commit unless they are explicitly documented
+and reproducible.
