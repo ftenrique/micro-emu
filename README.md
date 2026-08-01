@@ -114,6 +114,77 @@ For a firmware-only smoke test without the AJAZZ connected:
 npm run bridge:run -- -- --port COM7 --no-ajazz --listen 120 --emit AG00 --emit-after 10
 ```
 
+## Integrate with Codex through MCP
+
+The bridge includes a local Model Context Protocol (MCP) server over STDIO.
+Codex starts the bridge as a child process, sends JSON-RPC messages through
+standard input, and receives tool results through standard output. No HTTP
+server or additional network port is required.
+
+Build the bridge first and identify the RP2040 CDC port:
+
+```powershell
+npm run bridge:build
+npm run rp2040:port
+```
+
+Register the bridge with Codex CLI. Replace `COM7` and the project path when
+necessary:
+
+```powershell
+codex mcp add micro-emu-rp2040 `
+  -- npm.cmd --silent --prefix D:\Programming\micro-emu `
+  run bridge:run -- -- --port COM7 --mcp
+```
+
+The two `--` separators after `bridge:run` are intentional: one is consumed by
+npm and the other is forwarded to the bridge script. The explicit `--mcp` flag
+starts the STDIO MCP transport.
+
+The same server can be configured directly in `%USERPROFILE%\.codex\config.toml`
+or in a trusted project-scoped `.codex/config.toml`:
+
+```toml
+[mcp_servers.micro_emu_rp2040]
+command = "npm.cmd"
+args = ["--silent", "run", "bridge:run", "--", "--", "--port", "COM7", "--mcp"]
+cwd = "D:\\Programming\\micro-emu"
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+enabled = true
+```
+
+If `npm.cmd` is not available in Codex's `PATH`, use the absolute path returned
+by `Get-Command npm.cmd`, or run the compiled bridge directly:
+
+```toml
+[mcp_servers.micro_emu_rp2040]
+command = "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe"
+args = ["--port", "COM7", "--mcp"]
+cwd = "D:\\Programming\\micro-emu"
+```
+
+Verify the registration with:
+
+```powershell
+codex mcp list
+```
+
+In the Codex TUI, use `/mcp` to inspect the connected server. The Codex app,
+CLI, and IDE extension share the same MCP configuration on the host. Once
+connected, ask Codex to call `bridge_status` first. The bridge exposes these
+tools:
+
+- `bridge_status` — report firmware, serial port, and AJAZZ connection state.
+- `emit_key` — emit a synthetic Codex Micro key press/release.
+- `send_codex_message` — send one Codex Micro JSON message.
+- `set_thread_status` — update the six AJAZZ LCD status slots.
+- `set_rgb_config` — send `v.oai.rgbcfg` configuration.
+- `device_status` — request `device.status` from the RP2040 firmware.
+
+When Codex owns the MCP process, do not start a second bridge process against
+the same COM port. Close any manually started `bridge:run` process before
+using the MCP configuration.
 ## Implemented functionality
 
 - Codex Micro HID reports with Report ID 6 and 63-byte input, output, and

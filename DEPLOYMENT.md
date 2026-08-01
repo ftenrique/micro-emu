@@ -63,6 +63,63 @@ npm run bridge:run -- -- --port COM7
 Replace `COM7` with the actual port. The bridge exposes the HID+CDC interface
 and transports protocol messages; it must remain open during the test session.
 
+## Connect Codex through MCP
+
+The bridge also provides a local Model Context Protocol (MCP) server over
+STDIO. Codex launches it as a child process and communicates through standard
+input and output; no HTTP server or additional network port is needed.
+
+Build the bridge and find the RP2040 CDC port:
+
+```powershell
+npm run bridge:build
+npm run rp2040:port
+```
+
+Register it with Codex CLI. Replace `COM7` and the project path as needed:
+
+```powershell
+codex mcp add micro-emu-rp2040 `
+  -- npm.cmd --silent --prefix D:\Programming\micro-emu `
+  run bridge:run -- -- --port COM7 --mcp
+```
+
+The equivalent `%USERPROFILE%\.codex\config.toml` entry is:
+
+```toml
+[mcp_servers.micro_emu_rp2040]
+command = "npm.cmd"
+args = ["--silent", "run", "bridge:run", "--", "--", "--port", "COM7", "--mcp"]
+cwd = "D:\\Programming\\micro-emu"
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+enabled = true
+```
+
+If Codex cannot find `npm.cmd`, use its absolute path or point the configuration
+to the compiled executable:
+
+```toml
+[mcp_servers.micro_emu_rp2040]
+command = "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe"
+args = ["--port", "COM7", "--mcp"]
+cwd = "D:\\Programming\\micro-emu"
+```
+
+Verify the server:
+
+```powershell
+codex mcp list
+```
+
+In the Codex TUI, `/mcp` shows the active server. Ask Codex to call
+`bridge_status` first; it reports the firmware, COM port, and AJAZZ connection.
+The available MCP tools are `bridge_status`, `emit_key`,
+`send_codex_message`, `set_thread_status`, `set_rgb_config`, and
+`device_status`.
+
+Codex owns the MCP bridge process. Do not run another bridge instance against
+the same COM port at the same time.
 ## Optional hardware validation
 
 With the keyboard OEM software closed, validate the AJAZZ device with:
