@@ -57,7 +57,7 @@ modelo y la unidad detectada antes de confirmar cualquier escritura.
 Inicia el puente usando el puerto serie devuelto por el paso anterior:
 
 ```powershell
-npm run bridge:run -- --port COM7
+npm run bridge:run -- -- --port COM7
 ```
 
 Reemplaza `COM7` por el puerto real. El puente presenta la interfaz HID+CDC y

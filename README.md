@@ -1,89 +1,150 @@
-# Codex Micro para AJAZZ AKP03
+# Codex Micro for AJAZZ AKP03
 
-Prototipo local para comprobar si un AJAZZ AKP03 puede actuar como interfaz
-física de Codex Micro ante ChatGPT para Windows mediante un dispositivo USB
-RP2040.
+A working Windows integration that connects an AJAZZ AKP03E to Codex Micro
+through a low-cost RP2040 USB bridge. The project includes the portable
+protocol implementation, the Windows user-space bridge, the RP2040 HID+CDC
+firmware, hardware validation tools, and reproducible build scripts.
 
-El repositorio implementa las fases 0 y 1 y deja materializada la primera
-prueba de Fase 2:
+The supported path is:
 
-- **Fase 0:** contrato, inventario reproducible de Windows y perfil de hardware.
-- **Fase 1:** núcleo portable del protocolo, descriptor observado, modelos de
-  mensajes, fixtures, pruebas y probador físico AKP03E.
-- **Fase 2:** firmware RP2040 HID+CDC y puente Rust en espacio de usuario. El
-  spike KMDF/VHF se conserva como investigación, pero ya no es la ruta
-  recomendada.
+```text
+AJAZZ AKP03E  <->  Rust user-space bridge  <->  USB CDC  <->  RP2040
+                                                        <->  USB HID
+                                                        <->  Windows / ChatGPT
+```
 
-La ruta RP2040 no instala controladores propios, no necesita `testsigning` y no
-modifica Secure Boot.
+The implementation is operational with an AJAZZ AKP03E revision 2
+(`0300:3002`) and an RP2040 Zero-class board.
 
-## Requisitos
+## Why a low-cost RP2040 board is required
 
-- Windows PowerShell 5.1 para el inventario.
-- Node.js 20 o posterior para la biblioteca y las pruebas.
-- Rust 1.85 o posterior para el probador físico y el puente.
-- Aproximadamente 1,3 GiB libres en `D:` para el toolchain RP2040 aislado.
+The RP2040 is the USB adapter between the AJAZZ device and Windows. Its
+firmware presents the Codex Micro HID interface and a CDC channel for the
+user-space bridge, while the bridge handles the AJAZZ vendor HID interface.
 
-No hay dependencias npm.
+This inexpensive board is deliberate:
 
-## Uso rápido
+- Windows uses its built-in HID and USB CDC class drivers.
+- The project does not require a custom kernel-mode driver or a signed driver
+  package.
+- Secure Boot remains enabled and Windows test-signing mode is not required.
+- Firmware updates are reversible through the board's `BOOTSEL` mass-storage
+  mode and affect only the RP2040.
+- The hardware cost is kept low because no dedicated USB controller or custom
+  Windows hardware is needed.
+
+The repository contains an optional driver implementation for compatibility
+research, but it is not required for the working RP2040 path.
+
+## Requirements
+
+- Windows with PowerShell 5.1 or later.
+- Node.js 20 or later.
+- Rust 1.85 or later with Cargo.
+- A low-cost RP2040 Zero or compatible RP2040 board.
+- An AJAZZ AKP03E revision 2 (`0300:3002`) for the physical integration.
+- A USB data cable and approximately 1.3 GiB available on `D:` for the pinned
+  RP2040 toolchain.
+
+No npm dependencies are required.
+
+## Quick start
+
+From a clean checkout:
 
 ```powershell
+git clone https://github.com/ftenrique/micro-emu.git
+Set-Location .\micro-emu
+
 npm test
 npm run verify:descriptor
-npm run inventory
-npm run preflight
-npm run doctor:build
-npm run doctor
-npm run hardware:test -- --listen 45
 npm run bridge:test
 npm run bridge:build
+npm run firmware:host-test
 npm run rp2040:setup
 npm run rp2040:check
 npm run rp2040:build
 npm run rp2040:verify
 ```
 
-Los comandos `driver:*` y `monitor:*` se conservan sólo para reproducir la
-ruta VHF histórica.
+The RP2040 firmware artifact is generated at:
 
-Para guardar un inventario que se pueda adjuntar a un informe:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File .\tools\inventory-windows.ps1 `
-  -OutputPath .\artifacts\inventory.json
+```text
+firmware\rp2040-zero\build\codex_micro_rp2040_bridge.uf2
 ```
 
-El inventario es de solo lectura: no abre interfaces HID, no instala
-controladores y no escribe en el dispositivo. `hardware:test` sí escribe seis
-cuadros numerados en las LCD y captura los controles; debe ejecutarse con el
-software OEM cerrado.
+## Flash the RP2040
 
-## Deployment
+1. Disconnect the RP2040 board.
+2. Hold `BOOTSEL` while connecting the USB cable.
+3. Wait for the `RPI-RP2` drive to appear.
+4. Run:
 
-El procedimiento completo para preparar el puente Rust, compilar y verificar
-el firmware RP2040, flashearlo y ponerlo en marcha está en
-[DEPLOYMENT.md](DEPLOYMENT.md).
+   ```powershell
+   npm run rp2040:flash
+   ```
 
-Resumen mínimo:
+5. Disconnect and reconnect the board normally.
+6. Find the CDC port:
+
+   ```powershell
+   npm run rp2040:port
+   ```
+
+The flash script validates the UF2 image and requires exactly one `RPI-RP2`
+drive before copying. It changes only the firmware on the RP2040 and does not
+modify Windows boot configuration, drivers, or Secure Boot.
+
+## Run the bridge
+
+Close the official AJAZZ software before starting the bridge. Replace `COM7`
+with the port reported by `npm run rp2040:port`:
 
 ```powershell
-npm test
-npm run bridge:build
-npm run rp2040:setup
-npm run rp2040:build
-npm run rp2040:verify
-npm run rp2040:flash
-npm run rp2040:port
-npm run bridge:run -- --port COM7
+npm run bridge:run -- -- --port COM7
 ```
 
-Sustituye `COM7` por el puerto que indique `npm run rp2040:port`. El primer
-flasheo requiere conectar la placa RP2040 en modo BOOTSEL; el puente no es un
-servicio de producción y debe ejecutarse en el equipo que tenga conectada la
-placa.
-## API del protocolo
+The bridge opens the AJAZZ vendor collection `MI_00 / FFA0:0001`, translates
+its controls into Codex Micro events, and forwards the protocol through the
+RP2040 HID interface.
+
+For a firmware-only smoke test without the AJAZZ connected:
+
+```powershell
+npm run bridge:run -- -- --port COM7 --no-ajazz --listen 120 --emit AG00 --emit-after 10
+```
+
+## Implemented functionality
+
+- Codex Micro HID reports with Report ID 6 and 63-byte input, output, and
+  feature reports.
+- USB CDC transport between the bridge and the RP2040, including framing,
+  sequence numbers, payload lengths, and CRC16-CCITT.
+- Portable JavaScript framing, message validation, fixtures, and safe handling
+  of unknown methods.
+- `device.status`, `v.oai.thstatus`, `v.oai.rgbcfg`, radial controls, and key
+  events.
+- Six LCD keys mapped to `AG00`-`AG05`.
+- Lower keys mapped to `ACT06`-`ACT08`.
+- Encoder rotation, direction, and click events.
+- AJAZZ LCD updates with color, brightness, and clearing behavior.
+- Correlated ACK responses for RPC calls and no responses for notifications.
+- Windows inventory, preflight, hardware diagnostics, firmware host tests, and
+  reproducible RP2040 artifact verification.
+
+## Hardware validation
+
+With the AJAZZ software closed, run the physical test utility:
+
+```powershell
+npm run hardware:test -- --listen 45
+```
+
+The test writes six numbered tiles to the LCDs and reads the keys, encoders,
+and encoder clicks. The verified hardware profile is documented in
+[docs/hardware-profile.md](docs/hardware-profile.md).
+
+## Protocol API
 
 ```js
 import {
@@ -98,41 +159,37 @@ const reports = frameJson(createRequest("device.status", undefined, 1));
 const decoder = new FrameDecoder();
 for (const report of reports) {
   const { messages, errors } = decoder.feed(report);
-  // Procesar mensajes y registrar errores sin detener el proceso.
+  // Process messages and record errors without stopping the transport.
 }
 
 const press = keyEvent("AG00", 1, 0);
 ```
 
-Cada informe USB mide 63 bytes. Sus dos primeros bytes son opcode `0x02` y
-longitud; hasta 61 bytes de datos siguen a la cabecera. El mensaje lógico
-termina en CRLF y puede ocupar varios informes.
+## Documentation
 
-## Estado de viabilidad
+- [Deployment](DEPLOYMENT.md) — build, flash, run, validate, and publish.
+- [RP2040 bridge details](docs/rp2040-bridge.md) — firmware and transport
+  architecture.
+- [Hardware profile](docs/hardware-profile.md) — verified AJAZZ interface and
+  controls.
+- [Windows environment](docs/windows-environment.md) — inventory and system
+  diagnostics.
 
-La ruta física está **verificada** con un AJAZZ AKP03E rev. 2 `0300:3002`:
-escritura de las seis LCD y lectura de las nueve teclas, tres encoders y sus
-pulsaciones. El probador abre explícitamente la colección vendor
-`MI_00 / FFA0:0001`; abrir la interfaz de teclado `MI_01` produce falsos éxitos
-de escritura sin reacción del firmware.
+## Security model
 
-La viabilidad extremo a extremo con ChatGPT sigue **pendiente** hasta que:
+The portable protocol core does not access hardware, the network, or the
+filesystem. The recommended RP2040 path uses Windows inbox USB class drivers
+and does not install kernel code, alter Secure Boot, enable test signing, or
+modify the Windows driver store. Firmware flashing is isolated to the RP2040
+board.
 
-1. llegue la placa RP2040 Zero y se flashee el firmware;
-2. ChatGPT reconozca el HID físico y reaccione a `AG00`.
+## License and attribution
 
-Véanse [docs/hardware-profile.md](docs/hardware-profile.md),
-[docs/rp2040-bridge.md](docs/rp2040-bridge.md) y
-[docs/windows-environment.md](docs/windows-environment.md).
-El estado y los bloqueos observados están resumidos en
-[docs/phase2-feasibility-report.md](docs/phase2-feasibility-report.md).
+Project code is released under the [MIT License](LICENSE). Protocol and
+interoperability information adapted from FreeMicro is attributed in
+[NOTICE](NOTICE), with the original license reproduced at
+[docs/third-party/freemicro-LICENSE.txt](docs/third-party/freemicro-LICENSE.txt).
 
-## Seguridad
-
-El núcleo no accede a hardware, red o filesystem. No implementa llamadas a
-`sys.bootloader`, `fs.write`, `fs.writebin` ni `fs.delete`.
-
-## Licencia y atribución
-
-Código del proyecto bajo MIT. Las fuentes y condiciones de FreeMicro constan
-en [NOTICE](NOTICE).
+Codex, Codex Micro, ChatGPT, AJAZZ, and AKP03 may be trademarks of their
+respective owners. This project is independent and is not endorsed by OpenAI,
+AJAZZ, or the FreeMicro authors.
