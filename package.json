@@ -28,8 +28,10 @@
     "rp2040:flash": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/flash-rp2040.ps1",
     "rp2040:port": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/find-rp2040-port.ps1",
     "firmware:host-test": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-firmware-host.ps1",
+    "firmware:flash": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/flash-firmware.ps1",
     "bridge:build": "cargo build --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline",
     "bridge:test": "cargo test --manifest-path tools/rp2040-bridge/Cargo.toml --offline",
+    "bridge:release": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-bridge.ps1",
     "bridge:run": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline --",
     "driver:check": "powershell -NoProfile -ExecutionPolicy Bypass -File driver/vhf-spike/scripts/check-toolchain.ps1",
     "driver:build": "powershell -NoProfile -ExecutionPolicy Bypass -File driver/vhf-spike/scripts/build-driver.ps1"

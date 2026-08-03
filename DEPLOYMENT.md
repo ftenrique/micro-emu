@@ -120,7 +120,7 @@ The available MCP tools are `bridge_status`, `emit_key`,
 
 Use port auto for MCP. It resolves the present RP2040 CDC interface by VID/PID
 and refreshes the resolved COM port after a disconnect. The bridge keeps the
-MCP STDIO process alive while it retries the serial handshake with backoff.
+MCP STDIO process alive while it retries the serial handshake with backoff. After system resume, the firmware briefly re-enumerates the USB device so Codex receives a fresh HID arrival event.
 Codex owns the MCP bridge process. Do not run another bridge instance against
 the same COM port at the same time.
 ## Optional hardware validation

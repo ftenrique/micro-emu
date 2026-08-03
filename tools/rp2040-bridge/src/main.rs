@@ -5,16 +5,19 @@ mod serial;
 mod wire;
 
 use crate::ajazz::AjazzDevice;
-use crate::codex::{CodexDecoder, RadialState, frame_json, messages_for_synthetic_key};
+use crate::codex::{frame_json, messages_for_synthetic_key, CodexDecoder, RadialState};
 use crate::serial::SerialEvent;
 use crate::wire::{Frame, FrameType};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::env;
 use std::fs::File;
 use std::io::{self, IsTerminal};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Options {
     port: String,
@@ -263,6 +266,39 @@ struct BridgeRuntime {
     port: String,
     codex_decoder: CodexDecoder,
     radial_state: RadialState,
+    health: HealthCheck,
+}
+
+struct HealthCheck {
+    next_probe_at: Instant,
+    pending_deadline: Option<Instant>,
+}
+
+impl HealthCheck {
+    fn new() -> Self {
+        Self {
+            next_probe_at: Instant::now() + HEALTH_CHECK_INTERVAL,
+            pending_deadline: None,
+        }
+    }
+
+    fn due_at(&self, now: Instant) -> bool {
+        self.pending_deadline.is_none() && now >= self.next_probe_at
+    }
+
+    fn begin_at(&mut self, now: Instant) {
+        self.pending_deadline = Some(now + HEALTH_CHECK_TIMEOUT);
+    }
+
+    fn observe_status_at(&mut self, now: Instant) {
+        self.pending_deadline = None;
+        self.next_probe_at = now + HEALTH_CHECK_INTERVAL;
+    }
+
+    fn timed_out_at(&self, now: Instant) -> bool {
+        self.pending_deadline
+            .is_some_and(|deadline| now >= deadline)
+    }
 }
 
 fn open_serial_runtime(
@@ -304,22 +340,32 @@ fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
         port,
         codex_decoder: CodexDecoder::default(),
         radial_state: RadialState::default(),
+        health: HealthCheck::new(),
     })
 }
 
-fn replace_serial_runtime(bridge: &mut BridgeRuntime, options: &Options) -> Result<(), String> {
+fn replace_runtime(bridge: &mut BridgeRuntime, options: &Options) -> Result<(), String> {
     drop(bridge.serial.writer.take());
     if let Some(reader_thread) = bridge.serial.reader_thread.take() {
         let _ = reader_thread.join();
     }
+    // A system suspend can invalidate the AJAZZ HID handle without producing
+    // a CDC read error. Drop it before reopening both device paths.
+    bridge.ajazz.take();
+
     let (serial, firmware, port, sequence) = open_serial_runtime(&options.port)?;
-    bridge.serial.writer = serial.writer;
-    bridge.serial.receiver = serial.receiver;
-    bridge.serial.reader_thread = serial.reader_thread;
+    let ajazz = if options.no_ajazz {
+        None
+    } else {
+        Some(AjazzDevice::connect()?)
+    };
+    bridge.serial = serial;
+    bridge.ajazz = ajazz;
     bridge.sequence = sequence;
     bridge.firmware = firmware;
     bridge.port = port;
     bridge.codex_decoder = CodexDecoder::default();
+    bridge.health = HealthCheck::new();
     Ok(())
 }
 
@@ -594,7 +640,7 @@ fn reconnect_mcp(
             }
         }
 
-        match replace_serial_runtime(bridge, options) {
+        match replace_runtime(bridge, options) {
             Ok(()) => {
                 eprintln!("{}", bridge_status(bridge, "mcp-reconnected"));
                 return Ok(true);
@@ -606,6 +652,28 @@ fn reconnect_mcp(
             }
         }
     }
+}
+
+fn send_health_ping(bridge: &mut BridgeRuntime, now: Instant) -> Result<(), String> {
+    if !bridge.health.due_at(now) {
+        return Ok(());
+    }
+    let ping = Frame::new(
+        FrameType::Ping,
+        next_sequence(&mut bridge.sequence),
+        Vec::new(),
+    )
+    .map_err(|error| error.to_string())?;
+    serial::write_frame(
+        bridge
+            .serial
+            .writer
+            .as_mut()
+            .expect("serial writer is present"),
+        &ping,
+    )?;
+    bridge.health.begin_at(now);
+    Ok(())
 }
 
 fn run_mcp(options: Options) -> Result<(), String> {
@@ -628,7 +696,7 @@ fn run_mcp(options: Options) -> Result<(), String> {
                     match bridge.codex_decoder.feed(&frame.payload) {
                         Ok(messages) => {
                             for message in messages {
-                                process_codex_message(
+                                if let Err(error) = process_codex_message(
                                     message,
                                     &mut bridge.ajazz,
                                     bridge
@@ -638,11 +706,18 @@ fn run_mcp(options: Options) -> Result<(), String> {
                                         .expect("serial writer is present"),
                                     &mut bridge.sequence,
                                     false,
-                                )?;
+                                ) {
+                                    disconnected =
+                                        Some(format!("device processing failed: {error}"));
+                                    break;
+                                }
                             }
                         }
                         Err(error) => eprintln!("MCP bridge Codex report error: {error}"),
                     }
+                }
+                SerialEvent::Frame(frame) if frame.frame_type == FrameType::Status => {
+                    bridge.health.observe_status_at(Instant::now());
                 }
                 SerialEvent::Frame(frame) if frame.frame_type == FrameType::Log => {
                     eprintln!("RP2040: {}", String::from_utf8_lossy(&frame.payload));
@@ -654,6 +729,9 @@ fn run_mcp(options: Options) -> Result<(), String> {
                     break;
                 }
             }
+            if disconnected.is_some() {
+                break;
+            }
         }
         if let Some(error) = disconnected {
             eprintln!("RP2040 bridge disconnected: {error}");
@@ -663,22 +741,51 @@ fn run_mcp(options: Options) -> Result<(), String> {
             continue;
         }
 
-        if let Some(device) = &mut bridge.ajazz {
-            for event in device.poll(25)? {
-                if let Some(message) = bridge.radial_state.event(event) {
-                    send_codex_message(
-                        bridge
-                            .serial
-                            .writer
-                            .as_mut()
-                            .expect("serial writer is present"),
-                        &mut bridge.sequence,
-                        &message,
-                    )?;
+        let now = Instant::now();
+        if bridge.health.timed_out_at(now) {
+            eprintln!("RP2040 bridge health check timed out; reconnecting");
+            if !reconnect_mcp(&mut bridge, &options, &input)? {
+                return Ok(());
+            }
+            continue;
+        }
+        if let Err(error) = send_health_ping(&mut bridge, now) {
+            eprintln!("RP2040 bridge health check failed: {error}");
+            if !reconnect_mcp(&mut bridge, &options, &input)? {
+                return Ok(());
+            }
+            continue;
+        }
+
+        let ajazz_poll = if let Some(device) = &mut bridge.ajazz {
+            Some(device.poll(25))
+        } else {
+            None
+        };
+        match ajazz_poll {
+            Some(Ok(events)) => {
+                for event in events {
+                    if let Some(message) = bridge.radial_state.event(event) {
+                        send_codex_message(
+                            bridge
+                                .serial
+                                .writer
+                                .as_mut()
+                                .expect("serial writer is present"),
+                            &mut bridge.sequence,
+                            &message,
+                        )?;
+                    }
                 }
             }
-        } else {
-            std::thread::sleep(Duration::from_millis(25));
+            Some(Err(error)) => {
+                eprintln!("AJAZZ HID disconnected: {error}");
+                if !reconnect_mcp(&mut bridge, &options, &input)? {
+                    return Ok(());
+                }
+                continue;
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
         }
     }
 }
@@ -710,6 +817,24 @@ mod tests {
     fn notifications_do_not_receive_an_ack() {
         let message = json!({"m": "v.oai.rgbcfg", "p": {}});
         assert_eq!(rpc_ack_response(&message), None);
+    }
+
+    #[test]
+    fn health_check_requires_a_status_response() {
+        let now = Instant::now();
+        let mut health = HealthCheck {
+            next_probe_at: now,
+            pending_deadline: None,
+        };
+        assert!(health.due_at(now));
+
+        health.begin_at(now);
+        assert!(!health.due_at(now));
+        assert!(health.timed_out_at(now + HEALTH_CHECK_TIMEOUT));
+
+        health.observe_status_at(now);
+        assert!(!health.timed_out_at(now + HEALTH_CHECK_TIMEOUT));
+        assert!(!health.due_at(now));
     }
 }
 

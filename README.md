@@ -73,6 +73,22 @@ The RP2040 firmware artifact is generated at:
 firmware\rp2040-zero\build\codex_micro_rp2040_bridge.uf2
 ```
 
+For a single firmware update command, run:
+
+```powershell
+npm run firmware:flash
+```
+
+This runs the host test, builds and verifies the UF2, then flashes it to the
+single connected `RPI-RP2` BOOTSEL volume. Use
+`powershell -File tools/flash-firmware.ps1 -WhatIf` to validate without copying.
+
+To test and build the release bridge, run:
+
+```powershell
+npm run bridge:release
+```
+
 ## Flash the RP2040
 
 1. Disconnect the RP2040 board.
@@ -145,7 +161,7 @@ Use port auto for MCP. The bridge resolves the present VID_303A&PID_8360 CDC
 interface through the existing PnP detector, so a COM-number change after
 reconnecting the RP2040 does not require editing Codex configuration. If the
 CDC session drops, the MCP process keeps its STDIO session open and retries
-discovery and the firmware ping with backoff.
+discovery and the firmware ping with backoff. After system resume, the firmware briefly re-enumerates the USB device so Codex receives a fresh HID arrival event.
 The same server can be configured directly in `%USERPROFILE%\.codex\config.toml`
 or in a trusted project-scoped `.codex/config.toml`:
 
