@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -97,6 +97,22 @@ pub fn tools() -> Value {
                 }
             },
             {
+                "name": "set_display_context",
+                "description": "Update the optional Stream Deck + dashboard with project, task, model and effort metadata.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": {"type": ["string", "null"]},
+                        "task": {"type": ["string", "null"]},
+                        "model": {"type": ["string", "null"]},
+                        "effort": {"type": ["string", "null"]},
+                        "status": {"type": ["string", "null"]},
+                        "progress": {"type": ["integer", "null"], "minimum": 0, "maximum": 100}
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
                 "name": "set_rgb_config",
                 "description": "Send the v.oai.rgbcfg configuration to the bridge.",
                 "inputSchema": {
@@ -124,4 +140,3 @@ pub fn tool_error(message: impl Into<String>) -> Value {
     let message = message.into();
     json!({"isError": true, "content": [{"type": "text", "text": message}]})
 }
-

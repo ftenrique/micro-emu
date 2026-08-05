@@ -1,4 +1,5 @@
 use crate::codex::PhysicalEvent;
+use crate::controller::{ControllerKind, PhysicalController};
 use ajazz_sdk::{ImageFormat, ImageMirroring, ImageMode, ImageRotation, convert_image_with_format};
 use hidapi::{HidApi, HidDevice};
 use image::{DynamicImage, Rgb, RgbImage, imageops::rotate90};
@@ -269,6 +270,27 @@ impl AjazzDevice {
     }
 }
 
+impl PhysicalController for AjazzDevice {
+    fn kind(&self) -> ControllerKind {
+        ControllerKind::Ajazz
+    }
+    fn model(&self) -> &'static str {
+        "0300:3002"
+    }
+    fn serial(&self) -> Option<&str> {
+        None
+    }
+    fn poll(&mut self, timeout_ms: i32) -> Result<Vec<PhysicalEvent>, String> {
+        AjazzDevice::poll(self, timeout_ms)
+    }
+    fn apply_thread_status(&mut self, parameters: &Value) -> Result<(), String> {
+        AjazzDevice::apply_thread_status(self, parameters)
+    }
+    fn apply_rgb_config(&mut self, parameters: &Value) -> Result<(), String> {
+        AjazzDevice::apply_rgb_config(self, parameters)
+    }
+    fn shutdown(&mut self) {}
+}
 fn encode_color_image(
     index: usize,
     color: u32,
