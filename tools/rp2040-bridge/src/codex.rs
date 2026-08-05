@@ -138,15 +138,19 @@ impl RadialState {
             PhysicalEvent::EncoderTurn { index: 2, delta } if delta != 0 => {
                 return Some(self.radial_turn(1, if delta > 0 { 0.25 } else { 0.75 }, delta));
             }
-            PhysicalEvent::EncoderTurn { delta, .. } if delta > 0 => ("ENC_CW".to_owned(), 2, None),
-            PhysicalEvent::EncoderTurn { delta, .. } if delta < 0 => ("ENC_CC".to_owned(), 2, None),
+            PhysicalEvent::EncoderTurn { index: 1, delta } if delta > 0 => {
+                ("ENC_CW".to_owned(), 2, None)
+            }
+            PhysicalEvent::EncoderTurn { index: 1, delta } if delta < 0 => {
+                ("ENC_CC".to_owned(), 2, None)
+            }
             PhysicalEvent::EncoderButton { index: 0, pressed } => {
                 ("ACT12".to_owned(), i32::from(pressed), None)
             }
             PhysicalEvent::EncoderButton { index: 2, pressed } => {
                 ("ACT10".to_owned(), i32::from(pressed), None)
             }
-            PhysicalEvent::EncoderButton { pressed, .. } => {
+            PhysicalEvent::EncoderButton { index: 1, pressed } => {
                 ("ENC_CLK".to_owned(), i32::from(pressed), None)
             }
             _ => return None,
@@ -340,5 +344,24 @@ mod tests {
             ]
         );
         assert!(messages_for_synthetic_key("INVALID").is_err());
+    }
+}
+
+#[cfg(test)]
+mod stream_deck_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_fourth_encoder_does_not_emit_codex_events() {
+        assert!(
+            message_for_physical_event(PhysicalEvent::EncoderTurn { index: 3, delta: 1 }).is_none()
+        );
+        assert!(
+            message_for_physical_event(PhysicalEvent::EncoderButton {
+                index: 3,
+                pressed: true
+            })
+            .is_none()
+        );
     }
 }

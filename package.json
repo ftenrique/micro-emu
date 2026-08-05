@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": false,
   "type": "module",
-  "description": "Codex Micro protocol core, AJAZZ adapter and RP2040 USB bridge.",
+  "description": "Codex Micro protocol core, AJAZZ and Stream Deck adapters with an RP2040 USB bridge.",
   "exports": {
     ".": "./protocol/index.js",
     "./descriptors": "./protocol/descriptors/index.js"

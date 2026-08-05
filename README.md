@@ -130,6 +130,37 @@ For a firmware-only smoke test without the AJAZZ connected:
 npm run bridge:run -- -- --port COM7 --no-ajazz --listen 120 --emit AG00 --emit-after 10
 ```
 
+## Stream Deck controllers
+
+The bridge can use a Stream Deck directly through its Windows HID interface. Keep the official Stream Deck application closed while the bridge owns the device. AJAZZ remains the default controller, so existing commands do not change.
+
+```powershell
+npm run bridge:run -- -- --port COM7 --controller streamdeck-plus
+npm run bridge:run -- -- --port COM7 --controller streamdeck-xl
+```
+
+Supported models are Stream Deck + (`0FD9:0084`, 8 keys and 4 dials) and the original Stream Deck XL (`0FD9:006C`, 32 keys). The first six keys map to `AG00`-`AG05`; auxiliary keys map to `ACT06`-`ACT08`. On Stream Deck +, dials 0-2 map to the existing radial/encoder events and dial 3 plus the touch strip are reserved. XL keys after index 8 remain black and reserved. On Stream Deck +, the 800x100
+touch window also renders the optional MCP display context. It is independent
+from Codex Micro messages and is restored after HID reconnects.
+
+Use the existing MCP server (no second MCP server is needed):
+
+~~~json
+{
+  "project": "micro-emu",
+  "task": "Stream Deck dashboard",
+  "model": "gpt-5",
+  "effort": "high",
+  "status": "working",
+  "progress": 65
+}
+~~~
+
+Call the set_display_context tool with that object. Omitted or null fields are
+shown as neutral placeholders; text is truncated to the available window and
+task bodies/prompts are never inferred or logged.
+
+Use `--controller none` or the existing `--no-ajazz` alias to run without a physical controller. If more than one matching Stream Deck is connected, select one with `--controller-serial SERIAL`.
 ## Integrate with Codex through MCP
 
 The bridge includes a local Model Context Protocol (MCP) server over STDIO.
@@ -196,12 +227,13 @@ CLI, and IDE extension share the same MCP configuration on the host. Once
 connected, ask Codex to call `bridge_status` first. The bridge exposes these
 tools:
 
-- `bridge_status` — report firmware, serial port, and AJAZZ connection state.
-- `emit_key` — emit a synthetic Codex Micro key press/release.
-- `send_codex_message` — send one Codex Micro JSON message.
-- `set_thread_status` — update the six AJAZZ LCD status slots.
-- `set_rgb_config` — send `v.oai.rgbcfg` configuration.
-- `device_status` — request `device.status` from the RP2040 firmware.
+- `bridge_status` â€” report firmware, serial port, and AJAZZ connection state.
+- `emit_key` â€” emit a synthetic Codex Micro key press/release.
+- `send_codex_message` â€” send one Codex Micro JSON message.
+- `set_thread_status` â€” update the six AJAZZ LCD status slots.
+- set_display_context — update the optional Stream Deck + project/task dashboard.
+- `set_rgb_config` â€” send `v.oai.rgbcfg` configuration.
+- `device_status` â€” request `device.status` from the RP2040 firmware.
 
 When Codex owns the MCP process, do not start a second bridge process against
 the same COM port. Close any manually started `bridge:run` process before
@@ -259,12 +291,12 @@ const press = keyEvent("AG00", 1, 0);
 
 ## Documentation
 
-- [Deployment](DEPLOYMENT.md) — build, flash, run, validate, and publish.
-- [RP2040 bridge details](docs/rp2040-bridge.md) — firmware and transport
+- [Deployment](DEPLOYMENT.md) â€” build, flash, run, validate, and publish.
+- [RP2040 bridge details](docs/rp2040-bridge.md) â€” firmware and transport
   architecture.
-- [Hardware profile](docs/hardware-profile.md) — verified AJAZZ interface and
+- [Hardware profile](docs/hardware-profile.md) â€” verified AJAZZ interface and
   controls.
-- [Windows environment](docs/windows-environment.md) — inventory and system
+- [Windows environment](docs/windows-environment.md) â€” inventory and system
   diagnostics.
 
 ## Security model
