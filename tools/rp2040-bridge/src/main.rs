@@ -1,7 +1,10 @@
 mod ajazz;
 mod codex;
 mod controller;
+mod daemon;
 mod mcp;
+mod proxy;
+mod routing;
 mod serial;
 mod streamdeck;
 mod wire;
@@ -22,15 +25,22 @@ use std::time::{Duration, Instant};
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
-struct Options {
-    port: String,
-    controller: ControllerKind,
-    controller_serial: Option<String>,
-    listen_seconds: Option<u64>,
-    emit_key: Option<String>,
-    emit_after_seconds: u64,
-    mcp: bool,
-    legacy: bool,
+pub struct Options {
+    pub port: String,
+    pub controller: ControllerKind,
+    pub controller_serial: Option<String>,
+    pub listen_seconds: Option<u64>,
+    pub emit_key: Option<String>,
+    pub emit_after_seconds: u64,
+    pub mcp: bool,
+    pub legacy: bool,
+    pub daemon: bool,
+    pub bind: String,
+    pub mcp_proxy: bool,
+    pub agent: Option<crate::routing::AgentId>,
+    pub connect: String,
+    pub autostart: bool,
+    pub daemon_args: Vec<String>,
 }
 
 fn parse_options() -> Result<Options, String> {
@@ -43,6 +53,13 @@ fn parse_options() -> Result<Options, String> {
     let mut emit_after_seconds = 3;
     let mut mcp = false;
     let mut legacy = false;
+    let mut daemon = false;
+    let mut bind = crate::daemon::DEFAULT_BIND.to_owned();
+    let mut mcp_proxy = false;
+    let mut agent = None;
+    let mut connect = crate::daemon::DEFAULT_BIND.to_owned();
+    let mut autostart = false;
+    let mut daemon_args = Vec::new();
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -51,7 +68,7 @@ fn parse_options() -> Result<Options, String> {
                 port = Some(
                     arguments
                         .next()
-                        .ok_or_else(|| "--port requires COMx or auto".to_owned())?,
+                        .ok_or_else(|| "--port requires COMx, auto, or none".to_owned())?,
                 );
             }
             "--no-ajazz" => no_ajazz = true,
@@ -102,20 +119,49 @@ fn parse_options() -> Result<Options, String> {
             }
             "--mcp" => mcp = true,
             "--legacy" => legacy = true,
+            "--daemon" => daemon = true,
+            "--bind" => {
+                bind = arguments
+                    .next()
+                    .ok_or_else(|| "--bind requires an address".to_owned())?;
+            }
+            "--mcp-proxy" => mcp_proxy = true,
+            "--agent" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--agent requires codex or hermes".to_owned())?;
+                agent = Some(crate::routing::AgentId::parse(&value)?);
+            }
+            "--connect" => {
+                connect = arguments
+                    .next()
+                    .ok_or_else(|| "--connect requires an address".to_owned())?;
+            }
+            "--autostart" => autostart = true,
+            "--daemon-args" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--daemon-args requires a string".to_owned())?;
+                daemon_args = value.split_whitespace().map(str::to_owned).collect();
+            }
             "--help" | "-h" => {
                 println!(
-                    "rp2040-bridge --port COMx|auto [--controller ajazz|streamdeck-plus|streamdeck-xl|none] [--controller-serial SERIAL] [--no-ajazz] [--listen 0..3600] [--emit AG00] [--emit-after 0..3600] [--mcp|--legacy]"
+                    "rp2040-bridge --port COMx|auto|none [--controller ajazz|streamdeck-plus|streamdeck-xl|none] [--controller-serial SERIAL] [--no-ajazz] [--listen 0..3600] [--emit AG00] [--emit-after 0..3600] [--mcp|--legacy|--daemon [--bind 127.0.0.1:48360] | --mcp-proxy --agent codex|hermes [--connect 127.0.0.1:48360] [--autostart] [--daemon-args \"...\"]]"
                 );
                 std::process::exit(0);
             }
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
-    if mcp && legacy {
-        return Err("--mcp and --legacy cannot be used together".to_owned());
+    let mode_count = [mcp, legacy, daemon, mcp_proxy].iter().filter(|&&f| f).count();
+    if mode_count > 1 {
+        return Err("--mcp, --legacy, --daemon, and --mcp-proxy are mutually exclusive".to_owned());
     }
     if no_ajazz && controller.is_some() {
         return Err("--no-ajazz cannot be combined with --controller".to_owned());
+    }
+    if mcp_proxy && agent.is_none() {
+        return Err("--mcp-proxy requires --agent codex|hermes".to_owned());
     }
     let controller = controller.unwrap_or(if no_ajazz {
         ControllerKind::None
@@ -127,9 +173,18 @@ fn parse_options() -> Result<Options, String> {
     }
     if let Some(key) = &emit_key {
         messages_for_synthetic_key(key)?;
+        if port.as_deref() == Some("none") {
+            return Err("--emit cannot be used with --port none".to_owned());
+        }
     }
+    // The proxy mode does not need a port; it connects to the daemon.
+    let port = if mcp_proxy {
+        String::from("proxy")
+    } else {
+        port.unwrap_or_else(|| "auto".to_owned())
+    };
     Ok(Options {
-        port: port.ok_or_else(|| "--port COMx is required".to_owned())?,
+        port,
         controller,
         controller_serial,
         listen_seconds,
@@ -137,6 +192,13 @@ fn parse_options() -> Result<Options, String> {
         emit_after_seconds,
         mcp,
         legacy,
+        daemon,
+        bind,
+        mcp_proxy,
+        agent,
+        connect,
+        autostart,
+        daemon_args,
     })
 }
 
@@ -205,18 +267,19 @@ fn rpc_ack_response(message: &Value) -> Option<Value> {
 }
 
 #[derive(Debug)]
-enum ProcessError {
+pub enum ProcessError {
     Controller(String),
     Protocol(String),
     Serial(String),
 }
 
-fn process_codex_message(
+pub fn process_codex_message(
     message: Value,
     controller: &mut Option<Box<dyn PhysicalController>>,
     last_thread_status: &mut Option<Value>,
     last_rgb_config: &mut Option<Value>,
-    writer: &mut File,
+    fused_lcd: &mut crate::routing::FusedLcdState,
+    writer: Option<&mut File>,
     sequence: &mut u16,
     trace: bool,
 ) -> Result<(), ProcessError> {
@@ -227,8 +290,21 @@ fn process_codex_message(
             let parameters = message.get("p").or_else(|| message.get("params"));
             if let Some(parameters) = parameters {
                 *last_thread_status = Some(parameters.clone());
+                // ChatGPT (HID) owns slots 0-2 (Codex). Merge only that
+                // range into the fused state and apply the full fused array.
+                let fused = match fused_lcd.merge_from_agent(
+                    crate::routing::AgentId::Codex,
+                    parameters,
+                ) {
+                    Ok(fused) => fused,
+                    Err(error) if !parameters.is_array() => {
+                        return Err(ProcessError::Protocol(error));
+                    }
+                    Err(error) => return Err(ProcessError::Protocol(error)),
+                };
                 if let Some(device) = controller {
-                    match device.apply_thread_status(parameters) {
+                    let fused_value = Value::Array(fused);
+                    match device.apply_thread_status(&fused_value) {
                         Ok(()) => {}
                         Err(error) if !parameters.is_array() => {
                             return Err(ProcessError::Protocol(error));
@@ -256,7 +332,9 @@ fn process_codex_message(
         _ => {}
     }
     if let Some(response) = rpc_ack_response(&message) {
-        send_codex_message(writer, sequence, &response).map_err(ProcessError::Serial)?;
+        if let Some(writer) = writer {
+            send_codex_message(writer, sequence, &response).map_err(ProcessError::Serial)?;
+        }
         if trace {
             println!(
                 "{}",
@@ -297,33 +375,54 @@ fn codex_report_trace(report: &[u8], sequence: u16) -> Value {
     })
 }
 
-struct SerialRuntime {
-    writer: Option<File>,
-    receiver: Receiver<SerialEvent>,
-    reader_thread: Option<JoinHandle<()>>,
+pub struct SerialRuntime {
+    pub writer: Option<File>,
+    pub receiver: Receiver<SerialEvent>,
+    pub reader_thread: Option<JoinHandle<()>>,
 }
 
-struct BridgeRuntime {
-    serial: SerialRuntime,
-    sequence: u16,
-    controller: Option<Box<dyn PhysicalController>>,
-    controller_choice: ControllerKind,
-    controller_serial: Option<String>,
-    controller_retry_at: Instant,
-    controller_retry_delay: Duration,
-    last_thread_status: Option<Value>,
-    last_rgb_config: Option<Value>,
-    last_display_context: Option<DisplayContext>,
-    firmware: String,
-    port: String,
-    codex_decoder: CodexDecoder,
-    radial_state: RadialState,
-    health: HealthCheck,
+pub struct BridgeRuntime {
+    pub serial: Option<SerialRuntime>,
+    pub sequence: u16,
+    pub controller: Option<Box<dyn PhysicalController>>,
+    pub controller_choice: ControllerKind,
+    pub controller_serial: Option<String>,
+    pub controller_retry_at: Instant,
+    pub controller_retry_delay: Duration,
+    pub last_thread_status: Option<Value>,
+    pub last_rgb_config: Option<Value>,
+    pub last_display_context: Option<DisplayContext>,
+    pub firmware: String,
+    pub port: String,
+    pub codex_decoder: CodexDecoder,
+    pub radial_state: RadialState,
+    pub health: HealthCheck,
+    pub routing: crate::routing::EventRouting,
+    pub fused_lcd: crate::routing::FusedLcdState,
 }
 
-struct HealthCheck {
-    next_probe_at: Instant,
-    pending_deadline: Option<Instant>,
+impl BridgeRuntime {
+    fn has_serial(&self) -> bool {
+        self.serial.is_some()
+    }
+
+    /// Sends a Codex Micro JSON message through the serial port, if present.
+    /// In standalone mode this is a no-op.
+    fn send_codex(&mut self, message: &Value) -> Result<(), String> {
+        let Some(writer) = self
+            .serial
+            .as_mut()
+            .and_then(|runtime| runtime.writer.as_mut())
+        else {
+            return Ok(());
+        };
+        send_codex_message(writer, &mut self.sequence, message)
+    }
+}
+
+pub struct HealthCheck {
+    pub next_probe_at: Instant,
+    pub pending_deadline: Option<Instant>,
 }
 
 impl HealthCheck {
@@ -377,7 +476,7 @@ fn open_serial_runtime(
     ))
 }
 
-fn connect_controller(
+pub(crate) fn connect_controller(
     choice: ControllerKind,
     serial: Option<&str>,
 ) -> Result<Option<Box<dyn PhysicalController>>, String> {
@@ -390,8 +489,13 @@ fn connect_controller(
     }
 }
 
-fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
-    let (serial, firmware, port, sequence) = open_serial_runtime(&options.port)?;
+pub(crate) fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
+    let (serial, firmware, port, sequence) = if options.port == "none" {
+        (None, String::from("standalone"), String::from("none"), 1_u16)
+    } else {
+        let (serial, firmware, port, sequence) = open_serial_runtime(&options.port)?;
+        (Some(serial), firmware, port, sequence)
+    };
     let controller = connect_controller(options.controller, options.controller_serial.as_deref())?;
     Ok(BridgeRuntime {
         serial,
@@ -409,16 +513,29 @@ fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
         codex_decoder: CodexDecoder::default(),
         radial_state: RadialState::default(),
         health: HealthCheck::new(),
+        routing: crate::routing::EventRouting::new(),
+        fused_lcd: crate::routing::FusedLcdState::new(),
     })
 }
 
-fn replace_runtime(bridge: &mut BridgeRuntime, options: &Options) -> Result<(), String> {
-    drop(bridge.serial.writer.take());
-    if let Some(reader_thread) = bridge.serial.reader_thread.take() {
-        let _ = reader_thread.join();
+pub(crate) fn replace_runtime(bridge: &mut BridgeRuntime, options: &Options) -> Result<(), String> {
+    if let Some(serial) = bridge.serial.as_mut() {
+        drop(serial.writer.take());
+        if let Some(reader_thread) = serial.reader_thread.take() {
+            let _ = reader_thread.join();
+        }
+    }
+    if options.port == "none" {
+        bridge.serial = None;
+        bridge.firmware = String::from("standalone");
+        bridge.port = String::from("none");
+        bridge.sequence = 1;
+        bridge.codex_decoder = CodexDecoder::default();
+        bridge.health = HealthCheck::new();
+        return Ok(());
     }
     let (serial, firmware, port, sequence) = open_serial_runtime(&options.port)?;
-    bridge.serial = serial;
+    bridge.serial = Some(serial);
     bridge.sequence = sequence;
     bridge.firmware = firmware;
     bridge.port = port;
@@ -435,7 +552,7 @@ fn schedule_controller_retry(bridge: &mut BridgeRuntime) {
     }
 }
 
-fn reconnect_controller_if_due(bridge: &mut BridgeRuntime) {
+pub(crate) fn reconnect_controller_if_due(bridge: &mut BridgeRuntime) {
     if bridge.controller.is_some()
         || !bridge.controller_choice.is_physical()
         || Instant::now() < bridge.controller_retry_at
@@ -447,11 +564,9 @@ fn reconnect_controller_if_due(bridge: &mut BridgeRuntime) {
         bridge.controller_serial.as_deref(),
     ) {
         Ok(Some(mut controller)) => {
-            let replay = bridge
-                .last_thread_status
-                .as_ref()
-                .map(|value| controller.apply_thread_status(value));
-            if let Some(Err(error)) = replay {
+            let fused = bridge.fused_lcd.fused_array();
+            let fused_value = Value::Array(fused);
+            if let Err(error) = controller.apply_thread_status(&fused_value) {
                 eprintln!("controller state replay failed: {error}");
                 schedule_controller_retry(bridge);
                 return;
@@ -482,12 +597,13 @@ fn reconnect_controller_if_due(bridge: &mut BridgeRuntime) {
         }
     }
 }
-fn bridge_status(bridge: &BridgeRuntime, mode: &str) -> Value {
+pub(crate) fn bridge_status(bridge: &BridgeRuntime, mode: &str) -> Value {
     let controller = bridge.controller.as_ref();
     json!({
         "type": "bridge-ready",
         "firmware": bridge.firmware,
         "port": bridge.port,
+        "rp2040": bridge.has_serial(),
         "ajazzConnected": controller.is_some_and(|device| device.kind() == ControllerKind::Ajazz),
         "controller": {
             "kind": bridge.controller_choice.as_str(),
@@ -496,10 +612,18 @@ fn bridge_status(bridge: &BridgeRuntime, mode: &str) -> Value {
             "serial": controller.and_then(|device| device.serial())
         },
         "displayContext": bridge.last_display_context.as_ref().map(DisplayContext::to_value),
+        "agents": {
+            "codex": {"events": bridge.routing.queue(crate::routing::AgentId::Codex).len()},
+            "hermes": {"events": bridge.routing.queue(crate::routing::AgentId::Hermes).len()}
+        },
+        "partition": {
+            "codex": {"keys": ["AG00", "AG01", "AG02"], "slots": [0, 1, 2]},
+            "hermes": {"keys": ["AG03", "AG04", "AG05"], "slots": [3, 4, 5]}
+        },
         "mode": mode
     })
 }
-fn detach_controller(bridge: &mut BridgeRuntime, error: &str) {
+pub(crate) fn detach_controller(bridge: &mut BridgeRuntime, error: &str) {
     if let Some(mut controller) = bridge.controller.take() {
         controller.shutdown();
         eprintln!("{} HID disconnected: {error}", controller.kind().as_str());
@@ -507,21 +631,47 @@ fn detach_controller(bridge: &mut BridgeRuntime, error: &str) {
     schedule_controller_retry(bridge);
 }
 
-fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result<(), String> {
+/// Alias used by the daemon module.
+pub(crate) fn detach_controller_for(bridge: &mut BridgeRuntime, error: &str) {
+    detach_controller(bridge, error);
+}
+
+pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result<(), String> {
     let result = bridge.controller.as_mut().map(|device| device.poll(25));
     match result {
         Some(Ok(events)) => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
             for event in events {
+                // Partition button events by agent. Buttons 0-2 belong to
+                // Codex (sent to HID when the RP2040 is present, otherwise
+                // buffered for the Codex MCP session). Buttons 3-5 belong to
+                // Hermes and are always buffered for polling.
+                if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
+                    if let Some(owner) = crate::routing::button_owner(index) {
+                        if owner == crate::routing::AgentId::Hermes {
+                            bridge.routing.route_button(index, pressed, now_ms);
+                            if trace {
+                                println!(
+                                    "{}",
+                                    json!({"type":"controller-event","controller":bridge.controller_choice.as_str(),"agent":"hermes","event":format!("{event:?}")})
+                                );
+                            }
+                            continue;
+                        }
+                        // Codex button: buffer for the Codex MCP session in
+                        // standalone mode (no HID path).
+                        if !bridge.has_serial() {
+                            bridge.routing.route_button(index, pressed, now_ms);
+                        }
+                    }
+                }
                 if let Some(message) = bridge.radial_state.event(event) {
-                    send_codex_message(
-                        bridge
-                            .serial
-                            .writer
-                            .as_mut()
-                            .expect("serial writer is present"),
-                        &mut bridge.sequence,
-                        &message,
-                    )?;
+                    if bridge.has_serial() {
+                        bridge.send_codex(&message)?;
+                    }
                     if trace {
                         println!(
                             "{}",
@@ -557,69 +707,67 @@ fn run_legacy(options: Options) -> Result<(), String> {
                 .as_deref()
                 .expect("emit deadline requires a key");
             for message in messages_for_synthetic_key(key)? {
-                send_codex_message(
-                    bridge
-                        .serial
-                        .writer
-                        .as_mut()
-                        .expect("serial writer is present"),
-                    &mut bridge.sequence,
-                    &message,
-                )?;
+                bridge.send_codex(&message)?;
                 std::thread::sleep(Duration::from_millis(50));
             }
             println!("{}", json!({"type":"synthetic-event","key":key}));
             synthetic_emit_at = None;
         }
         reconnect_controller_if_due(&mut bridge);
-        while let Ok(event) = bridge.serial.receiver.try_recv() {
-            match event {
-                SerialEvent::Frame(frame) if frame.frame_type == FrameType::CodexOutputReport => {
-                    println!("{}", codex_report_trace(&frame.payload, frame.sequence));
-                    match bridge.codex_decoder.feed(&frame.payload) {
-                        Ok(messages) => {
-                            for message in messages {
-                                match process_codex_message(
-                                    message,
-                                    &mut bridge.controller,
-                                    &mut bridge.last_thread_status,
-                                    &mut bridge.last_rgb_config,
-                                    bridge
-                                        .serial
-                                        .writer
-                                        .as_mut()
-                                        .expect("serial writer is present"),
-                                    &mut bridge.sequence,
-                                    true,
-                                ) {
-                                    Ok(()) => {}
-                                    Err(ProcessError::Controller(error)) => {
-                                        detach_controller(&mut bridge, &error)
+        let mut serial_taken = bridge.serial.take();
+        if let Some(runtime) = serial_taken.as_mut() {
+            let mut events = Vec::new();
+            while let Ok(event) = runtime.receiver.try_recv() {
+                events.push(event);
+            }
+            for event in events {
+                match event {
+                    SerialEvent::Frame(frame) if frame.frame_type == FrameType::CodexOutputReport => {
+                        println!("{}", codex_report_trace(&frame.payload, frame.sequence));
+                        match bridge.codex_decoder.feed(&frame.payload) {
+                            Ok(messages) => {
+                                for message in messages {
+                                    let writer = runtime.writer.as_mut();
+                                    match process_codex_message(
+                                        message,
+                                        &mut bridge.controller,
+                                        &mut bridge.last_thread_status,
+                                        &mut bridge.last_rgb_config,
+                                        &mut bridge.fused_lcd,
+                                        writer,
+                                        &mut bridge.sequence,
+                                        true,
+                                    ) {
+                                        Ok(()) => {}
+                                        Err(ProcessError::Controller(error)) => {
+                                            detach_controller(&mut bridge, &error)
+                                        }
+                                        Err(ProcessError::Protocol(error)) => println!(
+                                            "{}",
+                                            json!({"type":"codex-parameter-error","error":error})
+                                        ),
+                                        Err(ProcessError::Serial(error)) => return Err(error),
                                     }
-                                    Err(ProcessError::Protocol(error)) => println!(
-                                        "{}",
-                                        json!({"type":"codex-parameter-error","error":error})
-                                    ),
-                                    Err(ProcessError::Serial(error)) => return Err(error),
                                 }
                             }
-                        }
-                        Err(error) => {
-                            println!("{}", json!({"type":"codex-report-error","error":error}))
+                            Err(error) => {
+                                println!("{}", json!({"type":"codex-report-error","error":error}))
+                            }
                         }
                     }
+                    SerialEvent::Frame(frame) if frame.frame_type == FrameType::Log => println!(
+                        "{}",
+                        json!({"type":"firmware-log","message":String::from_utf8_lossy(&frame.payload)})
+                    ),
+                    SerialEvent::Frame(_) => {}
+                    SerialEvent::ProtocolError(error) => {
+                        println!("{}", json!({"type":"protocol-error","error":error}))
+                    }
+                    SerialEvent::Disconnected(error) => return Err(error),
                 }
-                SerialEvent::Frame(frame) if frame.frame_type == FrameType::Log => println!(
-                    "{}",
-                    json!({"type":"firmware-log","message":String::from_utf8_lossy(&frame.payload)})
-                ),
-                SerialEvent::Frame(_) => {}
-                SerialEvent::ProtocolError(error) => {
-                    println!("{}", json!({"type":"protocol-error","error":error}))
-                }
-                SerialEvent::Disconnected(error) => return Err(error),
             }
         }
+        bridge.serial = serial_taken;
         poll_controller(&mut bridge, true)?;
     }
 }
@@ -630,17 +778,91 @@ fn tool_arguments(request: &Value) -> &Value {
         .unwrap_or(&Value::Null)
 }
 
+/// Helper for the daemon: emit_key tool.
+pub(crate) fn call_emit_key(bridge: &mut BridgeRuntime, arguments: &Value) -> Value {
+    let Some(key) = arguments.get("key").and_then(Value::as_str) else {
+        return mcp::tool_error("emit_key requires a key");
+    };
+    match messages_for_synthetic_key(key) {
+        Ok(messages) => {
+            let count = messages.len();
+            let send_result = messages.iter().try_for_each(|message| {
+                bridge.send_codex(message)?;
+                std::thread::sleep(Duration::from_millis(50));
+                Ok::<(), String>(())
+            });
+            send_result
+                .map(|_| mcp::text_result(json!({"key": key, "messagesSent": count})))
+                .unwrap_or_else(mcp::tool_error)
+        }
+        Err(error) => mcp::tool_error(error),
+    }
+}
+
+/// Helper for the daemon: send_codex_message tool.
+pub(crate) fn call_send_codex_message(bridge: &mut BridgeRuntime, arguments: &Value) -> Value {
+    let Some(message) = arguments.get("message") else {
+        return mcp::tool_error("send_codex_message requires message");
+    };
+    if !message.is_object() {
+        return mcp::tool_error("message must be a JSON object");
+    }
+    match send_tool_message(bridge, message) {
+        Ok(reports) => mcp::text_result(json!({"reportsSent": reports})),
+        Err(error) => mcp::tool_error(error),
+    }
+}
+
+/// Helper for the daemon: set_display_context tool.
+pub(crate) fn call_set_display_context(bridge: &mut BridgeRuntime, arguments: &Value) -> Value {
+    let context = match DisplayContext::from_value(arguments) {
+        Ok(context) => context,
+        Err(error) => return mcp::tool_error(error),
+    };
+    bridge.last_display_context = Some(context.clone());
+    let apply_result = bridge
+        .controller
+        .as_mut()
+        .map(|device| device.apply_display_context(&context));
+    if let Some(Err(error)) = apply_result {
+        detach_controller(bridge, &error);
+        mcp::tool_error(format!("Stream Deck dashboard disconnected: {error}"))
+    } else {
+        mcp::text_result(json!({
+            "updated": true,
+            "context": context.to_value()
+        }))
+    }
+}
+
+/// Helper for the daemon: set_rgb_config tool.
+pub(crate) fn call_set_rgb_config(bridge: &mut BridgeRuntime, arguments: &Value) -> Value {
+    let Some(config) = arguments.get("config") else {
+        return mcp::tool_error("set_rgb_config requires config");
+    };
+    if !config.is_object() {
+        return mcp::tool_error("config must be an object");
+    }
+    let message = json!({"m": "v.oai.rgbcfg", "p": config});
+    match send_tool_message(bridge, &message) {
+        Ok(reports) => mcp::text_result(json!({"reportsSent": reports})),
+        Err(error) => mcp::tool_error(error),
+    }
+}
+
+/// Helper for the daemon: device_status tool.
+pub(crate) fn call_device_status(bridge: &mut BridgeRuntime) -> Value {
+    let id = next_sequence(&mut bridge.sequence);
+    let message = json!({"m": "device.status", "id": id});
+    match send_tool_message(bridge, &message) {
+        Ok(reports) => mcp::text_result(json!({"requestId": id, "reportsSent": reports})),
+        Err(error) => mcp::tool_error(error),
+    }
+}
+
 fn send_tool_message(bridge: &mut BridgeRuntime, message: &Value) -> Result<usize, String> {
     let reports = frame_json(message)?.len();
-    send_codex_message(
-        bridge
-            .serial
-            .writer
-            .as_mut()
-            .expect("serial writer is present"),
-        &mut bridge.sequence,
-        message,
-    )?;
+    bridge.send_codex(message)?;
     Ok(reports)
 }
 
@@ -660,15 +882,7 @@ fn call_tool(request: &Value, bridge: &mut BridgeRuntime) -> Value {
                 Ok(messages) => {
                     let count = messages.len();
                     let send_result = messages.iter().try_for_each(|message| {
-                        send_codex_message(
-                            bridge
-                                .serial
-                                .writer
-                                .as_mut()
-                                .expect("serial writer is present"),
-                            &mut bridge.sequence,
-                            message,
-                        )?;
+                        bridge.send_codex(message)?;
                         std::thread::sleep(Duration::from_millis(50));
                         Ok::<(), String>(())
                     });
@@ -738,6 +952,45 @@ fn call_tool(request: &Value, bridge: &mut BridgeRuntime) -> Value {
             let message = json!({"m": "device.status", "id": id});
             send_tool_message(bridge, &message)
                 .map(|reports| mcp::text_result(json!({"requestId": id, "reportsSent": reports})))
+        }
+        "poll_events" => {
+            // In legacy --mcp mode the agent is always Codex.
+            let timeout_ms = arguments
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(25_000);
+            let has_events = !bridge.routing.queue(crate::routing::AgentId::Codex).is_empty();
+            if has_events {
+                let events: Vec<Value> = bridge
+                    .routing
+                    .queue_mut(crate::routing::AgentId::Codex)
+                    .drain()
+                    .into_iter()
+                    .map(|e| json!({"key": e.key, "pressed": e.pressed, "ts": e.timestamp_ms}))
+                    .collect();
+                Ok(mcp::text_result(json!({"events": events})))
+            } else if timeout_ms > 0 {
+                // Simple blocking wait in legacy mode.
+                let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+                while Instant::now() < deadline
+                    && bridge.routing.queue(crate::routing::AgentId::Codex).is_empty()
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                    crate::reconnect_controller_if_due(bridge);
+                    let _ = crate::poll_controller(bridge, false);
+                }
+                let events: Vec<Value> = bridge
+                    .routing
+                    .queue_mut(crate::routing::AgentId::Codex)
+                    .drain()
+                    .into_iter()
+                    .map(|e| json!({"key": e.key, "pressed": e.pressed, "ts": e.timestamp_ms}))
+                    .collect();
+                Ok(mcp::text_result(json!({"events": events})))
+            } else {
+                Ok(mcp::text_result(json!({"events": []})))
+            }
         }
         _ => Err(format!("unknown MCP tool: {name}")),
     };
@@ -821,7 +1074,7 @@ fn reconnect_mcp(
     }
 }
 
-fn send_health_ping(bridge: &mut BridgeRuntime, now: Instant) -> Result<(), String> {
+pub(crate) fn send_health_ping(bridge: &mut BridgeRuntime, now: Instant) -> Result<(), String> {
     if !bridge.health.due_at(now) {
         return Ok(());
     }
@@ -831,14 +1084,14 @@ fn send_health_ping(bridge: &mut BridgeRuntime, now: Instant) -> Result<(), Stri
         Vec::new(),
     )
     .map_err(|error| error.to_string())?;
-    serial::write_frame(
-        bridge
-            .serial
-            .writer
-            .as_mut()
-            .expect("serial writer is present"),
-        &ping,
-    )?;
+    let Some(writer) = bridge
+        .serial
+        .as_mut()
+        .and_then(|runtime| runtime.writer.as_mut())
+    else {
+        return Ok(());
+    };
+    serial::write_frame(writer, &ping)?;
     bridge.health.begin_at(now);
     Ok(())
 }
@@ -856,59 +1109,65 @@ fn run_mcp(options: Options) -> Result<(), String> {
             }
         }
         let mut serial_disconnected = None;
-        while let Ok(event) = bridge.serial.receiver.try_recv() {
-            match event {
-                SerialEvent::Frame(frame) if frame.frame_type == FrameType::CodexOutputReport => {
-                    match bridge.codex_decoder.feed(&frame.payload) {
-                        Ok(messages) => {
-                            for message in messages {
-                                match process_codex_message(
-                                    message,
-                                    &mut bridge.controller,
-                                    &mut bridge.last_thread_status,
-                                    &mut bridge.last_rgb_config,
-                                    bridge
-                                        .serial
-                                        .writer
-                                        .as_mut()
-                                        .expect("serial writer is present"),
-                                    &mut bridge.sequence,
-                                    false,
-                                ) {
-                                    Ok(()) => {}
-                                    Err(ProcessError::Controller(error)) => {
-                                        detach_controller(&mut bridge, &error)
-                                    }
-                                    Err(ProcessError::Protocol(error)) => {
-                                        eprintln!("MCP bridge Codex parameter error: {error}")
-                                    }
-                                    Err(ProcessError::Serial(error)) => {
-                                        serial_disconnected = Some(error);
-                                        break;
+        // Drain serial events by temporarily taking the serial runtime out
+        // of the bridge, so we can mutably access other bridge fields while
+        // processing them.
+        let mut serial_taken = bridge.serial.take();
+        if let Some(runtime) = serial_taken.as_mut() {
+            let mut events = Vec::new();
+            while let Ok(event) = runtime.receiver.try_recv() {
+                events.push(event);
+            }
+            for event in events {
+                match event {
+                    SerialEvent::Frame(frame) if frame.frame_type == FrameType::CodexOutputReport => {
+                        match bridge.codex_decoder.feed(&frame.payload) {
+                            Ok(messages) => {
+                                for message in messages {
+                                    let writer = runtime.writer.as_mut();
+                                    match process_codex_message(
+                                        message,
+                                        &mut bridge.controller,
+                                        &mut bridge.last_thread_status,
+                                        &mut bridge.last_rgb_config,
+                                        &mut bridge.fused_lcd,
+                                        writer,
+                                        &mut bridge.sequence,
+                                        false,
+                                    ) {
+                                        Ok(()) => {}
+                                        Err(ProcessError::Controller(error)) => {
+                                            detach_controller(&mut bridge, &error)
+                                        }
+                                        Err(ProcessError::Protocol(error)) => {
+                                            eprintln!("MCP bridge Codex parameter error: {error}")
+                                        }
+                                        Err(ProcessError::Serial(error)) => {
+                                            serial_disconnected = Some(error);
+                                            break;
+                                        }
                                     }
                                 }
                             }
+                            Err(error) => eprintln!("MCP bridge Codex report error: {error}"),
                         }
-                        Err(error) => eprintln!("MCP bridge Codex report error: {error}"),
+                    }
+                    SerialEvent::Frame(frame) if frame.frame_type == FrameType::Status => {
+                        bridge.health.observe_status_at(Instant::now())
+                    }
+                    SerialEvent::Frame(frame) if frame.frame_type == FrameType::Log => {
+                        eprintln!("RP2040: {}", String::from_utf8_lossy(&frame.payload))
+                    }
+                    SerialEvent::Frame(_) => {}
+                    SerialEvent::ProtocolError(error) => eprintln!("bridge protocol error: {error}"),
+                    SerialEvent::Disconnected(error) => {
+                        serial_disconnected = Some(error);
+                        break;
                     }
                 }
-                SerialEvent::Frame(frame) if frame.frame_type == FrameType::Status => {
-                    bridge.health.observe_status_at(Instant::now())
-                }
-                SerialEvent::Frame(frame) if frame.frame_type == FrameType::Log => {
-                    eprintln!("RP2040: {}", String::from_utf8_lossy(&frame.payload))
-                }
-                SerialEvent::Frame(_) => {}
-                SerialEvent::ProtocolError(error) => eprintln!("bridge protocol error: {error}"),
-                SerialEvent::Disconnected(error) => {
-                    serial_disconnected = Some(error);
-                    break;
-                }
-            }
-            if serial_disconnected.is_some() {
-                break;
             }
         }
+        bridge.serial = serial_taken;
         if let Some(error) = serial_disconnected {
             eprintln!("RP2040 bridge disconnected: {error}");
             if !reconnect_mcp(&mut bridge, &options, &input)? {
@@ -944,6 +1203,25 @@ impl Drop for BridgeRuntime {
 }
 fn run() -> Result<(), String> {
     let options = parse_options()?;
+    if options.mcp_proxy {
+        let agent = options.agent.expect("--mcp-proxy requires --agent");
+        let exe = env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "rp2040-bridge".to_owned());
+        return crate::proxy::run_proxy(crate::proxy::ProxyOptions {
+            connect: options.connect,
+            agent,
+            autostart: options.autostart,
+            daemon_args: options.daemon_args,
+            exe,
+        });
+    }
+    if options.daemon {
+        return crate::daemon::run_daemon(crate::daemon::DaemonOptions {
+            bind: options.bind.clone(),
+            bridge_options: options,
+        });
+    }
     let use_mcp = options.mcp || (!options.legacy && !io::stdin().is_terminal());
     if use_mcp {
         run_mcp(options)

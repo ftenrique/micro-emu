@@ -33,6 +33,10 @@
     "bridge:test": "cargo test --manifest-path tools/rp2040-bridge/Cargo.toml --offline",
     "bridge:release": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-bridge.ps1",
     "bridge:run": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline --",
+    "bridge:daemon": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline -- --daemon --port auto",
+    "bridge:daemon:standalone": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline -- --daemon --port none",
+    "bridge:proxy:codex": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline -- --mcp-proxy --agent codex --autostart",
+    "bridge:proxy:hermes": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline -- --mcp-proxy --agent hermes --autostart",
     "driver:check": "powershell -NoProfile -ExecutionPolicy Bypass -File driver/vhf-spike/scripts/check-toolchain.ps1",
     "driver:build": "powershell -NoProfile -ExecutionPolicy Bypass -File driver/vhf-spike/scripts/build-driver.ps1"
   },

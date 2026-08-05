@@ -1,3 +1,4 @@
+use crate::routing::AgentId;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -126,7 +127,8 @@ pub fn tools() -> Value {
                 "name": "device_status",
                 "description": "Request device.status from the RP2040 firmware; the response is consumed by the bridge.",
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-            }
+            },
+            poll_events_tool()
         ]
     })
 }
@@ -139,4 +141,46 @@ pub fn text_result(value: Value) -> Value {
 pub fn tool_error(message: impl Into<String>) -> Value {
     let message = message.into();
     json!({"isError": true, "content": [{"type": "text", "text": message}]})
+}
+
+/// Returns the tool list filtered for the given agent. `None` means the
+/// agent has not been identified yet (e.g. direct `--mcp` STDIO mode) and
+/// all tools are exposed for backward compatibility.
+pub fn tools_for(agent: Option<AgentId>) -> Value {
+    let all = tools()["tools"].as_array().unwrap_or(&Vec::new()).clone();
+    let filtered: Vec<Value> = all
+        .into_iter()
+        .filter(|tool| {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            tool_available(name, agent)
+        })
+        .collect();
+    json!({"tools": filtered})
+}
+
+/// Returns true if the given tool is available for the agent.
+pub fn tool_available(name: &str, agent: Option<AgentId>) -> bool {
+    match agent {
+        Some(AgentId::Hermes) => matches!(
+            name,
+            "bridge_status" | "poll_events" | "set_thread_status" | "set_rgb_config"
+        ),
+        // Codex or unknown (legacy --mcp): all tools.
+        _ => true,
+    }
+}
+
+/// The `poll_events` tool definition.
+pub fn poll_events_tool() -> Value {
+    json!({
+        "name": "poll_events",
+        "description": "Drain buffered physical controller events for the calling agent. With timeout_ms > 0, waits up to that many milliseconds for events to arrive (long-poll). Returns an array of {key, pressed, ts}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "timeout_ms": {"type": "integer", "minimum": 0, "maximum": 25000, "default": 0}
+            },
+            "additionalProperties": false
+        }
+    })
 }

@@ -226,3 +226,86 @@ AJAZZ.
 ## EjecuciÃ³n estable
 
 El proceso permanece activo indefinidamente si se omite `--listen`; `--listen N` queda reservado para pruebas y `--listen 0` equivale tambiÃ©n a ilimitado.
+
+
+## Daemon multi-agente (Codex + Hermes)
+
+El bridge puede correr como **daemon** (`--daemon`) que posee el hardware una
+vez y sirve a varios agentes simultaneamente por TCP loopback. Cada agente
+(Codex CLI, Hermes Desktop Agent) lanza un **proxy STDIO** (`--mcp-proxy`)
+que se conecta al daemon y bombea lineas JSON-RPC en ambas direcciones.
+
+``text
+AJAZZ / Stream Deck --HID-- daemon --CDC-- RP2040 --HID-- ChatGPT
+                                | (127.0.0.1:48360)
+                    +-----------+-----------+
+            proxy (codex)           proxy (hermes)
+                    |                       |
+                Codex CLI           Hermes Desktop Agent
+``
+
+### Particion de teclas y slots LCD
+
+- **Codex/ChatGPT**: `AG00`-`AG02` + slots LCD 1-3 (via HID como antes).
+- **Hermes**: `AG03`-`AG05` + slots LCD 4-6 (via MCP `poll_events` y
+  `set_thread_status`).
+- Teclas auxiliares (`ACT06`-`ACT08`) y rotores permanecen en Codex.
+
+Los slots LCD se fusionan: cada agente solo escribe su rango y el controlador
+fisico muestra siempre el estado combinado. Hermes recibe las pulsaciones a
+traves de la tool `poll_events` (long-poll hasta 25 s).
+
+### Arranque
+
+``powershell
+npm run bridge:daemon -- -- --port auto
+``
+
+Modo standalone sin RP2040 (solo controlador fisico + MCP):
+
+``powershell
+npm run bridge:daemon:standalone
+``
+
+### Registro de proxies
+
+**Hermes** (`~/.hermes/config.yaml`):
+
+``yaml
+mcp_servers:
+  micro_emu_bridge:
+    command: "D:\Programming\micro-emu\tools\rp2040-bridge\target\release\rp2040-bridge.exe"
+    args: ["--mcp-proxy", "--agent", "hermes", "--autostart"]
+``
+
+**Codex** (`.codex/config.toml`):
+
+``toml
+[mcp_servers.micro_emu_bridge]
+command = "D:\Programming\micro-emu\tools\rp2040-bridge\target\release\rp2040-bridge.exe"
+args = ["--mcp-proxy", "--agent", "codex", "--autostart"]
+cwd = "D:\Programming\micro-emu"
+``
+
+`--autostart` hace que el proxy lance el daemon automaticamente si no esta
+corriendo. El daemon solo escucha en `127.0.0.1:48360` (configurable con
+`--bind`).
+
+### Tools de Hermes
+
+Hermes ve un conjunto filtrado de tools:
+
+- `bridge_status` - estado del daemon, firmware, controlador y agentes.
+- `poll_events` - drena las pulsaciones fisicas bufferizadas (AG03-AG05).
+  Con `timeout_ms > 0` espera hasta ese numero de milisegundos.
+- `set_thread_status` - actualiza los slots LCD 4-6.
+- `set_rgb_config` - envia `v.oai.rgbcfg`.
+
+Codex conserva todas las tools existentes mas `poll_events`.
+
+### Modo `--port none` (standalone)
+
+El daemon puede arrancar sin RP2040 conectado. En ese modo no abre puerto
+serie, no hace health-check ni reconexion CDC, y las tools que requieren el
+RP2040 (`emit_key`, `send_codex_message`, `device_status`) devuelven un
+error claro. El controlador fisico y `poll_events` siguen funcionando.

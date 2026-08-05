@@ -238,6 +238,85 @@ tools:
 When Codex owns the MCP process, do not start a second bridge process against
 the same COM port. Close any manually started `bridge:run` process before
 using the MCP configuration.
+
+## Multi-agent daemon (Codex + Hermes Desktop Agent)
+
+The bridge can run as a **daemon** that owns the hardware once and serves
+multiple agents simultaneously over TCP loopback. Each agent (Codex CLI,
+Hermes Desktop Agent) launches a lightweight **STDIO proxy** that connects to
+the daemon. This replaces the single-owner `--mcp` STDIO mode when you need
+both agents at the same time.
+
+```text
+AJAZZ / Stream Deck ──HID── bridge daemon ──CDC── RP2040 ──HID── ChatGPT
+                                │ (127.0.0.1:48360)
+                    ┌───────────┴───────────┐
+            proxy (codex)           proxy (hermes)
+                    │                       │
+                Codex CLI           Hermes Desktop Agent
+```
+
+### Key partition
+
+The six LCD keys are split between the two agents:
+
+- **Codex/ChatGPT**: `AG00`-`AG02` + LCD slots 1-3 (via HID as before).
+- **Hermes**: `AG03`-`AG05` + LCD slots 4-6 (via MCP `poll_events` and
+  `set_thread_status`).
+- Auxiliary keys (`ACT06`-`ACT08`) and encoders remain on Codex.
+
+Hermes receives key presses through the `poll_events` tool (long-poll up to
+25 seconds). LCD status slots are fused: each agent only writes its assigned
+slots, and the physical controller always shows the combined state.
+
+### Start the daemon
+
+```powershell
+npm run bridge:daemon -- -- --port auto
+```
+
+For standalone mode without the RP2040 (controller only, no ChatGPT HID):
+
+```powershell
+npm run bridge:daemon:standalone
+```
+
+### Register the proxies
+
+**Hermes** (`~/.hermes/config.yaml`):
+
+```yaml
+mcp_servers:
+  micro_emu_bridge:
+    command: "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe"
+    args: ["--mcp-proxy", "--agent", "hermes", "--autostart"]
+```
+
+**Codex** (`.codex/config.toml`):
+
+```toml
+[mcp_servers.micro_emu_bridge]
+command = "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe"
+args = ["--mcp-proxy", "--agent", "codex", "--autostart"]
+cwd = "D:\\Programming\\micro-emu"
+```
+
+The `--autostart` flag makes the proxy spawn the daemon automatically if it
+is not already running. The daemon binds only to `127.0.0.1:48360`
+(configurable with `--bind`).
+
+### Hermes tools
+
+Hermes sees a filtered tool set:
+
+- `bridge_status` — report daemon, firmware, controller, and agent state.
+- `poll_events` — drain buffered physical key presses (AG03-AG05). With
+  `timeout_ms > 0`, waits up to that many milliseconds for events.
+- `set_thread_status` — update LCD slots 4-6.
+- `set_rgb_config` — send `v.oai.rgbcfg` configuration.
+
+Codex retains all existing tools plus `poll_events`.
+
 ## Implemented functionality
 
 - Codex Micro HID reports with Report ID 6 and 63-byte input, output, and
