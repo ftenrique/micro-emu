@@ -24,12 +24,13 @@ El bridge conserva AJAZZ como controlador predeterminado y admite selección exp
 
 ```powershell
 npm run bridge:run -- -- --port COM7 --controller streamdeck-plus
+npm run bridge:run -- -- --port COM7 --controller streamdeck-plus-xl
 npm run bridge:run -- -- --port COM7 --controller streamdeck-xl
 ```
 
-Stream Deck + usa `0FD9:0084` y el XL original usa `0FD9:006C`. Ambos se abren mediante HID directo; la aplicación oficial de Stream Deck debe estar cerrada. `--controller-serial` resuelve la ambigüedad cuando hay varios dispositivos iguales. `--controller none` y `--no-ajazz` desactivan el controlador físico.
+Stream Deck + usa `0FD9:0084`, Stream Deck + XL usa `0FD9:00C6` (36 teclas, 6 rotores y ventana de 1200x100), y el XL original usa `0FD9:006C`. Ambos perfiles XL se abren mediante HID directo; la aplicación oficial de Stream Deck debe estar cerrada. `--controller-serial` resuelve la ambigüedad cuando hay varios dispositivos iguales. `--controller none` y `--no-ajazz` desactivan el controlador físico.
 
-El mapeo mantiene el contrato Codex existente: teclas 0-5 a `AG00`-`AG05`, teclas auxiliares a `ACT06`-`ACT08`, y los tres primeros diales del Plus a los eventos radiales/encoder ya soportados. La cuarta rueda, la pantalla táctil y las teclas XL sobrantes quedan reservadas.
+El mapeo mantiene el contrato Codex existente: teclas 0-5 a `AG00`-`AG05`, teclas auxiliares a `ACT06`-`ACT08`, y los tres primeros rotores del Plus/+ XL a los eventos radiales/encoder ya soportados. En el XL original, que no tiene rotores, el bridge reserva las teclas sobrantes salvo una disposición fija: índices 11/18/19/20/27 forman una cruceta (arriba/izquierda/enviar/derecha/abajo), 29/30/31 simulan el rotor (CC/click/CW) y 14 es el botón Mic (`ACT10`). Las teclas reservadas permanecen negras y no producen eventos. Los iconos Mic y Enviar a Codex se dibujan directamente en el XL; las imágenes de estado 0-5 siguen viniendo de `v.oai.thstatus`. No se añaden mensajes Codex nuevos.
 
 ### Panel de contexto en Stream Deck +
 
@@ -228,12 +229,13 @@ AJAZZ.
 El proceso permanece activo indefinidamente si se omite `--listen`; `--listen N` queda reservado para pruebas y `--listen 0` equivale tambiÃ©n a ilimitado.
 
 
-## Daemon multi-agente (Codex + Hermes)
+## Daemon multi-agente (Codex + ZCode + Hermes)
 
 El bridge puede correr como **daemon** (`--daemon`) que posee el hardware una
-vez y sirve a varios agentes simultaneamente por TCP loopback. Cada agente
-(Codex CLI, Hermes Desktop Agent) lanza un **proxy STDIO** (`--mcp-proxy`)
-que se conecta al daemon y bombea lineas JSON-RPC en ambas direcciones.
+vez y sirve a hasta tres agentes simultaneamente por TCP loopback. Cada agente
+(Codex CLI, ZCode ADE, Hermes Desktop Agent) lanza un **proxy STDIO**
+(`--mcp-proxy`) que se conecta al daemon y bombea lineas JSON-RPC en ambas
+direcciones.
 
 ``text
 AJAZZ / Stream Deck --HID-- daemon --CDC-- RP2040 --HID-- ChatGPT
@@ -244,16 +246,24 @@ AJAZZ / Stream Deck --HID-- daemon --CDC-- RP2040 --HID-- ChatGPT
                 Codex CLI           Hermes Desktop Agent
 ``
 
-### Particion de teclas y slots LCD
+### Particion dinamica de teclas y slots LCD
 
-- **Codex/ChatGPT**: `AG00`-`AG02` + slots LCD 1-3 (via HID como antes).
-- **Hermes**: `AG03`-`AG05` + slots LCD 4-6 (via MCP `poll_events` y
-  `set_thread_status`).
-- Teclas auxiliares (`ACT06`-`ACT08`) y rotores permanecen en Codex.
+La particion de las 6 teclas LCD y 6 slots se ajusta dinamicamente segun
+cuantos agentes estan activos. Prioridad: **Codex > ZCode > Hermes**.
 
-Los slots LCD se fusionan: cada agente solo escribe su rango y el controlador
-fisico muestra siempre el estado combinado. Hermes recibe las pulsaciones a
-traves de la tool `poll_events` (long-poll hasta 25 s).
+- **1 agente activo**: posee las 6 teclas y los 6 slots.
+- **2 agentes activos**: el de mayor prioridad toma `AG00`-`AG02` / slots 1-3;
+  el otro toma `AG03`-`AG05` / slots 4-6.
+- **3 agentes activos**: particion por **columnas**: Codex `AG00`+`AG03`
+  (slots 1,4), ZCode `AG01`+`AG04` (slots 2,5), Hermes `AG02`+`AG05`
+  (slots 3,6).
+
+"Activo" significa: tiene una sesion MCP viva en el daemon, o (solo Codex)
+el RP2040 esta conectado. Cuando el conjunto activo cambia, el daemon espera
+750 ms (debounce) y reparticiona. Cada agente activo recibe un evento de
+particion via `poll_events`. El estado LCD se conserva durante los cambios.
+
+Ver `docs/ZCode_integration.md` para la matriz completa de particiones.
 
 ### Arranque
 
@@ -288,18 +298,23 @@ cwd = "D:\Programming\micro-emu"
 ``
 
 `--autostart` hace que el proxy lance el daemon automaticamente si no esta
-corriendo. El daemon solo escucha en `127.0.0.1:48360` (configurable con
-`--bind`).
+corriendo. Un lockfile en `%LOCALAPPDATA%\micro-emu\bridge-daemon.lock`
+evita que varios proxies intenten arrancar el daemon simultaneamente. El
+daemon solo escucha en `127.0.0.1:48360` (configurable con `--bind`).
 
-### Tools de Hermes
+### Tools por agente
 
 Hermes ve un conjunto filtrado de tools:
 
 - `bridge_status` - estado del daemon, firmware, controlador y agentes.
-- `poll_events` - drena las pulsaciones fisicas bufferizadas (AG03-AG05).
-  Con `timeout_ms > 0` espera hasta ese numero de milisegundos.
-- `set_thread_status` - actualiza los slots LCD 4-6.
+- `poll_events` - drena las pulsaciones fisicas bufferizadas para sus teclas.
+  Con `timeout_ms > 0` espera hasta ese numero de milisegundos. Tambien
+  entrega eventos de cambio de particion.
+- `set_thread_status` - actualiza los slots LCD asignados a Hermes.
 - `set_rgb_config` - envia `v.oai.rgbcfg`.
+
+ZCode ve las mismas tools que Hermes mas `set_display_context` (panel de
+contexto del Stream Deck +).
 
 Codex conserva todas las tools existentes mas `poll_events`.
 
@@ -309,3 +324,11 @@ El daemon puede arrancar sin RP2040 conectado. En ese modo no abre puerto
 serie, no hace health-check ni reconexion CDC, y las tools que requieren el
 RP2040 (`emit_key`, `send_codex_message`, `device_status`) devuelven un
 error claro. El controlador fisico y `poll_events` siguen funcionando.
+## Task board and multi-device daemon
+
+Daemon mode pools task slots from all configured HID controllers. Use repeatable `--device KIND[,serial=SERIAL][,task-slots=N]` options; the old single `--controller`/`--controller-serial` flags remain compatibility aliases. AJAZZ has six slots, Stream Deck+ eight, and XL models default to eight. Same-model devices must be selected by serial when ambiguous.
+
+Call `publish_tasks` with snapshot semantics and stable `task_id` values. The return value gives each task's current physical assignment or `null` on overflow. `set_thread_status` adapts legacy six-entry arrays to stable session-local cards. `poll_events` adds `task_selected` and `layout_changed` events while retaining legacy key events for adapter clients. Selected-task context is device-scoped; daemon RGB is centrally managed.
+
+TCP sessions are registered before hello, require a valid hello before tools are exposed, and may share a client kind. Hello metadata includes a generated instance id and focus capability. Disconnects retain cards for 30 seconds for stable-id republish/reclaim. `bridge_status` version 2 exposes sessions, devices, assignments, overflow, per-device selection, queue depth, and leases.
+LCD task tiles now show a compact owning-agent label (`codex`, `zcode`, or `hermes`) above a smaller slot number. The color tile and task assignment behavior are unchanged; blank/unassigned tiles remain black.

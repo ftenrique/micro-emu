@@ -28,31 +28,36 @@ const DIGITS: [[u8; 15]; DISPLAY_KEY_COUNT] = [
 
 pub struct AjazzDevice {
     device: HidDevice,
+    serial: Option<String>,
     pressed_buttons: HashSet<u8>,
     pressed_encoders: [bool; 3],
     last_colors: [Option<(u32, u8)>; DISPLAY_KEY_COUNT],
+    last_agents: [Option<String>; DISPLAY_KEY_COUNT],
 }
 
 impl AjazzDevice {
-    pub fn connect() -> Result<Self, String> {
+    pub fn connect(requested_serial: Option<&str>) -> Result<Self, String> {
         let api = HidApi::new().map_err(|error| error.to_string())?;
-        let info = api
-            .device_list()
-            .find(|device| {
-                device.vendor_id() == VENDOR_ID
-                    && device.product_id() == PRODUCT_ID
-                    && device.usage_page() == USAGE_PAGE
-                    && device.usage() == USAGE
-            })
-            .ok_or_else(|| "AKP03E rev. 2 vendor interface FFA0:0001 was not found".to_owned())?;
+        let candidates = api.device_list().filter(|device| {
+            device.vendor_id() == VENDOR_ID
+                && device.product_id() == PRODUCT_ID
+                && device.usage_page() == USAGE_PAGE
+                && device.usage() == USAGE
+                && requested_serial.map(|serial| device.serial_number() == Some(serial)).unwrap_or(true)
+        }).collect::<Vec<_>>();
+        if candidates.is_empty() { return Err("AKP03E rev. 2 vendor interface FFA0:0001 was not found".to_owned()); }
+        if candidates.len() != 1 { return Err("multiple AJAZZ devices were found; pass --device ajazz,serial=SERIAL".to_owned()); }
+        let info = candidates[0];
         let device = api.open_path(info.path()).map_err(|error| {
             format!("could not open AJAZZ MI_00; close the vendor app first: {error}")
         })?;
         let mut result = Self {
             device,
+            serial: info.serial_number().map(str::to_owned),
             pressed_buttons: HashSet::new(),
             pressed_encoders: [false; 3],
             last_colors: [None; DISPLAY_KEY_COUNT],
+            last_agents: std::array::from_fn(|_| None),
         };
         result.write_command(&[0x44, 0x49, 0x53, 0x00, 0x00])?;
         result.write_command(&[0x4c, 0x49, 0x47, 0x00, 0x00, 100])?;
@@ -91,38 +96,29 @@ impl AjazzDevice {
         // v.oai.thstatus, so a global rgbcfg update cannot repaint every slot.
         Ok(())
     }
-    pub fn apply_thread_status(&mut self, parameters: &Value) -> Result<(), String> {
+pub fn apply_thread_status(&mut self, parameters: &Value) -> Result<(), String> {
         let Some(entries) = parameters.as_array() else {
             return Err("v.oai.thstatus parameters must be an array".to_owned());
         };
         let mut colors = self.last_colors;
+        let mut agents = self.last_agents.clone();
         for entry in entries {
-            let Some(id) = entry.get("id").and_then(Value::as_u64) else {
-                continue;
-            };
-            if id >= DISPLAY_KEY_COUNT as u64 {
-                continue;
-            }
+            let Some(id) = entry.get("id").and_then(Value::as_u64) else { continue; };
+            if id >= DISPLAY_KEY_COUNT as u64 { continue; }
+            let index = id as usize;
             let color = entry.get("c").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let brightness = entry
-                .get("b")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0)
-                .clamp(0.0, 1.0);
+            let brightness = entry.get("b").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.0, 1.0);
             let effect = entry.get("e").and_then(Value::as_u64);
-            // Codex Micro uses effect=0 (OFF), or b=0, to release an
-            // Agent-Key slot. Treat that as a real clear rather than drawing
-            // an indigo number over a black JPEG, which otherwise leaves a
-            // visible remnant after a thread finishes.
             if effect == Some(0) || brightness <= f64::EPSILON {
-                colors[id as usize] = None;
+                colors[index] = None;
+                agents[index] = None;
             } else {
-                colors[id as usize] = Some((color & 0x00ff_ffff, (brightness * 100.0) as u8));
+                colors[index] = Some((color & 0x00ff_ffff, (brightness * 100.0) as u8));
+                agents[index] = entry.get("agent").and_then(Value::as_str).map(str::to_owned);
             }
         }
-        self.apply_colors(colors)
+        self.apply_colors(colors, agents)
     }
-
     fn clear_displays(&mut self) -> Result<(), String> {
         // First discard the device's stored frames (including any digit
         // overlay), then commit an explicit black image to every LCD.  CLE by
@@ -147,23 +143,16 @@ impl AjazzDevice {
         self.write_command(&[0x43, 0x4c, 0x45, 0x00, 0x00, 0x00, key + 1])
     }
 
-    fn apply_colors(
-        &mut self,
-        colors: [Option<(u32, u8)>; DISPLAY_KEY_COUNT],
-    ) -> Result<(), String> {
+fn apply_colors(&mut self, colors: [Option<(u32, u8)>; DISPLAY_KEY_COUNT], agents: [Option<String>; DISPLAY_KEY_COUNT]) -> Result<(), String> {
         let mut changed = false;
         for (index, color) in colors.into_iter().enumerate() {
-            if self.last_colors[index] == color {
-                continue;
-            }
+            if self.last_colors[index] == color && self.last_agents[index] == agents[index] { continue; }
             match color {
                 Some((rgb, brightness)) => {
-                    let encoded = encode_color_image(index, rgb, brightness, true)?;
+                    let encoded = encode_color_image_with_agent(index, rgb, brightness, true, agents[index].as_deref())?;
                     self.write_image(index as u8, &encoded)?;
                 }
                 None => {
-                    // Purge the old frame first, then write an explicit black
-                    // image: CLE alone displays the device's neutral grey.
                     self.clear_display(index as u8)?;
                     let encoded = encode_color_image(index, 0, 0, false)?;
                     self.write_image(index as u8, &encoded)?;
@@ -171,14 +160,12 @@ impl AjazzDevice {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
             self.last_colors[index] = color;
+            self.last_agents[index] = agents[index].clone();
             changed = true;
         }
-        if changed {
-            self.write_command(&[0x53, 0x54, 0x50])?;
-        }
+        if changed { self.write_command(&[0x53, 0x54, 0x50])?; }
         Ok(())
     }
-
     fn events_from_code(&mut self, code: u8) -> Vec<PhysicalEvent> {
         match code {
             0 => self
@@ -278,7 +265,7 @@ impl PhysicalController for AjazzDevice {
         "0300:3002"
     }
     fn serial(&self) -> Option<&str> {
-        None
+        self.serial.as_deref()
     }
     fn poll(&mut self, timeout_ms: i32) -> Result<Vec<PhysicalEvent>, String> {
         AjazzDevice::poll(self, timeout_ms)
@@ -291,12 +278,11 @@ impl PhysicalController for AjazzDevice {
     }
     fn shutdown(&mut self) {}
 }
-fn encode_color_image(
-    index: usize,
-    color: u32,
-    brightness: u8,
-    draw_digits: bool,
-) -> Result<Vec<u8>, String> {
+fn encode_color_image(index: usize, color: u32, brightness: u8, draw_digits: bool) -> Result<Vec<u8>, String> {
+    encode_color_image_with_agent(index, color, brightness, draw_digits, None)
+}
+
+fn encode_color_image_with_agent(index: usize, color: u32, brightness: u8, draw_digits: bool, agent: Option<&str>) -> Result<Vec<u8>, String> {
     let scale = u32::from(brightness.min(100));
     let base = [
         (((color >> 16) & 0xff) * scale / 100) as u8,
@@ -304,38 +290,27 @@ fn encode_color_image(
         ((color & 0xff) * scale / 100) as u8,
     ];
     let mut image = RgbImage::from_pixel(SOURCE_SIZE, SOURCE_SIZE, Rgb(base));
-    let cell = 20_u32;
-    let origin_x = (SOURCE_SIZE - 3 * cell) / 2;
-    let origin_y = (SOURCE_SIZE - 5 * cell) / 2;
     if !draw_digits {
-        let rotated = rotate90(&image);
-        return convert_image_with_format(
-            ImageFormat {
-                mode: ImageMode::JPEG,
-                size: (TRANSPORT_SIZE, TRANSPORT_SIZE),
-                rotation: ImageRotation::Rot0,
-                mirror: ImageMirroring::None,
-            },
-            DynamicImage::ImageRgb8(rotated),
-        )
-        .map_err(|error| error.to_string());
+        return encode_ajazz_image(image);
     }
+    if let Some(agent) = agent { draw_agent_label(&mut image, agent); }
+    let cell = 9_u32;
+    let origin_x = (SOURCE_SIZE - 3 * cell) / 2;
+    let origin_y = 15_u32;
     for row in 0..5 {
         for column in 0..3 {
-            if DIGITS[index][row * 3 + column] == 0 {
-                continue;
-            }
+            if DIGITS[index][row * 3 + column] == 0 { continue; }
             for y in 2..cell - 2 {
                 for x in 2..cell - 2 {
-                    image.put_pixel(
-                        origin_x + column as u32 * cell + x,
-                        origin_y + row as u32 * cell + y,
-                        Rgb(DIGIT_COLOR),
-                    );
+                    image.put_pixel(origin_x + column as u32 * cell + x, origin_y + row as u32 * cell + y, Rgb(DIGIT_COLOR));
                 }
             }
         }
     }
+    encode_ajazz_image(image)
+}
+
+fn encode_ajazz_image(image: RgbImage) -> Result<Vec<u8>, String> {
     let rotated = rotate90(&image);
     convert_image_with_format(
         ImageFormat {
@@ -345,10 +320,40 @@ fn encode_color_image(
             mirror: ImageMirroring::None,
         },
         DynamicImage::ImageRgb8(rotated),
-    )
-    .map_err(|error| error.to_string())
+    ).map_err(|error| error.to_string())
 }
 
+fn draw_agent_label(image: &mut RgbImage, agent: &str) {
+    let text = agent.to_ascii_lowercase();
+    let scale = 2_u32;
+    let width = text.chars().count() as u32 * 8;
+    let start_x = (SOURCE_SIZE.saturating_sub(width)) / 2;
+    for (index, ch) in text.chars().enumerate() {
+        let glyph = agent_glyph(ch);
+        for row in 0..5 { for column in 0..3 {
+            if glyph[row * 3 + column] == 0 { continue; }
+            for y in 0..scale { for x in 0..scale {
+                image.put_pixel(start_x + index as u32 * 8 + column as u32 * scale + x, 2 + row as u32 * scale + y, Rgb(DIGIT_COLOR));
+            }}
+        }}
+    }
+}
+
+fn agent_glyph(ch: char) -> [u8; 15] {
+    match ch {
+        'c' => [0,1,1,1,0,0,1,0,0,1,0,0,0,1,1],
+        'd' => [1,1,0,1,0,1,1,0,1,1,0,1,1,1,0],
+        'e' => [1,1,1,1,0,0,1,1,0,1,0,0,1,1,1],
+        'h' => [1,0,1,1,0,1,1,1,1,1,0,1,1,0,1],
+        'm' => [1,0,1,1,1,1,1,1,1,1,0,1,1,0,1],
+        'o' => [0,1,0,1,0,1,1,0,1,1,0,1,0,1,0],
+        'r' => [1,1,0,1,0,1,1,1,0,1,0,1,1,0,1],
+        's' => [0,1,1,1,0,0,0,1,0,0,0,1,1,1,0],
+        'x' => [1,0,1,0,1,0,0,1,0,0,1,0,1,0,1],
+        'z' => [1,1,1,0,0,1,0,1,0,1,0,0,1,1,1],
+        _ => [0; 15],
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

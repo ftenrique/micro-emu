@@ -89,7 +89,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "set_thread_status",
-                "description": "Update the six AJAZZ LCD status slots using v.oai.thstatus.",
+                "description": "Publish live Codex task/status state to the assigned LCD slots using v.oai.thstatus. The colored numbered cards shown before this call are standby indicators, not task data; call this whenever task status changes. Use bridge_status to see which slots you own.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"status": {"type": "array", "items": {"type": "object"}}},
@@ -98,8 +98,20 @@ pub fn tools() -> Value {
                 }
             },
             {
+                "name": "publish_tasks",
+                "description": "Publish the complete live task-card snapshot for this MCP session. This replaces the standby LCD indicators; call it at task start and whenever the task list or progress changes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tasks": {"type": "array", "items": {"type": "object"}}
+                    },
+                    "required": ["tasks"],
+                    "additionalProperties": false
+                }
+            },
+            {
                 "name": "set_display_context",
-                "description": "Update the optional Stream Deck + dashboard with project, task, model and effort metadata.",
+                "description": "Publish live project/task/model/status/progress metadata to the Stream Deck+ dashboard. The READY strip is standby context; call this at task start and when the active task or progress changes.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -108,7 +120,8 @@ pub fn tools() -> Value {
                         "model": {"type": ["string", "null"]},
                         "effort": {"type": ["string", "null"]},
                         "status": {"type": ["string", "null"]},
-                        "progress": {"type": ["integer", "null"], "minimum": 0, "maximum": 100}
+                        "progress": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+                        "task_id": {"type": ["string", "null"]},
                     },
                     "additionalProperties": false
                 }
@@ -158,12 +171,28 @@ pub fn tools_for(agent: Option<AgentId>) -> Value {
     json!({"tools": filtered})
 }
 
+pub fn daemon_tools_for(agent: Option<AgentId>) -> Value {
+    let mut result = tools_for(agent);
+    if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.retain(|tool| tool.get("name").and_then(Value::as_str) != Some("set_rgb_config"));
+    }
+    result
+}
 /// Returns true if the given tool is available for the agent.
 pub fn tool_available(name: &str, agent: Option<AgentId>) -> bool {
     match agent {
         Some(AgentId::Hermes) => matches!(
             name,
-            "bridge_status" | "poll_events" | "set_thread_status" | "set_rgb_config"
+            "bridge_status" | "poll_events" | "set_thread_status" | "publish_tasks" | "set_rgb_config"
+        ),
+        Some(AgentId::ZCode) => matches!(
+            name,
+            "bridge_status"
+                | "poll_events"
+                | "set_thread_status"
+                | "publish_tasks"
+                | "set_rgb_config"
+                | "set_display_context"
         ),
         // Codex or unknown (legacy --mcp): all tools.
         _ => true,
@@ -174,7 +203,7 @@ pub fn tool_available(name: &str, agent: Option<AgentId>) -> bool {
 pub fn poll_events_tool() -> Value {
     json!({
         "name": "poll_events",
-        "description": "Drain buffered physical controller events for the calling agent. With timeout_ms > 0, waits up to that many milliseconds for events to arrive (long-poll). Returns an array of {key, pressed, ts}.",
+        "description": "Drain buffered physical controller events for the calling agent. With timeout_ms > 0, waits up to that many milliseconds for events to arrive (long-poll). Returns an array of events; key events have shape {type:\"key\", key, pressed, ts} and partition change events have shape {type:\"partition\", keys, slots, agents, ts}.",
         "inputSchema": {
             "type": "object",
             "properties": {

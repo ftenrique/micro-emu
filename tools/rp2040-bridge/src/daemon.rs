@@ -4,17 +4,31 @@
 //! See `run_daemon` for the entry point invoked from `main.rs` when the
 //! `--daemon` flag is set.
 
-use crate::routing::AgentId;
 use crate::mcp;
+use crate::routing::{ActiveSet, AgentId, Partition};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn log_context() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    format!("ts={millis} pid={}", std::process::id())
+}
 
 /// Default loopback bind address for the daemon.
 pub const DEFAULT_BIND: &str = "127.0.0.1:48360";
+
+/// Debounce period before a repartition is applied after the active set
+/// changes. Agent restarts and workspace switches cause brief membership
+/// fluctuations; this prevents LCD churn.
+const REPARTITION_DEBOUNCE: Duration = Duration::from_millis(750);
 
 /// Internal greeting sent by a proxy as its first line to identify which
 /// agent it represents. The daemon consumes it and does not forward it to
@@ -22,11 +36,20 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:48360";
 const BRIDGE_HELLO: &str = "hello";
 
 /// A message received from a connected session.
+#[derive(Clone, Debug)]
+pub(crate) struct HelloInfo {
+    agent: AgentId,
+    instance_id: Option<String>,
+    focus_capable: bool,
+}
+
 pub enum SessionMessage {
+    /// Registers the response writer before the session sends its hello.
+    Connected { session_id: usize, writer: Sender<Result<Value, String>> },
     /// A parsed JSON-RPC request from the session.
     Request { session_id: usize, request: Value },
     /// The session identified its agent via the hello line.
-    Hello { session_id: usize, agent: AgentId },
+    Hello { session_id: usize, info: HelloInfo },
     /// The session disconnected.
     Disconnected { session_id: usize },
     /// An I/O or parse error on the session.
@@ -38,17 +61,59 @@ pub struct DaemonOptions {
     pub bridge_options: crate::Options,
 }
 
+fn retry_serial_connection(
+    bridge: &mut crate::BridgeRuntime,
+    options: &crate::Options,
+    retry_at: &mut Option<Instant>,
+    retry_delay: &mut Duration,
+    reason: &str,
+) {
+    match crate::replace_runtime(bridge, options) {
+        Ok(()) => {
+            eprintln!("{}", crate::bridge_status(bridge, "daemon-reconnected"));
+            *retry_at = None;
+            *retry_delay = crate::SERIAL_RETRY_INITIAL_DELAY;
+        }
+        Err(error) => {
+            eprintln!("RP2040 reconnect pending ({reason}): {error}");
+            *retry_at = Some(Instant::now() + *retry_delay);
+            *retry_delay = (*retry_delay * 2).min(crate::SERIAL_RETRY_MAX_DELAY);
+        }
+    }
+}
+
+/// Computes the effective active set: agents with live MCP sessions, plus
+/// Codex if the RP2040 serial link is up (ChatGPT drives Codex over HID
+/// without an MCP session).
+fn effective_active_set(session_agents: ActiveSet, codex_hardware_active: bool) -> ActiveSet {
+    let mut set = session_agents;
+    if codex_hardware_active {
+        set.insert(AgentId::Codex);
+    }
+    set
+}
+
 /// Runs the daemon: owns the hardware via a single `BridgeRuntime` and
 /// serves multiple MCP sessions over TCP loopback.
 pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
+    eprintln!("daemon [{}] starting bind={} port={} controller={} serial={:?}", log_context(), options.bind, options.bridge_options.port, options.bridge_options.controller.as_str(), options.bridge_options.controller_serial);
     let listener = TcpListener::bind(&options.bind)
         .map_err(|error| format!("failed to bind {}: {error}", options.bind))?;
     let local = listener
         .local_addr()
         .map_err(|error| format!("could not resolve local addr: {error}"))?;
-    eprintln!("bridge daemon listening on {local}");
+    eprintln!("daemon [{}] listening on {local}", log_context());
 
     let mut bridge = crate::open_runtime(&options.bridge_options)?;
+    bridge.task_mode = true;
+    // Initialize the partition: Codex is active if the RP2040 is present.
+    let mut session_agents = ActiveSet::new();
+    let mut codex_hardware_active = bridge.has_serial();
+    let mut pending_repartition_at: Option<Instant> = None;
+    {
+        let active = effective_active_set(session_agents, codex_hardware_active);
+        bridge.partition = Partition::compute(active);
+    }
     eprintln!("{}", crate::bridge_status(&bridge, "daemon"));
 
     let (session_tx, session_rx) = mpsc::channel::<SessionMessage>();
@@ -59,6 +124,8 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     // the deadline until which the daemon should wait before responding with
     // an empty result.
     let mut pending_polls: Vec<PendingPoll> = Vec::new();
+    let mut serial_retry_at = None;
+    let mut serial_retry_delay = crate::SERIAL_RETRY_INITIAL_DELAY;
 
     // Acceptor thread.
     let accept_tx = session_tx.clone();
@@ -71,10 +138,23 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         // Drain session messages.
         while let Ok(msg) = session_rx.try_recv() {
             match msg {
-                SessionMessage::Hello { session_id, agent } => {
-                    handle_hello(&mut sessions, session_id, agent);
+                SessionMessage::Connected { session_id, writer } => {
+                    eprintln!("daemon [{}] session connected id={session_id}", log_context());
+                    sessions.push(SessionHandle { id: session_id, agent: None, instance_id: None, focus_capable: false, writer, events: VecDeque::new() });
                 }
-                SessionMessage::Request { session_id, request } => {
+                SessionMessage::Hello { session_id, info } => {
+                    eprintln!("daemon [{}] hello session={} agent={} instance={:?} focus={}", log_context(), session_id, info.agent.as_str(), info.instance_id, info.focus_capable);
+                    let agent = info.agent;
+                    handle_hello(&mut sessions, session_id, info);
+                    session_agents.insert(agent);
+                    pending_repartition_at = Some(Instant::now() + REPARTITION_DEBOUNCE);
+                }
+                SessionMessage::Request {
+                    session_id,
+                    request,
+                } => {
+                    let method = request.get("method").and_then(Value::as_str).unwrap_or("<notification-or-invalid>");
+                    eprintln!("daemon [{}] request session={} method={} id={}", log_context(), session_id, method, request.get("id").map(Value::to_string).unwrap_or_else(|| "-".to_owned()));
                     handle_request(
                         &mut sessions,
                         session_id,
@@ -84,13 +164,32 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     )?;
                 }
                 SessionMessage::Disconnected { session_id } => {
+                    eprintln!("daemon [{}] session disconnected id={session_id}", log_context());
+                    let removed_agent = find_session_agent(&sessions, session_id);
+                    bridge.task_board.disconnect_session(session_id, now_ms());
+                    let _ = crate::refresh_task_board(&mut bridge);
                     remove_session(&mut sessions, session_id);
                     pending_polls.retain(|p| p.session_id != session_id);
+                    if let Some(agent) = removed_agent {
+                        if !sessions.iter().any(|s| s.agent == Some(agent)) {
+                            session_agents.remove(agent);
+                            pending_repartition_at = Some(Instant::now() + REPARTITION_DEBOUNCE);
+                        }
+                    }
                 }
                 SessionMessage::Error { session_id, error } => {
-                    eprintln!("session {session_id} error: {error}");
+                    eprintln!("daemon [{}] session error id={session_id}: {error}", log_context());
+                    let removed_agent = find_session_agent(&sessions, session_id);
+                    bridge.task_board.disconnect_session(session_id, now_ms());
+                    let _ = crate::refresh_task_board(&mut bridge);
                     remove_session(&mut sessions, session_id);
                     pending_polls.retain(|p| p.session_id != session_id);
+                    if let Some(agent) = removed_agent {
+                        if !sessions.iter().any(|s| s.agent == Some(agent)) {
+                            session_agents.remove(agent);
+                            pending_repartition_at = Some(Instant::now() + REPARTITION_DEBOUNCE);
+                        }
+                    }
                 }
             }
         }
@@ -111,6 +210,22 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                         match bridge.codex_decoder.feed(&frame.payload) {
                             Ok(messages) => {
                                 for message in messages {
+                                    if bridge.task_mode
+                                        && crate::codex::method(&message) == Some("v.oai.thstatus")
+                                    {
+                                        if let Some(parameters) = message.get("p").or_else(|| message.get("params")) {
+                                            // The serial status is an explicit Codex update even
+                                            // when an optional task field cannot be adapted. Keep
+                                            // it authoritative and let the renderer fall back to
+                                            // the fused status buffer rather than standby cards.
+                                            bridge.has_explicit_task_state = true;
+                                            match bridge.task_board.publish_codex_hid_status(parameters, now_ms()) {
+                                                Ok(()) => eprintln!("Codex HID status accepted entries={}", parameters.as_array().map(Vec::len).unwrap_or(0)),
+                                                Err(error) => eprintln!("Codex task status adapter fallback: {error}"),
+                                            }
+                                            let _ = crate::refresh_task_board(&mut bridge);
+                                        }
+                                    }
                                     let writer = runtime.writer.as_mut();
                                     match crate::process_codex_message(
                                         message,
@@ -118,6 +233,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                                         &mut bridge.last_thread_status,
                                         &mut bridge.last_rgb_config,
                                         &mut bridge.fused_lcd,
+                                        &bridge.partition,
                                         writer,
                                         &mut bridge.sequence,
                                         false,
@@ -163,25 +279,102 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         bridge.serial = serial_taken;
         if let Some(error) = serial_disconnected {
             eprintln!("RP2040 bridge disconnected: {error}");
-            crate::replace_runtime(&mut bridge, &options.bridge_options)?;
-            eprintln!("{}", crate::bridge_status(&bridge, "daemon-reconnected"));
+            retry_serial_connection(
+                &mut bridge,
+                &options.bridge_options,
+                &mut serial_retry_at,
+                &mut serial_retry_delay,
+                "device event",
+            );
+        }
+
+        // Retry a port that was still absent or busy after resume. Keep the
+        // daemon alive while Windows finishes re-enumerating the USB device.
+        let now = Instant::now();
+        if !bridge.has_serial()
+            && options.bridge_options.port != "none"
+            && serial_retry_at.is_some_and(|retry_at| now >= retry_at)
+        {
+            retry_serial_connection(
+                &mut bridge,
+                &options.bridge_options,
+                &mut serial_retry_at,
+                &mut serial_retry_delay,
+                "port unavailable",
+            );
         }
 
         // Health check (only with serial).
-        let now = Instant::now();
         if bridge.has_serial() {
             if bridge.health.timed_out_at(now) {
                 eprintln!("RP2040 health check timed out; reconnecting");
-                crate::replace_runtime(&mut bridge, &options.bridge_options)?;
+                retry_serial_connection(
+                    &mut bridge,
+                    &options.bridge_options,
+                    &mut serial_retry_at,
+                    &mut serial_retry_delay,
+                    "health timeout",
+                );
             } else if let Err(error) = crate::send_health_ping(&mut bridge, now) {
                 eprintln!("RP2040 health check failed: {error}");
-                crate::replace_runtime(&mut bridge, &options.bridge_options)?;
+                retry_serial_connection(
+                    &mut bridge,
+                    &options.bridge_options,
+                    &mut serial_retry_at,
+                    &mut serial_retry_delay,
+                    "health write",
+                );
             }
         }
 
         // Controller reconnect + poll.
         crate::reconnect_controller_if_due(&mut bridge);
+        bridge.task_board.expire(now_ms());
+        let _ = crate::refresh_task_board(&mut bridge);
         crate::poll_controller(&mut bridge, false)?;
+        for (session_id, event) in bridge.pending_task_events.drain(..) {
+            if let Some(session) = sessions.iter_mut().find(|session| session.id == session_id) {
+                session.events.push_back(event);
+            }
+        }
+
+        // Track RP2040 attach/detach for Codex hardware activity.
+        let now_has_serial = bridge.has_serial();
+        if now_has_serial != codex_hardware_active {
+            codex_hardware_active = now_has_serial;
+            pending_repartition_at = Some(now + REPARTITION_DEBOUNCE);
+        }
+
+        // Apply a debounced repartition if the active set has changed.
+        if let Some(repartition_at) = pending_repartition_at {
+            if now >= repartition_at {
+                pending_repartition_at = None;
+                let active = effective_active_set(session_agents, codex_hardware_active);
+                let new_partition = Partition::compute(active);
+                eprintln!(
+                    "repartition: active={:?} owners={:?}",
+                    active.iter(),
+                    new_partition.owners_json()
+                );
+                bridge.partition = new_partition.clone();
+                // Re-render through the centralized desired-state path.  An
+                // empty fused buffer is not an explicit Codex update; sending
+                // it directly would clear the connection-default cards while
+                // the MCP session is merely establishing its partition.
+                let _ = crate::refresh_task_board(&mut bridge);
+                // Notify all active agents about the new partition.
+                let active_list = active.iter();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                for agent in &active_list {
+                    bridge
+                        .routing
+                        .push_partition_event(*agent, &new_partition, &active_list, now_ms);
+                }
+            }
+        }
 
         // Resolve pending long-polls that have events or have timed out.
         resolve_pending_polls(&mut pending_polls, &mut sessions, &mut bridge, now);
@@ -194,7 +387,10 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
 struct SessionHandle {
     id: usize,
     agent: Option<AgentId>,
+    instance_id: Option<String>,
+    focus_capable: bool,
     writer: Sender<Result<Value, String>>,
+    events: VecDeque<Value>,
 }
 
 struct PendingPoll {
@@ -229,7 +425,7 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
         .peer_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
-    eprintln!("session {id} connected from {peer}");
+    eprintln!("daemon [{}] session {id} connected from {peer}", log_context());
 
     let read_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -242,7 +438,7 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
         }
     };
 
-    let (_writer_tx, writer_rx) = mpsc::channel::<Result<Value, String>>();
+    let (writer_tx, writer_rx) = mpsc::channel::<Result<Value, String>>();
     let mut write_stream = stream;
 
     // Writer thread.
@@ -252,16 +448,13 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
             for message in writer_rx.iter() {
                 let line = match message {
                     Ok(value) => serde_json::to_string(&value).unwrap_or_default(),
-                    Err(error) => serde_json::to_string(&mcp::error_response(
-                        None,
-                        -32001,
-                        error,
-                    ))
-                    .unwrap_or_default(),
+                    Err(error) => serde_json::to_string(&mcp::error_response(None, -32001, error))
+                        .unwrap_or_default(),
                 };
                 if let Err(error) = write_stream
                     .write_all(line.as_bytes())
-                    .and_then(|_| write_stream.write_all(b"\n"))
+                    .and_then(|_| write_stream.write_all(b"
+"))
                     .and_then(|_| write_stream.flush())
                 {
                     eprintln!("session {id} write failed: {error}");
@@ -269,6 +462,10 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
                 }
             }
         });
+
+    if tx.send(SessionMessage::Connected { session_id: id, writer: writer_tx }).is_err() {
+        return;
+    }
 
     // Reader loop.
     let reader = BufReader::new(read_stream);
@@ -279,11 +476,11 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
             Ok(line) => {
                 if first_line {
                     first_line = false;
-                    if let Some(agent) = parse_hello(&line) {
-                        let _ = tx.send(SessionMessage::Hello {
-                            session_id: id,
-                            agent,
-                        });
+                    if let Some(mut info) = parse_hello_info(&line) {
+                        if info.instance_id.is_none() {
+                            info.instance_id = Some(format!("session-{id}"));
+                        }
+                        let _ = tx.send(SessionMessage::Hello { session_id: id, info });
                         continue;
                     }
                     // Fall through: treat as a normal MCP request.
@@ -318,28 +515,36 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
             }
         }
     }
+    eprintln!("daemon [{}] session {id} reader reached EOF", log_context());
     let _ = tx.send(SessionMessage::Disconnected { session_id: id });
 }
 
-fn parse_hello(line: &str) -> Option<AgentId> {
+fn parse_hello_info(line: &str) -> Option<HelloInfo> {
     let value: Value = serde_json::from_str(line).ok()?;
-    if value.get("bridge").and_then(Value::as_str) == Some(BRIDGE_HELLO) {
-        value
-            .get("agent")
-            .and_then(Value::as_str)
-            .and_then(|s| AgentId::parse(s).ok())
-    } else {
-        None
+    if value.get("bridge").and_then(Value::as_str) != Some(BRIDGE_HELLO) {
+        return None;
     }
+    let agent = value.get("agent").and_then(Value::as_str).and_then(|s| AgentId::parse(s).ok())?;
+    let instance_id = value.get("instance_id").or_else(|| value.get("instance"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 160)
+        .map(str::to_owned);
+    let focus_capable = value.get("focus").and_then(Value::as_bool)
+        .or_else(|| value.get("capabilities").and_then(|v| v.get("focus")).and_then(Value::as_bool))
+        .unwrap_or(false);
+    Some(HelloInfo { agent, instance_id, focus_capable })
 }
 
-fn handle_hello(sessions: &mut Vec<SessionHandle>, session_id: usize, agent: AgentId) {
-    // Replace any existing session for the same agent (the new one wins).
-    sessions.retain(|s| s.agent != Some(agent));
-    // Find the session by id and set its agent.
+fn parse_hello(line: &str) -> Option<AgentId> {
+    parse_hello_info(line).map(|info| info.agent)
+}
+
+fn handle_hello(sessions: &mut Vec<SessionHandle>, session_id: usize, info: HelloInfo) {
     if let Some(session) = sessions.iter_mut().find(|s| s.id == session_id) {
-        session.agent = Some(agent);
-        eprintln!("session {session_id} registered as agent {}", agent.as_str());
+        session.agent = Some(info.agent);
+        session.instance_id = Some(info.instance_id.unwrap_or_else(|| format!("session-{session_id}")));
+        session.focus_capable = info.focus_capable;
+        eprintln!("session {session_id} registered as agent {} (instance {}, focus={})", info.agent.as_str(), session.instance_id.as_deref().unwrap_or("unknown"), session.focus_capable);
     }
 }
 
@@ -385,19 +590,46 @@ fn handle_request(
         return Ok(());
     };
     let agent = find_session_agent(sessions, session_id);
+    let Some(agent) = agent else {
+        send_to_session(sessions, session_id, mcp::error_response(Some(id), -32000, "daemon session must send a valid bridge hello first"));
+        return Ok(());
+    };
+    let instructions = match Some(agent) {
+        Some(a) => {
+            let keys = bridge.partition.keys_for(a);
+            let slots = bridge.partition.slots_for(a);
+            format!(
+                "{} agent. Use bridge_status first. Your keys: {:?}, LCD slots: {:?}. \
+                 Use poll_events to receive key presses and partition change notifications. \
+                 The colored numbered LCD cards and READY dashboard shown before an explicit update are standby indicators only. \
+                 Publish live task state with publish_tasks or set_thread_status, and live dashboard metadata with set_display_context, at task start and whenever state changes.",
+                a.as_str(),
+                keys,
+                slots
+            )
+        }
+        None => "Use bridge_status first. Hardware actions target the RP2040 on the configured serial port.".to_owned(),
+    };
     let result = match method {
         "initialize" => json!({
             "protocolVersion": mcp::PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "micro-emu-bridge", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": match agent {
-                Some(AgentId::Hermes) => "Hermes agent. Use bridge_status first, then poll_events to receive physical key presses (AG03-AG05). set_thread_status writes LCD slots 4-6.",
-                _ => "Codex agent. Use bridge_status first. Hardware actions target the RP2040 on the configured serial port.",
-            }
+            "instructions": instructions
         }),
         "ping" => json!({}),
-        "tools/list" => mcp::tools_for(agent),
-        "tools/call" => call_tool_for(&request, bridge, agent, pending_polls, session_id, id.clone()),
+        "resources/list" => json!({"resources": []}),
+        "resources/templates/list" => json!({"resourceTemplates": []}),
+        "tools/list" => mcp::daemon_tools_for(Some(agent)),
+        "tools/call" => call_tool_for(
+            &request,
+            sessions,
+            bridge,
+            Some(agent),
+            pending_polls,
+            session_id,
+            id.clone(),
+        ),
         _ => {
             send_to_session(
                 sessions,
@@ -413,6 +645,7 @@ fn handle_request(
 
 fn call_tool_for(
     request: &Value,
+    sessions: &mut Vec<SessionHandle>,
     bridge: &mut crate::BridgeRuntime,
     agent: Option<AgentId>,
     pending_polls: &mut Vec<PendingPoll>,
@@ -437,11 +670,24 @@ fn call_tool_for(
     }
 
     match name {
-        "bridge_status" => mcp::text_result(crate::bridge_status(bridge, "daemon")),
+        "bridge_status" => mcp::text_result(daemon_bridge_status(bridge, sessions)),
         "emit_key" => crate::call_emit_key(bridge, arguments),
         "send_codex_message" => crate::call_send_codex_message(bridge, arguments),
-        "set_thread_status" => call_set_thread_status(bridge, arguments, agent),
+        "set_thread_status" => call_set_thread_status(bridge, arguments, agent, session_id),
+        "publish_tasks" => {
+            let agent_id = agent.unwrap_or(AgentId::Codex);
+            match bridge.task_board.publish_tasks(session_id, agent_id, arguments, now_ms()) {
+                Ok(result) => {
+                    bridge.has_explicit_task_state = true;
+                    let _ = crate::refresh_task_board(bridge);
+                    push_session_event(sessions, session_id, json!({"type":"layout_changed","tasks":result.get("tasks"),"ts":now_ms()}));
+                    mcp::text_result(result)
+                }
+                Err(error) => mcp::tool_error(error),
+            }
+        }
         "set_display_context" => crate::call_set_display_context(bridge, arguments),
+        "set_rgb_config" if bridge.task_mode => mcp::tool_error("set_rgb_config is daemon-managed; configure RGB on the bridge"),
         "set_rgb_config" => crate::call_set_rgb_config(bridge, arguments),
         "device_status" => crate::call_device_status(bridge),
         "poll_events" => {
@@ -451,14 +697,16 @@ fn call_tool_for(
                 .unwrap_or(0)
                 .min(25_000);
             let agent = agent.unwrap_or(AgentId::Codex);
+            let session_events = drain_session_events(sessions, session_id);
+            if !session_events.is_empty() {
+                mcp::text_result(json!({"events": session_events}))
+            } else {
             let queue = bridge.routing.queue_mut(agent);
             if !queue.is_empty() {
                 let events: Vec<Value> = queue
                     .drain()
                     .into_iter()
-                    .map(|e| {
-                        json!({"key": e.key, "pressed": e.pressed, "ts": e.timestamp_ms})
-                    })
+                    .map(|e| e.to_json())
                     .collect();
                 mcp::text_result(json!({"events": events}))
             } else if timeout_ms > 0 {
@@ -476,6 +724,7 @@ fn call_tool_for(
             } else {
                 mcp::text_result(json!({"events": []}))
             }
+            }
         }
         _ => mcp::tool_error(format!("unknown MCP tool: {name}")),
     }
@@ -485,6 +734,7 @@ fn call_set_thread_status(
     bridge: &mut crate::BridgeRuntime,
     arguments: &Value,
     agent: Option<AgentId>,
+    session_id: usize,
 ) -> Value {
     let Some(status) = arguments.get("status") else {
         return mcp::tool_error("set_thread_status requires status");
@@ -493,8 +743,17 @@ fn call_set_thread_status(
         return mcp::tool_error("status must be an array");
     }
     let agent = agent.unwrap_or(AgentId::Codex);
-    let fused = match bridge.fused_lcd.merge_from_agent(agent, status) {
-        Ok(fused) => fused,
+    if bridge.task_mode {
+        return match bridge.task_board.publish_legacy_status(session_id, agent, status, now_ms()) {
+            Ok(result) => { bridge.has_explicit_task_state = true; let _ = crate::refresh_task_board(bridge); mcp::text_result(result) }
+            Err(error) => mcp::tool_error(error),
+        };
+    }
+    let fused = match bridge.fused_lcd.merge_from_agent(agent, status, &bridge.partition) {
+        Ok(fused) => {
+            bridge.has_explicit_task_state = true;
+            fused
+        }
         Err(error) => return mcp::tool_error(error),
     };
     // Apply the fused array to the physical controller.
@@ -515,6 +774,35 @@ fn call_set_thread_status(
     mcp::text_result(json!({"updated": true, "agent": agent.as_str()}))
 }
 
+fn daemon_bridge_status(bridge: &crate::BridgeRuntime, sessions: &[SessionHandle]) -> Value {
+    let mut status = crate::bridge_status(bridge, "daemon");
+    let session_values = sessions.iter().map(|session| json!({
+        "session_id": session.id,
+        "agent": session.agent.map(|agent| agent.as_str()),
+        "instance_id": session.instance_id,
+        "focus_capable": session.focus_capable,
+        "queue_depth": session.events.len()
+    })).collect::<Vec<_>>();
+    if let Some(object) = status.as_object_mut() {
+        object.insert("sessions".to_owned(), json!(session_values));
+        object.insert("sessionCount".to_owned(), json!(session_values.len()));
+    }
+    status
+}
+fn now_ms() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
+fn push_session_event(sessions: &mut [SessionHandle], session_id: usize, event: Value) {
+    if let Some(session) = sessions.iter_mut().find(|session| session.id == session_id) {
+        if session.events.len() >= 256 { session.events.pop_front(); }
+        session.events.push_back(event);
+    }
+}
+
+fn drain_session_events(sessions: &mut Vec<SessionHandle>, session_id: usize) -> Vec<Value> {
+    sessions.iter_mut().find(|session| session.id == session_id).map(|session| session.events.drain(..).collect()).unwrap_or_default()
+}
 fn resolve_pending_polls(
     pending_polls: &mut Vec<PendingPoll>,
     sessions: &mut Vec<SessionHandle>,
@@ -524,16 +812,24 @@ fn resolve_pending_polls(
     let mut resolved = Vec::new();
     pending_polls.retain(|poll| {
         let queue = bridge.routing.queue(poll.agent);
-        if !queue.is_empty() || now >= poll.deadline {
-            let events: Vec<Value> = bridge
-                .routing
-                .queue_mut(poll.agent)
-                .drain()
-                .into_iter()
-                .map(|e| json!({"key": e.key, "pressed": e.pressed, "ts": e.timestamp_ms}))
-                .collect();
+        let session_has_events = sessions.iter().find(|session| session.id == poll.session_id).is_some_and(|session| !session.events.is_empty());
+        if session_has_events || !queue.is_empty() || now >= poll.deadline {
+            let mut events = drain_session_events(sessions, poll.session_id);
+            if events.is_empty() {
+                events = bridge
+                    .routing
+                    .queue_mut(poll.agent)
+                    .drain()
+                    .into_iter()
+                    .map(|e| e.to_json())
+                    .collect();
+            }
             let result = mcp::text_result(json!({"events": events}));
-            send_to_session(sessions, poll.session_id, mcp::response(&poll.request_id, result));
+            send_to_session(
+                sessions,
+                poll.session_id,
+                mcp::response(&poll.request_id, result),
+            );
             resolved.push(poll.session_id);
             false
         } else {
@@ -553,26 +849,42 @@ mod tests {
         assert_eq!(parse_hello(line), Some(AgentId::Hermes));
         let line = r#"{"bridge":"hello","agent":"codex"}"#;
         assert_eq!(parse_hello(line), Some(AgentId::Codex));
+        let line = r#"{"bridge":"hello","agent":"zcode"}"#;
+        assert_eq!(parse_hello(line), Some(AgentId::ZCode));
         let line = r#"{"jsonrpc":"2.0","method":"initialize","id":1}"#;
         assert_eq!(parse_hello(line), None);
     }
 
+#[test]
+    fn versioned_hello_carries_instance_and_focus() {
+        let info = parse_hello_info(r#"{"bridge":"hello","version":1,"agent":"zcode","instance_id":"z-1","capabilities":{"focus":true}}"#).unwrap();
+        assert_eq!(info.agent, AgentId::ZCode);
+        assert_eq!(info.instance_id.as_deref(), Some("z-1"));
+        assert!(info.focus_capable);
+    }
     #[test]
-    fn hello_replaces_existing_session_for_same_agent() {
+    fn hello_allows_multiple_sessions_for_same_agent() {
         let mut sessions = vec![SessionHandle {
             id: 1,
             agent: Some(AgentId::Hermes),
+            instance_id: Some("one".to_owned()),
+            focus_capable: false,
             writer: mpsc::channel().0,
+            events: VecDeque::new()
         }];
         // New session id=2 claims Hermes.
         sessions.push(SessionHandle {
             id: 2,
             agent: None,
+            instance_id: None,
+            focus_capable: false,
             writer: mpsc::channel().0,
+            events: VecDeque::new()
         });
-        handle_hello(&mut sessions, 2, AgentId::Hermes);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, 2);
+        handle_hello(&mut sessions, 2, HelloInfo { agent: AgentId::Hermes, instance_id: Some("test".to_owned()), focus_capable: true });
+        assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].agent, Some(AgentId::Hermes));
+        assert_eq!(sessions[1].id, 2);
+        assert_eq!(sessions[1].agent, Some(AgentId::Hermes));
     }
 }
