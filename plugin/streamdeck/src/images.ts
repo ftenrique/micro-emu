@@ -11,9 +11,11 @@ const STATUS_COLORS: Record<string, string> = {
 
 const DEFAULT_COLOR = "#263238";
 
-/** Encode generated SVGs in the data-URI format accepted by Stream Deck. */
+/** Encode generated SVGs in the data-URI format accepted by Stream Deck.
+ * Uses base64 encoding — percent-encoded SVGs render backgrounds but not
+ * text elements in Stream Deck's rasterizer. */
 function svgDataUrl(svg: string): string {
-    return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+    return `data:image/svg+xml;base64,${Buffer.from(svg, "utf-8").toString("base64")}`;
 }
 
 /** 5x3 pixel font for digits 0-7, matching the HID path's DIGITS array. */

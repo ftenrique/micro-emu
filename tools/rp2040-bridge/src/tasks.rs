@@ -1,4 +1,4 @@
-//! Task-instance scheduling for daemon mode.
+﻿//! Task-instance scheduling for daemon mode.
 //!
 //! The legacy bridge partitioned six physical slots by agent product.  The
 //! daemon now treats a task as the schedulable resource and maps tasks onto a
@@ -26,7 +26,7 @@ pub fn display_task_title(slot: usize, title: &str) -> String {
     }
 
     let title = title
-        .split_once(" — ")
+        .split_once(" \u{2014} ")
         .and_then(|(number, remainder)| {
             number
                 .parse::<usize>()
@@ -35,12 +35,15 @@ pub fn display_task_title(slot: usize, title: &str) -> String {
                 .map(|_| remainder)
         })
         .unwrap_or(title);
-    let prefix = format!("{} — ", slot + 1);
+    let prefix = format!("{} \u{2014} ", slot + 1);
     let remaining = 160usize.saturating_sub(prefix.chars().count());
     if title.is_empty() {
         return (slot + 1).to_string();
     }
-    format!("{prefix}{}", title.chars().take(remaining).collect::<String>())
+    format!(
+        "{prefix}{}",
+        title.chars().take(remaining).collect::<String>()
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -140,12 +143,16 @@ impl TaskBoard {
         let device_id = device_id.into();
         if connected {
             let slots = (0..task_slots)
-                .map(|slot| DeviceSlot { device_id: device_id.clone(), slot })
+                .map(|slot| DeviceSlot {
+                    device_id: device_id.clone(),
+                    slot,
+                })
                 .collect();
             self.devices.insert(device_id, slots);
         } else {
             self.devices.remove(&device_id);
-            self.assignments.retain(|_, assignment| assignment.slot.device_id != device_id);
+            self.assignments
+                .retain(|_, assignment| assignment.slot.device_id != device_id);
             self.selected.remove(&device_id);
         }
         self.reallocate();
@@ -175,7 +182,10 @@ impl TaskBoard {
             let id = replacement.last().expect("pushed task").task_id.clone();
             if let Some(existing) = self.tasks.get(&id) {
                 if existing.owner_session != session {
-                    return Err(format!("task_id is already owned by session {}: {id}", existing.owner_session));
+                    return Err(format!(
+                        "task_id is already owned by session {}: {id}",
+                        existing.owner_session
+                    ));
                 }
             }
             if !seen.insert(id.clone()) {
@@ -291,8 +301,13 @@ impl TaskBoard {
             .map_err(|_| "priority must be from 0 to 100".to_owned())?;
         let progress = match object.get("progress") {
             None | Some(Value::Null) => None,
-            Some(value) => Some(value.as_u64().ok_or_else(|| "progress must be an integer".to_owned())?
-                .try_into().map_err(|_| "progress must be from 0 to 100".to_owned())?),
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| "progress must be an integer".to_owned())?
+                    .try_into()
+                    .map_err(|_| "progress must be from 0 to 100".to_owned())?,
+            ),
         };
         let color = parse_color(object.get("color").or_else(|| object.get("c")))?;
         let brightness = parse_brightness(object.get("brightness").or_else(|| object.get("b")))?;
@@ -315,10 +330,16 @@ impl TaskBoard {
     }
 
     fn replace_session_tasks(&mut self, session: usize, replacement: Vec<TaskCard>, now_ms: u128) {
-        let ids: HashSet<String> = replacement.iter().map(|task| task.task_id.clone()).collect();
-        let old_ids: Vec<String> = self.tasks
+        let ids: HashSet<String> = replacement
             .iter()
-            .filter_map(|(id, task)| (task.owner_session == session && !ids.contains(id)).then_some(id.clone()))
+            .map(|task| task.task_id.clone())
+            .collect();
+        let old_ids: Vec<String> = self
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| {
+                (task.owner_session == session && !ids.contains(id)).then_some(id.clone())
+            })
             .collect();
         for id in old_ids {
             self.tasks.remove(&id);
@@ -333,7 +354,11 @@ impl TaskBoard {
 
     pub fn disconnect_session(&mut self, session: usize, now_ms: u128) {
         let until = now_ms + RECONNECT_GRACE.as_millis();
-        for task in self.tasks.values_mut().filter(|task| task.owner_session == session) {
+        for task in self
+            .tasks
+            .values_mut()
+            .filter(|task| task.owner_session == session)
+        {
             task.state = TaskState::Reconnecting;
             task.reconnect_until_ms = Some(until);
         }
@@ -343,8 +368,14 @@ impl TaskBoard {
     }
 
     pub fn expire(&mut self, now_ms: u128) {
-        let expired: Vec<String> = self.tasks.iter()
-            .filter_map(|(id, task)| task.reconnect_until_ms.filter(|until| *until <= now_ms).map(|_| id.clone()))
+        let expired: Vec<String> = self
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| {
+                task.reconnect_until_ms
+                    .filter(|until| *until <= now_ms)
+                    .map(|_| id.clone())
+            })
             .collect();
         for id in &expired {
             self.tasks.remove(id);
@@ -356,8 +387,12 @@ impl TaskBoard {
     }
 
     pub fn select(&mut self, device_id: &str, slot: usize, now_ms: u128) -> Option<Value> {
-        let task_id = self.assignments.iter()
-            .find(|(_, assignment)| assignment.slot.device_id == device_id && assignment.slot.slot == slot)
+        let task_id = self
+            .assignments
+            .iter()
+            .find(|(_, assignment)| {
+                assignment.slot.device_id == device_id && assignment.slot.slot == slot
+            })
             .map(|(id, _)| id.clone())?;
         self.selected.insert(device_id.to_owned(), task_id.clone());
         let task = self.tasks.get(&task_id)?;
@@ -373,8 +408,12 @@ impl TaskBoard {
     }
 
     pub fn task_at(&self, device_id: &str, slot: usize) -> Option<&TaskCard> {
-        let id = self.assignments.iter()
-            .find(|(_, assignment)| assignment.slot.device_id == device_id && assignment.slot.slot == slot)
+        let id = self
+            .assignments
+            .iter()
+            .find(|(_, assignment)| {
+                assignment.slot.device_id == device_id && assignment.slot.slot == slot
+            })
             .map(|(id, _)| id)?;
         self.tasks.get(id)
     }
@@ -408,7 +447,17 @@ impl TaskBoard {
         let slot = self.selected_slot(device_id)?;
         let mut context = serde_json::Map::new();
         if let Some(source) = task.context.as_object() {
-            for key in ["project", "task", "model", "effort", "status", "progress", "task_id"] {
+            for key in [
+                "project",
+                "task",
+                "model",
+                "effort",
+                "status",
+                "progress",
+                "task_id",
+                "weekly_remaining",
+                "five_hour_remaining",
+            ] {
                 if let Some(value) = source.get(key) {
                     context.insert(key.to_owned(), value.clone());
                 }
@@ -426,7 +475,9 @@ impl TaskBoard {
             .entry("status".to_owned())
             .or_insert_with(|| json!(task.state.as_str()));
         if let Some(progress) = task.progress {
-            context.entry("progress".to_owned()).or_insert_with(|| json!(progress));
+            context
+                .entry("progress".to_owned())
+                .or_insert_with(|| json!(progress));
         }
         context
             .entry("task_id".to_owned())
@@ -440,11 +491,17 @@ impl TaskBoard {
 
     pub fn assignments_for_session(&self, session: usize) -> Value {
         let mut result = Vec::new();
-        for task in self.tasks.values().filter(|task| task.owner_session == session) {
-            let assignment = self.assignment(&task.task_id).map(|a| json!({
-                "device_id": a.slot.device_id,
-                "slot": a.slot.slot
-            }));
+        for task in self
+            .tasks
+            .values()
+            .filter(|task| task.owner_session == session)
+        {
+            let assignment = self.assignment(&task.task_id).map(|a| {
+                json!({
+                    "device_id": a.slot.device_id,
+                    "slot": a.slot.slot
+                })
+            });
             result.push(json!({"task_id": task.task_id, "assignment": assignment}));
         }
         result.sort_by(|a, b| a["task_id"].as_str().cmp(&b["task_id"].as_str()));
@@ -452,21 +509,32 @@ impl TaskBoard {
     }
 
     pub fn rendered_slots(&self, device_id: &str, slot_count: usize) -> Vec<Value> {
-        (0..slot_count).map(|slot| {
-            let Some(task) = self.task_at(device_id, slot) else { return json!({"id": slot, "e": 0}); };
-            json!({
-                "id": slot,
-                "e": u8::from(task.state != TaskState::Completed),
-                "t": task.title,
-                "c": task.color.unwrap_or(0),
-                "b": f64::from(task.brightness) / 100.0,
-                "progress": task.progress,
-                "task_id": task.task_id,
-                "agent": task.owner_agent.as_str()
+        (0..slot_count)
+            .map(|slot| {
+                let Some(task) = self.task_at(device_id, slot) else {
+                    return json!({"id": slot, "e": 0});
+                };
+                let title = if task.title.is_empty() {
+                    task.legacy_key
+                        .clone()
+                        .unwrap_or_else(|| format!("Task {}", slot + 1))
+                } else {
+                    task.title.clone()
+                };
+                json!({
+                    "id": slot,
+                    "e": u8::from(task.state != TaskState::Completed),
+                    "t": title,
+                    "status": task.state.as_str(),
+                    "c": task.color.unwrap_or(0),
+                    "b": f64::from(task.brightness) / 100.0,
+                    "progress": task.progress,
+                    "task_id": task.task_id,
+                    "agent": task.owner_agent.as_str()
+                })
             })
-        }).collect()
+            .collect()
     }
-
     pub fn status_json(&self) -> Value {
         let tasks = self.tasks.values().map(|task| {
             let assignment = self.assignment(&task.task_id).map(|a| json!({"device_id": a.slot.device_id, "slot": a.slot.slot}));
@@ -479,13 +547,22 @@ impl TaskBoard {
         let available: Vec<DeviceSlot> = self.devices.values().flatten().cloned().collect();
         let available_set: HashSet<DeviceSlot> = available.iter().cloned().collect();
         self.assignments.retain(|task_id, assignment| {
-            self.tasks.get(task_id).is_some_and(|task| task.state.eligible())
+            self.tasks
+                .get(task_id)
+                .is_some_and(|task| task.state.eligible())
                 && available_set.contains(&assignment.slot)
         });
-        let mut free: Vec<DeviceSlot> = available.into_iter().filter(|slot| !self.assignments.values().any(|a| a.slot == *slot)).collect();
+        let mut free: Vec<DeviceSlot> = available
+            .into_iter()
+            .filter(|slot| !self.assignments.values().any(|a| a.slot == *slot))
+            .collect();
         free.sort_by(|a, b| a.device_id.cmp(&b.device_id).then(a.slot.cmp(&b.slot)));
 
-        let mut candidates: Vec<&TaskCard> = self.tasks.values().filter(|task| task.state.eligible() && !self.assignments.contains_key(&task.task_id)).collect();
+        let mut candidates: Vec<&TaskCard> = self
+            .tasks
+            .values()
+            .filter(|task| task.state.eligible() && !self.assignments.contains_key(&task.task_id))
+            .collect();
         candidates.sort_by(|a, b| task_order(a, b));
         let mut by_session: BTreeMap<usize, Vec<&TaskCard>> = BTreeMap::new();
         for task in candidates {
@@ -498,23 +575,35 @@ impl TaskBoard {
             }
         }
         for slot in free {
-            let Some((&session, _)) = by_session.iter()
+            let Some((&session, _)) = by_session
+                .iter()
                 .filter(|(_, tasks)| !tasks.is_empty())
                 .min_by(|(session_a, tasks_a), (session_b, tasks_b)| {
-                    visible_by_session.get(session_a).unwrap_or(&0)
+                    visible_by_session
+                        .get(session_a)
+                        .unwrap_or(&0)
                         .cmp(visible_by_session.get(session_b).unwrap_or(&0))
                         .then(task_order(tasks_a[0], tasks_b[0]))
                         .then(session_a.cmp(session_b))
-                }) else { break; };
-            let task = by_session.get_mut(&session).expect("session exists").remove(0);
-            self.assignments.insert(task.task_id.clone(), TaskAssignment { slot });
+                })
+            else {
+                break;
+            };
+            let task = by_session
+                .get_mut(&session)
+                .expect("session exists")
+                .remove(0);
+            self.assignments
+                .insert(task.task_id.clone(), TaskAssignment { slot });
             *visible_by_session.entry(session).or_default() += 1;
         }
     }
 }
 
 fn task_order(a: &TaskCard, b: &TaskCard) -> Ordering {
-    a.state.rank().cmp(&b.state.rank())
+    a.state
+        .rank()
+        .cmp(&b.state.rank())
         .then(b.priority.cmp(&a.priority))
         .then(b.updated_at_ms.cmp(&a.updated_at_ms))
         .then(a.task_id.cmp(&b.task_id))
@@ -523,11 +612,18 @@ fn task_order(a: &TaskCard, b: &TaskCard) -> Ordering {
 fn parse_color(value: Option<&Value>) -> Result<Option<u32>, String> {
     match value {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(value)) => value.as_u64().ok_or_else(|| "color must be an integer or #RRGGBB".to_owned()).map(|v| Some((v & 0x00ff_ffff) as u32)),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .ok_or_else(|| "color must be an integer or #RRGGBB".to_owned())
+            .map(|v| Some((v & 0x00ff_ffff) as u32)),
         Some(Value::String(value)) => {
             let raw = value.strip_prefix('#').unwrap_or(value);
-            if raw.len() != 6 { return Err("color must be #RRGGBB".to_owned()); }
-            u32::from_str_radix(raw, 16).map(Some).map_err(|_| "color must be #RRGGBB".to_owned())
+            if raw.len() != 6 {
+                return Err("color must be #RRGGBB".to_owned());
+            }
+            u32::from_str_radix(raw, 16)
+                .map(Some)
+                .map_err(|_| "color must be #RRGGBB".to_owned())
         }
         _ => Err("color must be an integer, #RRGGBB, or null".to_owned()),
     }
@@ -537,9 +633,13 @@ fn parse_brightness(value: Option<&Value>) -> Result<u8, String> {
     match value {
         None | Some(Value::Null) => Ok(100),
         Some(Value::Number(value)) => {
-            let value = value.as_f64().ok_or_else(|| "brightness must be numeric".to_owned())?;
+            let value = value
+                .as_f64()
+                .ok_or_else(|| "brightness must be numeric".to_owned())?;
             let normalized = if value <= 1.0 { value * 100.0 } else { value };
-            if !(0.0..=100.0).contains(&normalized) { return Err("brightness must be from 0 to 100".to_owned()); }
+            if !(0.0..=100.0).contains(&normalized) {
+                return Err("brightness must be from 0 to 100".to_owned());
+            }
             Ok(normalized.round() as u8)
         }
         _ => Err("brightness must be numeric or null".to_owned()),
@@ -570,7 +670,14 @@ mod tests {
     fn legacy_status_accepts_i_and_percent_brightness() {
         let mut board = TaskBoard::new();
         board.set_device("plus", 8, true);
-        board.publish_legacy_status(4, AgentId::Hermes, &json!([{"i":0,"e":1,"t":"hello","c":"#112233","b":80}]), 1).unwrap();
+        board
+            .publish_legacy_status(
+                4,
+                AgentId::Hermes,
+                &json!([{"i":0,"e":1,"t":"hello","c":"#112233","b":80}]),
+                1,
+            )
+            .unwrap();
         let card = board.tasks().next().unwrap();
         assert_eq!(card.color, Some(0x112233));
         assert_eq!(card.brightness, 80);
@@ -582,25 +689,33 @@ mod tests {
         let mut board = TaskBoard::new();
         board.set_device("plus", 8, true);
         board
-            .publish_tasks(1, AgentId::Codex, &json!({"tasks": [{
-                "task_id": "build",
-                "title": "Build bridge",
-                "state": "running",
-                "progress": 42
-            }]}), 1)
+            .publish_tasks(
+                1,
+                AgentId::Codex,
+                &json!({"tasks": [{
+                    "task_id": "build",
+                    "title": "Build bridge",
+                    "state": "running",
+                    "progress": 42
+                }]}),
+                1,
+            )
             .unwrap();
         board.select("plus", 0, 2).expect("selected task");
         let context = board.selected_display_context("plus").expect("context");
-        assert_eq!(context["task"], "1 — Build bridge");
+        assert_eq!(context["task"], "1 \u{2014} Build bridge");
         assert_eq!(context["status"], "running");
         assert_eq!(context["progress"], 42);
     }
 
     #[test]
     fn display_task_title_uses_one_based_slots_and_is_idempotent() {
-        assert_eq!(display_task_title(0, "Build bridge"), "1 — Build bridge");
-        assert_eq!(display_task_title(5, "Build bridge"), "6 — Build bridge");
-        assert_eq!(display_task_title(0, "6 — Existing label"), "1 — Existing label");
+        assert_eq!(display_task_title(0, "Build bridge"), "1 \u{2014} Build bridge");
+        assert_eq!(display_task_title(5, "Build bridge"), "6 \u{2014} Build bridge");
+        assert_eq!(
+            display_task_title(0, "6 \u{2014} Existing label"),
+            "1 \u{2014} Existing label"
+        );
         assert_eq!(display_task_title(6, "Build bridge"), "Build bridge");
     }
 
@@ -624,7 +739,7 @@ mod tests {
         board.select("plus", 5, 2).expect("selected task");
 
         let context = board.selected_display_context("plus").expect("context");
-        assert_eq!(context["task"], "6 — Live task 5");
+        assert_eq!(context["task"], "6 \u{2014} Live task 5");
         assert_eq!(context["task_id"], "wire-5");
     }
 
@@ -632,7 +747,14 @@ mod tests {
     fn reconnect_lease_expires() {
         let mut board = TaskBoard::new();
         board.set_device("plus", 8, true);
-        board.publish_tasks(1, AgentId::Codex, &json!({"tasks":[task("x", "running", 50)]}), 1).unwrap();
+        board
+            .publish_tasks(
+                1,
+                AgentId::Codex,
+                &json!({"tasks":[task("x", "running", 50)]}),
+                1,
+            )
+            .unwrap();
         board.disconnect_session(1, 2);
         assert_eq!(board.tasks().next().unwrap().state, TaskState::Reconnecting);
         assert_eq!(board.assignment("x").unwrap().slot.slot, 0);
@@ -641,3 +763,6 @@ mod tests {
         assert_eq!(board.tasks().count(), 0);
     }
 }
+
+
+
