@@ -1,7 +1,7 @@
 ﻿import { action, SingletonAction, type KeyAction, type DialAction, type WillAppearEvent, type KeyDownEvent, type KeyUpEvent } from "@elgato/streamdeck";
 import type { JsonValue } from "@elgato/utils";
 import { PluginContext } from "../context";
-import { renderKeyImage, renderDisconnectedImage } from "../images";
+import { renderTaskCardImage, renderDisconnectedImage } from "../images";
 
 /** Settings for the Task Card action. */
 export interface TaskCardSettings {
@@ -50,22 +50,17 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
     private refresh(action: TaskCardInstance, settings: TaskCardSettings): void {
         const slot = Number(settings.slot ?? 0);
         if (!this.ctx.isConnected()) {
-            action.setImage(renderDisconnectedImage(`#${slot + 1}`));
+            action.setImage(renderDisconnectedImage(`#${slot}`));
             return;
         }
         const taskCard = this.ctx.getTaskCard(slot);
         const status = taskCard
             ? ((taskCard.status as string) ?? (taskCard.state as string) ?? "")
             : "";
-        const title = taskCard
-            ? ((taskCard.title as string) ?? (taskCard.t as string) ?? "Task " + (slot + 1))
-            : "Task " + (slot + 1);
-        const color = taskCard?.color
-            ?? taskCard?.c;
-        action.setImage(renderKeyImage(truncate(title, 10), status, slot, color));
+        const agent = taskCard
+            ? ((taskCard.agent as string) ?? null)
+            : null;
+        const color = taskCard?.color ?? taskCard?.c;
+        action.setImage(renderTaskCardImage(slot, agent, status, color));
     }
-}
-
-function truncate(text: string, max: number): string {
-    return text.length <= max ? text : text.slice(0, max - 1) + "…";
 }

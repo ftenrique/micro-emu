@@ -42,11 +42,8 @@ export class CruxHorizontalAction extends SingletonAction<CruxDialSettings> {
             ev.action.showAlert();
             return;
         }
-        const ticks = ev.payload.ticks;
-        const delta = ticks >= 0 ? 1 : -1;
-        for (let i = 0; i < Math.abs(ticks); i++) {
-            this.ctx.daemon.sendEncoderTurn(0, delta);
-        }
+        const delta = ev.payload.ticks >= 0 ? 1 : -1;
+        this.ctx.daemon.sendEncoderTurn(0, delta);
     }
 
     onDialDown(ev: DialDownEvent<CruxDialSettings>): void {

@@ -16,6 +16,34 @@ function svgDataUrl(svg: string): string {
     return `data:image/svg+xml,${encodeURIComponent(svg)}`;
 }
 
+/** 5x3 pixel font for digits 0-7, matching the HID path's DIGITS array. */
+const DIGITS: number[][] = [
+    [0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1], // 0
+    [1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1], // 1
+    [1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0], // 2
+    [1, 0, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1], // 3
+    [1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0], // 4
+    [0, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0], // 5
+    [1, 1, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1], // 6
+    [0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1], // 7
+];
+
+/** Renders a big pixel-font digit (0-7) as SVG rects, matching the HID path. */
+function renderDigit(digit: number, originX: number, originY: number, cell: number, color: string): string {
+    if (digit < 0 || digit >= DIGITS.length) return "";
+    const glyph = DIGITS[digit];
+    let rects = "";
+    for (let row = 0; row < 5; row++) {
+        for (let col = 0; col < 3; col++) {
+            if (glyph[row * 3 + col] === 0) continue;
+            const x = originX + col * cell;
+            const y = originY + row * cell;
+            rects += `<rect x="${x + 2}" y="${y + 2}" width="${cell - 4}" height="${cell - 4}" fill="${color}"/>`;
+        }
+    }
+    return rects;
+}
+
 /** Generates a colored key image as a Stream Deck image data URI. */
 export function renderKeyImage(
     label: string,
@@ -33,6 +61,31 @@ export function renderKeyImage(
   ${index !== undefined ? `<text x="${w / 2}" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#fff" fill-opacity="0.5" text-anchor="middle">${index}</text>` : ""}
   <text x="${w / 2}" y="${h / 2 + 6}" font-family="sans-serif" font-size="18" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(label)}</text>
   ${status ? `<text x="${w / 2}" y="${h - 16}" font-family="sans-serif" font-size="11" fill="#fff" fill-opacity="0.7" text-anchor="middle">${escapeXml(status.toUpperCase())}</text>` : ""}
+</svg>`);
+}
+
+/** Renders a task-card key with agent label on top and a big pixel-font digit. */
+export function renderTaskCardImage(
+    slot: number,
+    agent: string | null | undefined,
+    status: string,
+    colorOverride?: unknown,
+): string {
+    const color = normalizeColor(colorOverride) ?? (status ? (STATUS_COLORS[status.toLowerCase()] ?? DEFAULT_COLOR) : DEFAULT_COLOR);
+    const w = 144;
+    const h = 144;
+    const cell = Math.floor(Math.min(w, h) / 10);
+    const digitW = 3 * cell;
+    const digitH = 5 * cell;
+    const originX = Math.floor((w - digitW) / 2);
+    const originY = h - digitH - 16;
+    const agentLabel = agent ? agent.toLowerCase() : "";
+
+    return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+  <rect x="4" y="4" width="${w - 8}" height="${h - 8}" rx="12" fill="${color}" stroke="#000" stroke-opacity="0.2" stroke-width="1"/>
+  <text x="${w / 2}" y="24" font-family="sans-serif" font-size="13" font-weight="bold" fill="#fff" fill-opacity="0.8" text-anchor="middle">${escapeXml(agentLabel)}</text>
+  ${renderDigit(slot, originX, originY, cell, "#c4c2ff")}
+  ${status ? `<text x="${w / 2}" y="${h - 6}" font-family="sans-serif" font-size="9" fill="#fff" fill-opacity="0.6" text-anchor="middle">${escapeXml(status.toUpperCase())}</text>` : ""}
 </svg>`);
 }
 

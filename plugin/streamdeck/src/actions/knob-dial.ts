@@ -8,13 +8,14 @@ import {
     type DialAction,
 } from "@elgato/streamdeck";
 import { PluginContext } from "../context";
-import { renderKnobStrip, renderStripOffline } from "../images";
+import { renderKnobStrip, renderStripOffline, type StripContext } from "../images";
 
 /**
  * Knob dial — emulates the original Codex Micro rotor knob.
  * Rotation sends `EncoderTurn` index 1 (ENC_CW/ENC_CC); press sends
  * `EncoderButton` index 1 (ENC_CLK). The touch strip shows the selected
- * task info (number, project, shortened name).
+ * task info (number, project, shortened name), merging display context
+ * with task-card data when available.
  */
 @action({ UUID: "com.micro-emu.codex.knob" })
 export class KnobDialAction extends SingletonAction {
@@ -35,11 +36,8 @@ export class KnobDialAction extends SingletonAction {
             ev.action.showAlert();
             return;
         }
-        const ticks = ev.payload.ticks;
-        const delta = ticks >= 0 ? 1 : -1;
-        for (let i = 0; i < Math.abs(ticks); i++) {
-            this.ctx.daemon.sendEncoderTurn(1, delta);
-        }
+        const delta = ev.payload.ticks >= 0 ? 1 : -1;
+        this.ctx.daemon.sendEncoderTurn(1, delta);
     }
 
     onDialDown(ev: DialDownEvent): void {
@@ -66,7 +64,22 @@ export class KnobDialAction extends SingletonAction {
             action.setFeedback({ canvas: renderStripOffline("KNOB") });
             return;
         }
-        const ctx = this.ctx.getDisplayContext();
-        action.setFeedback({ canvas: renderKnobStrip(ctx ?? {}) });
+        const displayCtx = this.ctx.getDisplayContext();
+        const stripCtx: StripContext = { ...(displayCtx ?? {}) };
+        // Enrich with task-card data: find the first assigned task card
+        // to show its task_id and title when display context lacks them.
+        for (let i = 0; i < 8; i++) {
+            const card = this.ctx.getTaskCard(i);
+            if (card && (card.e as number) !== 0) {
+                if (!stripCtx.task_id) {
+                    stripCtx.task_id = (card.task_id as string) ?? String(i);
+                }
+                if (!stripCtx.task || stripCtx.task === "BRIDGE") {
+                    stripCtx.task = (card.t as string) ?? stripCtx.task;
+                }
+                break;
+            }
+        }
+        action.setFeedback({ canvas: renderKnobStrip(stripCtx) });
     }
 }

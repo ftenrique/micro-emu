@@ -3,6 +3,7 @@ mod codex;
 mod controller;
 mod daemon;
 mod mcp;
+mod plugin_controller;
 mod proxy;
 mod routing;
 mod serial;
@@ -95,7 +96,9 @@ fn parse_options() -> Result<Options, String> {
                     })?);
             }
             "--device" => {
-                let value = arguments.next().ok_or_else(|| "--device requires KIND[,serial=SERIAL][,task-slots=N]".to_owned())?;
+                let value = arguments.next().ok_or_else(|| {
+                    "--device requires KIND[,serial=SERIAL][,task-slots=N]".to_owned()
+                })?;
                 device_specs.push(DeviceSpec::parse(&value)?);
             }
             "--listen" => {
@@ -171,20 +174,34 @@ fn parse_options() -> Result<Options, String> {
     if mode_count > 1 {
         return Err("--mcp, --legacy, --daemon, and --mcp-proxy are mutually exclusive".to_owned());
     }
-if !device_specs.is_empty() {
+    if !device_specs.is_empty() {
         if no_ajazz || controller.is_some() || controller_serial.is_some() {
-            return Err("--device cannot be combined with --no-ajazz, --controller, or --controller-serial".to_owned());
+            return Err(
+                "--device cannot be combined with --no-ajazz, --controller, or --controller-serial"
+                    .to_owned(),
+            );
         }
     } else {
-        let selected = controller.unwrap_or(if no_ajazz { ControllerKind::None } else { ControllerKind::Ajazz });
+        let selected = controller.unwrap_or(if no_ajazz {
+            ControllerKind::None
+        } else {
+            ControllerKind::Ajazz
+        });
         if controller_serial.is_some() && !selected.is_physical() {
             return Err("--controller-serial requires a physical --controller".to_owned());
         }
         if selected.is_physical() {
-            device_specs.push(DeviceSpec { kind: selected, serial: controller_serial.clone(), task_slots: None });
+            device_specs.push(DeviceSpec {
+                kind: selected,
+                serial: controller_serial.clone(),
+                task_slots: None,
+            });
         }
     }
-    let controller = device_specs.first().map(|spec| spec.kind).unwrap_or(ControllerKind::None);
+    let controller = device_specs
+        .first()
+        .map(|spec| spec.kind)
+        .unwrap_or(ControllerKind::None);
     let controller_serial = device_specs.first().and_then(|spec| spec.serial.clone());
     if mcp_proxy && agent.is_none() {
         return Err("--mcp-proxy requires --agent codex|zcode|hermes".to_owned());
@@ -452,8 +469,7 @@ impl BridgeRuntime {
 
 fn connection_default_cards(slot_count: usize) -> Vec<Value> {
     const COLORS: [u32; 8] = [
-        0x1565c0, 0x00897b, 0x6a1b9a, 0xef6c00,
-        0x2e7d32, 0xad1457, 0x0277bd, 0x5d4037,
+        0x1565c0, 0x00897b, 0x6a1b9a, 0xef6c00, 0x2e7d32, 0xad1457, 0x0277bd, 0x5d4037,
     ];
     let active_slots = slot_count.min(8);
     // Always return the complete physical card set. Explicitly disabling the
@@ -482,21 +498,30 @@ fn connection_default_context() -> DisplayContext {
         status: Some("READY".to_owned()),
         progress: Some(0),
         task_id: None,
+        weekly_remaining: None,
+        five_hour_remaining: None,
     }
 }
 
 fn desired_primary_cards(bridge: &BridgeRuntime) -> Vec<Value> {
     if bridge.task_mode {
-        if bridge.has_explicit_task_state {
+        // A v.oai.thstatus message is explicit state even when it arrived via
+        // the MCP/proxy path rather than directly from the RP2040 serial link.
+        if bridge.has_explicit_task_state || bridge.last_thread_status.is_some() {
             if bridge.task_board.has_tasks() || bridge.last_thread_status.is_none() {
-                bridge.task_board.rendered_slots(&bridge.task_device_id, bridge.task_slot_count)
+                bridge
+                    .task_board
+                    .rendered_slots(&bridge.task_device_id, bridge.task_slot_count)
             } else {
-                // A serial v.oai.thstatus update is authoritative even if the
-                // task adapter cannot parse one of its optional fields.
                 bridge.fused_lcd.fused_array(&bridge.partition)
             }
         } else {
-            connection_default_cards(bridge.partition.slots_for(crate::routing::AgentId::Codex).len())
+            connection_default_cards(
+                bridge
+                    .partition
+                    .slots_for(crate::routing::AgentId::Codex)
+                    .len(),
+            )
         }
     } else if bridge.has_explicit_task_state || bridge.last_thread_status.is_some() {
         bridge.fused_lcd.fused_array(&bridge.partition)
@@ -521,7 +546,8 @@ fn display_context_for_controller(
 }
 
 fn desired_context(bridge: &BridgeRuntime) -> Option<DisplayContext> {
-    bridge.task_board
+    bridge
+        .task_board
         .selected_display_context(&bridge.task_device_id)
         .and_then(|value| DisplayContext::from_value(&value).ok())
         .or_else(|| bridge.last_display_context.clone())
@@ -550,7 +576,12 @@ fn replay_primary_controller_state(bridge: &mut BridgeRuntime) -> Result<(), Str
     let context = desired_context(bridge);
     let rgb_config = bridge.last_rgb_config.clone();
     if let Some(device) = bridge.controller.as_mut() {
-        apply_controller_state(device.as_mut(), &cards, context.as_ref(), rgb_config.as_ref())?;
+        apply_controller_state(
+            device.as_mut(),
+            &cards,
+            context.as_ref(),
+            rgb_config.as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -574,8 +605,12 @@ pub(crate) fn refresh_task_board(bridge: &mut BridgeRuntime) -> Result<(), Strin
     }
     let mut survivors = Vec::new();
     for (device_id, mut device, slots) in std::mem::take(&mut bridge.aux_controllers) {
-        let cards = if bridge.has_explicit_task_state {
-            bridge.task_board.rendered_slots(&device_id, slots)
+        let cards = if bridge.has_explicit_task_state || bridge.last_thread_status.is_some() {
+            if bridge.task_board.has_tasks() {
+                bridge.task_board.rendered_slots(&device_id, slots)
+            } else {
+                bridge.fused_lcd.fused_array(&bridge.partition)
+            }
         } else {
             connection_default_cards(slots)
         };
@@ -662,6 +697,12 @@ pub(crate) fn connect_controller(
         ControllerKind::StreamDeckPlus
         | ControllerKind::StreamDeckPlusXl
         | ControllerKind::StreamDeckXl => Ok(Some(connect_streamdeck(choice, serial)?)),
+        // The plugin controller is created by the daemon when a plugin
+        // session arrives; it is never instantiated from the CLI.
+        ControllerKind::StreamDeckPlugin => Err(
+            "streamdeck-plugin controller is daemon-managed and not selectable from the CLI"
+                .to_owned(),
+        ),
     }
 }
 
@@ -677,20 +718,37 @@ pub(crate) fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
         let (serial, firmware, port, sequence) = open_serial_runtime(&options.port)?;
         (Some(serial), firmware, port, sequence)
     };
-let controller = connect_controller(options.controller, options.controller_serial.as_deref())?;
-    let task_device_id = controller.as_ref().map(|device| device.device_id()).unwrap_or_else(|| options.controller.as_str().to_owned());
-    let task_slot_count = controller.as_ref().map(|device| options.devices.first().and_then(|spec| spec.task_slots).unwrap_or_else(|| device.task_slot_count())).unwrap_or(0);
+    let controller = connect_controller(options.controller, options.controller_serial.as_deref())?;
+    let task_device_id = controller
+        .as_ref()
+        .map(|device| device.device_id())
+        .unwrap_or_else(|| options.controller.as_str().to_owned());
+    let task_slot_count = controller
+        .as_ref()
+        .map(|device| {
+            options
+                .devices
+                .first()
+                .and_then(|spec| spec.task_slots)
+                .unwrap_or_else(|| device.task_slot_count())
+        })
+        .unwrap_or(0);
     let mut task_board = crate::tasks::TaskBoard::new();
-    if task_slot_count > 0 { task_board.set_device(task_device_id.clone(), task_slot_count, true); }
+    if task_slot_count > 0 {
+        task_board.set_device(task_device_id.clone(), task_slot_count, true);
+    }
     let mut aux_controllers = Vec::new();
     for spec in options.devices.iter().skip(1) {
         let device = connect_controller(spec.kind, spec.serial.as_deref())?
             .ok_or_else(|| format!("device {} did not produce a controller", spec.kind.as_str()))?;
         let id = device.device_id();
         let slots = spec.task_slots.unwrap_or_else(|| device.task_slot_count());
-        if slots > 0 { task_board.set_device(id.clone(), slots, true); }
+        if slots > 0 {
+            task_board.set_device(id.clone(), slots, true);
+        }
         aux_controllers.push((id, device, slots));
-    }    let mut bridge = BridgeRuntime {
+    }
+    let mut bridge = BridgeRuntime {
         serial,
         sequence,
         controller,
@@ -718,16 +776,21 @@ let controller = connect_controller(options.controller, options.controller_seria
         pending_task_events: Vec::new(),
         // In legacy/mcp modes, Codex is the sole agent and owns all 6 slots.
         // The daemon updates this dynamically based on active sessions.
-        partition: crate::routing::Partition::compute(
-            crate::routing::ActiveSet::from_single(crate::routing::AgentId::Codex),
-        ),
+        partition: crate::routing::Partition::compute(crate::routing::ActiveSet::from_single(
+            crate::routing::AgentId::Codex,
+        )),
     };
     replay_primary_controller_state(&mut bridge)?;
     let context = desired_context(&bridge);
     let rgb_config = bridge.last_rgb_config.clone();
     for (_, device, slots) in bridge.aux_controllers.iter_mut() {
         let cards = connection_default_cards(*slots);
-        apply_controller_state(device.as_mut(), &cards, context.as_ref(), rgb_config.as_ref())?;
+        apply_controller_state(
+            device.as_mut(),
+            &cards,
+            context.as_ref(),
+            rgb_config.as_ref(),
+        )?;
     }
     Ok(bridge)
 }
@@ -780,7 +843,11 @@ pub(crate) fn reconnect_controller_if_due(bridge: &mut BridgeRuntime) {
         Ok(Some(controller)) => {
             bridge.controller = Some(controller);
             if bridge.task_mode {
-                bridge.task_board.set_device(bridge.task_device_id.clone(), bridge.task_slot_count, true);
+                bridge.task_board.set_device(
+                    bridge.task_device_id.clone(),
+                    bridge.task_slot_count,
+                    true,
+                );
             }
             if let Err(error) = replay_primary_controller_state(bridge) {
                 eprintln!("controller state replay failed: {error}");
@@ -809,12 +876,14 @@ pub(crate) fn bridge_status(bridge: &BridgeRuntime, mode: &str) -> Value {
         "connected": controller.is_some(),
         "selectedTask": bridge.task_board.selected(&bridge.task_device_id)
     })];
-    devices.extend(bridge.aux_controllers.iter().map(|(id, _, slots)| json!({
-        "id": id,
-        "taskSlots": slots,
-        "connected": true,
-        "selectedTask": bridge.task_board.selected(id)
-    })));
+    devices.extend(bridge.aux_controllers.iter().map(|(id, _, slots)| {
+        json!({
+            "id": id,
+            "taskSlots": slots,
+            "connected": true,
+            "selectedTask": bridge.task_board.selected(id)
+        })
+    }));
     json!({
         "type": "bridge-ready",
         "version": 2,
@@ -880,16 +949,31 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
                 if bridge.task_mode {
                     if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
                         if usize::from(index) < bridge.task_slot_count {
-                            if let Some(selection) = bridge.task_board.select(&bridge.task_device_id, usize::from(index), now_ms) {
-                                let owner = selection.get("owner_session").and_then(Value::as_u64).unwrap_or(0) as usize;
+                            if let Some(selection) = bridge.task_board.select(
+                                &bridge.task_device_id,
+                                usize::from(index),
+                                now_ms,
+                            ) {
+                                let owner = selection
+                                    .get("owner_session")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0)
+                                    as usize;
                                 bridge.pending_task_events.push((owner, selection.clone()));
-                                if let Some(legacy_key) = selection.get("legacy_key").and_then(Value::as_str) {
+                                if let Some(legacy_key) =
+                                    selection.get("legacy_key").and_then(Value::as_str)
+                                {
                                     bridge.pending_task_events.push((owner, json!({"type":"key","key":legacy_key,"pressed":pressed,"ts":now_ms})));
                                     if owner == 0 && bridge.has_serial() {
-                                        if let Ok(messages) = messages_for_synthetic_key(legacy_key) {
+                                        if let Ok(messages) = messages_for_synthetic_key(legacy_key)
+                                        {
                                             if pressed {
-                                                if let Some(message) = messages.first() { let _ = bridge.send_codex(message); }
-                                            } else if let Some(message) = messages.last() { let _ = bridge.send_codex(message); }
+                                                if let Some(message) = messages.first() {
+                                                    let _ = bridge.send_codex(message);
+                                                }
+                                            } else if let Some(message) = messages.last() {
+                                                let _ = bridge.send_codex(message);
+                                            }
                                         }
                                     }
                                 }
@@ -957,27 +1041,87 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
     Ok(())
 }
 
-
-fn route_task_device_events(bridge: &mut BridgeRuntime, device_id: &str, slot_count: usize, events: Vec<crate::codex::PhysicalEvent>) {
-    if !bridge.task_mode { return; }
-    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+fn route_task_device_events(
+    bridge: &mut BridgeRuntime,
+    device_id: &str,
+    slot_count: usize,
+    events: Vec<crate::codex::PhysicalEvent>,
+) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     for event in events {
-        let crate::codex::PhysicalEvent::Button { index, pressed } = event else { continue; };
-        if usize::from(index) >= slot_count { continue; }
-        let Some(selection) = bridge.task_board.select(device_id, usize::from(index), now_ms) else { continue; };
-        let owner = selection.get("owner_session").and_then(Value::as_u64).unwrap_or(0) as usize;
-        bridge.pending_task_events.push((owner, selection));
-        if let Some(legacy_key) = bridge.task_board.task_at(device_id, usize::from(index)).and_then(|task| task.legacy_key.as_deref()) {
-            bridge.pending_task_events.push((owner, json!({"type":"key","key":legacy_key,"pressed":pressed,"ts":now_ms})));
-            if owner == 0 && bridge.has_serial() {
-                if let Ok(messages) = messages_for_synthetic_key(legacy_key) {
-                    let message = if pressed { messages.first() } else { messages.last() };
-                    if let Some(message) = message { let _ = bridge.send_codex(message); }
+        // A task card gets first refusal while task mode is active. If the
+        // slot has no task (or task mode is off), fall through to the normal
+        // physical-event mapping so Agent/Action/Mic/Send/Dial keys work too.
+        if bridge.task_mode {
+            if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
+                if usize::from(index) < slot_count {
+                    if let Some(selection) = bridge.task_board.select(
+                        device_id,
+                        usize::from(index),
+                        now_ms,
+                    ) {
+                        let owner = selection
+                            .get("owner_session")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0)
+                            as usize;
+                        bridge.pending_task_events.push((owner, selection));
+                        if let Some(legacy_key) = bridge
+                            .task_board
+                            .task_at(device_id, usize::from(index))
+                            .and_then(|task| task.legacy_key.as_deref())
+                        {
+                            bridge.pending_task_events.push((
+                                owner,
+                                json!({"type":"key","key":legacy_key,"pressed":pressed,"ts":now_ms}),
+                            ));
+                            if owner == 0 && bridge.has_serial() {
+                                if let Ok(messages) = messages_for_synthetic_key(legacy_key) {
+                                    let message = if pressed {
+                                        messages.first()
+                                    } else {
+                                        messages.last()
+                                    };
+                                    if let Some(message) = message {
+                                        let _ = bridge.send_codex(message);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 }
             }
         }
+
+        // Plugin-backed controllers are auxiliary physical controllers. They
+        // must share the same partition and HID routing as the primary device.
+        if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
+            if let Some(owner) = bridge.partition.owner_of(index) {
+                if owner != crate::routing::AgentId::Codex {
+                    bridge
+                        .routing
+                        .route_button(index, pressed, now_ms, &bridge.partition);
+                    continue;
+                }
+                if !bridge.has_serial() {
+                    bridge
+                        .routing
+                        .route_button(index, pressed, now_ms, &bridge.partition);
+                }
+            }
+        }
+        if let Some(message) = bridge.radial_state.event(event) {
+            if bridge.has_serial() {
+                let _ = bridge.send_codex(&message);
+            }
+        }
     }
-}fn run_legacy(options: Options) -> Result<(), String> {
+}
+fn run_legacy(options: Options) -> Result<(), String> {
     let mut bridge = open_runtime(&options)?;
     println!("{}", bridge_status(&bridge, "legacy"));
     let deadline = options
@@ -1113,13 +1257,30 @@ pub(crate) fn call_set_display_context(bridge: &mut BridgeRuntime, arguments: &V
         Err(error) => return mcp::tool_error(error),
     };
     bridge.last_display_context = Some(context.clone());
+
     let render_context = display_context_for_controller(bridge, &context);
-    let apply_result = bridge
+    let primary_error = bridge
         .controller
         .as_mut()
-        .map(|device| device.apply_display_context(&render_context));
-    if let Some(Err(error)) = apply_result {
-        detach_controller(bridge, &error);
+        .and_then(|device| device.apply_display_context(&render_context).err());
+    if let Some(error) = primary_error.as_deref() {
+        detach_controller(bridge, error);
+    }
+
+    // Plugin-backed Stream Decks live in aux_controllers. Push context to them
+    // immediately instead of waiting for an unrelated task-board refresh.
+    let mut survivors = Vec::new();
+    for (device_id, mut device, slots) in std::mem::take(&mut bridge.aux_controllers) {
+        if let Err(error) = device.apply_display_context(&render_context) {
+            device.shutdown();
+            eprintln!("device {device_id} display context failed: {error}");
+        } else {
+            survivors.push((device_id, device, slots));
+        }
+    }
+    bridge.aux_controllers = survivors;
+
+    if let Some(error) = primary_error {
         mcp::tool_error(format!("Stream Deck dashboard disconnected: {error}"))
     } else {
         mcp::text_result(json!({
@@ -1231,13 +1392,12 @@ fn call_tool(request: &Value, bridge: &mut BridgeRuntime) -> Value {
                     return mcp::tool_error(format!("controller apply failed: {error}"));
                 }
                 let message = json!({"m": "v.oai.thstatus", "p": status});
-                send_tool_message(bridge, &message)
-                    .map(|reports| {
-                        mcp::text_result(json!({
-                            "updated": true,
-                            "reportsSent": reports
-                        }))
-                    })
+                send_tool_message(bridge, &message).map(|reports| {
+                    mcp::text_result(json!({
+                        "updated": true,
+                        "reportsSent": reports
+                    }))
+                })
             }
         }
         "set_display_context" => {
@@ -1645,9 +1805,9 @@ mod tests {
             health: HealthCheck::new(),
             routing: crate::routing::EventRouting::new(),
             fused_lcd: crate::routing::FusedLcdState::new(),
-            partition: crate::routing::Partition::compute(
-                crate::routing::ActiveSet::from_single(crate::routing::AgentId::Codex),
-            ),
+            partition: crate::routing::Partition::compute(crate::routing::ActiveSet::from_single(
+                crate::routing::AgentId::Codex,
+            )),
             task_board: crate::tasks::TaskBoard::new(),
             task_mode: false,
             task_device_id: "streamdeck-plus:test".to_owned(),
@@ -1670,7 +1830,11 @@ mod tests {
         let rendered = Arc::new(Mutex::new(None));
         let mut bridge = test_bridge(Arc::clone(&rendered));
         replay_primary_controller_state(&mut bridge).expect("default replay");
-        let payload = rendered.lock().expect("render lock").clone().expect("payload");
+        let payload = rendered
+            .lock()
+            .expect("render lock")
+            .clone()
+            .expect("payload");
         assert_eq!(payload.as_array().expect("cards").len(), 8);
         assert_eq!(payload[0]["e"], 1);
 
@@ -1680,7 +1844,11 @@ mod tests {
             context: Arc::new(Mutex::new(None)),
         }));
         replay_primary_controller_state(&mut bridge).expect("reconnect replay");
-        let payload = reconnected.lock().expect("render lock").clone().expect("payload");
+        let payload = reconnected
+            .lock()
+            .expect("render lock")
+            .clone()
+            .expect("payload");
         assert_eq!(payload[0]["agent"], "codex");
         assert_eq!(payload[7]["e"], 1);
     }
@@ -1703,7 +1871,9 @@ mod tests {
         );
         bridge.task_mode = true;
         bridge.has_explicit_task_state = true;
-        bridge.task_board.set_device(bridge.task_device_id.clone(), 6, true);
+        bridge
+            .task_board
+            .set_device(bridge.task_device_id.clone(), 6, true);
         bridge
             .task_board
             .publish_tasks(
@@ -1757,11 +1927,50 @@ mod tests {
             Some("1 — Codex refresh")
         );
         assert_eq!(
-            bridge.last_display_context
+            bridge
+                .last_display_context
                 .as_ref()
                 .and_then(|context| context.task.as_deref()),
             Some("Codex refresh")
         );
+    }
+    #[test]
+    fn display_context_is_broadcast_to_aux_controllers() {
+        let primary_context = Arc::new(Mutex::new(None));
+        let aux_context = Arc::new(Mutex::new(None));
+        let mut bridge =
+            test_bridge_with_context(Arc::new(Mutex::new(None)), Arc::clone(&primary_context));
+        bridge.aux_controllers.push((
+            "streamdeck-plugin:test".to_owned(),
+            Box::new(RecordingController {
+                rendered: Arc::new(Mutex::new(None)),
+                context: Arc::clone(&aux_context),
+            }),
+            4,
+        ));
+
+        call_set_display_context(
+            &mut bridge,
+            &json!({"project": "micro-emu", "task": "Live task", "progress": 42}),
+        );
+
+        assert_eq!(
+            primary_context
+                .lock()
+                .expect("primary context")
+                .as_ref()
+                .and_then(|context| context.task.as_deref()),
+            Some("Live task")
+        );
+        assert_eq!(
+            aux_context
+                .lock()
+                .expect("aux context")
+                .as_ref()
+                .and_then(|context| context.task.as_deref()),
+            Some("Live task")
+        );
+        assert_eq!(bridge.aux_controllers.len(), 1);
     }
 
     #[test]
@@ -1778,8 +1987,18 @@ mod tests {
             )
             .expect("empty status merge");
         replay_primary_controller_state(&mut bridge).expect("empty status replay");
-        let payload = rendered.lock().expect("render lock").clone().expect("payload");
-        assert!(payload.as_array().expect("cards").iter().all(|card| card["e"] == 0));
+        let payload = rendered
+            .lock()
+            .expect("render lock")
+            .clone()
+            .expect("payload");
+        assert!(
+            payload
+                .as_array()
+                .expect("cards")
+                .iter()
+                .all(|card| card["e"] == 0)
+        );
     }
     #[test]
     fn partition_refresh_does_not_clear_connection_defaults() {
@@ -1787,7 +2006,11 @@ mod tests {
         let mut bridge = test_bridge(Arc::clone(&rendered));
         bridge.task_mode = true;
         refresh_task_board(&mut bridge).expect("default task replay");
-        let payload = rendered.lock().expect("render lock").clone().expect("payload");
+        let payload = rendered
+            .lock()
+            .expect("render lock")
+            .clone()
+            .expect("payload");
         let cards = payload.as_array().expect("cards");
         assert!(cards[..6].iter().all(|card| card["e"] == 1));
         assert!(cards[6..].iter().all(|card| card["e"] == 0));
@@ -1801,9 +2024,9 @@ mod tests {
                 context: Arc::new(Mutex::new(None)),
             }));
         let mut fused_lcd = crate::routing::FusedLcdState::new();
-        let partition = crate::routing::Partition::compute(
-            crate::routing::ActiveSet::from_single(crate::routing::AgentId::Codex),
-        );
+        let partition = crate::routing::Partition::compute(crate::routing::ActiveSet::from_single(
+            crate::routing::AgentId::Codex,
+        ));
         let status = json!([{"c": "#112233", "b": 1.0}]);
 
         apply_thread_status_locally(

@@ -1,6 +1,6 @@
 import { action, SingletonAction, type KeyAction, type DialAction, type WillAppearEvent, type KeyDownEvent, type KeyUpEvent } from "@elgato/streamdeck";
 import { PluginContext } from "../context";
-import { renderKeyImage, renderDisconnectedImage } from "../images";
+import { renderActionKeyImage, renderDisconnectedImage } from "../images";
 
 /**
  * Mic action — maps a Stream Deck key to Codex Micro ACT10 (microphone toggle).
@@ -43,6 +43,6 @@ export class MicAction extends SingletonAction {
             action.setImage(renderDisconnectedImage("MIC"));
             return;
         }
-        action.setImage(renderKeyImage("MIC", undefined));
+        action.setImage(renderActionKeyImage("MIC", "mic"));
     }
 }

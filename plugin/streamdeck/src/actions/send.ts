@@ -1,6 +1,6 @@
 import { action, SingletonAction, type KeyAction, type DialAction, type WillAppearEvent, type KeyDownEvent, type KeyUpEvent } from "@elgato/streamdeck";
 import { PluginContext } from "../context";
-import { renderKeyImage, renderDisconnectedImage } from "../images";
+import { renderActionKeyImage, renderDisconnectedImage } from "../images";
 
 /**
  * Send action — maps a Stream Deck key to Codex Micro ACT12 (send to Codex).
@@ -43,6 +43,6 @@ export class SendAction extends SingletonAction {
             action.setImage(renderDisconnectedImage("SEND"));
             return;
         }
-        action.setImage(renderKeyImage("SEND", undefined));
+        action.setImage(renderActionKeyImage("SEND", "send"));
     }
 }
