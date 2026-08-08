@@ -43,6 +43,6 @@ export class MicAction extends SingletonAction {
             action.setImage(renderDisconnectedImage("MIC"));
             return;
         }
-        action.setImage(renderActionKeyImage("MIC", "mic"));
+        action.setImage(renderActionKeyImage("MIC", "mic", undefined, 1.8, "#000"));
     }
 }

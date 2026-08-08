@@ -196,15 +196,25 @@ const ICON_GLYPHS: Record<string, string> = {
 /** Names of the available action-button icons. */
 export const ACTION_ICONS = Object.keys(ICON_GLYPHS);
 
-/** Renders a key image with an action icon glyph, label, and status color. */
-export function renderActionKeyImage(label: string, icon: string, index?: number): string {
+/** Renders a key image with an action icon glyph, label, and status color.
+ * The glyph is drawn in a 40x40 box; `scale` enlarges it (e.g. 1.8 = 72x72).
+ * `bgColor` overrides the default dark-grey background. */
+export function renderActionKeyImage(
+    label: string,
+    icon: string,
+    index?: number,
+    scale = 1,
+    bgColor?: string,
+): string {
     const glyph = ICON_GLYPHS[icon] ?? ICON_GLYPHS.action;
     const w = 144;
     const h = 144;
+    const box = 40 * scale;
+    const glyphY = index !== undefined ? 32 : (h - box) / 2 - 8;
     return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
-  <rect x="4" y="4" width="${w - 8}" height="${h - 8}" rx="12" fill="${DEFAULT_COLOR}" stroke="#000" stroke-opacity="0.2" stroke-width="1"/>
+  <rect x="4" y="4" width="${w - 8}" height="${h - 8}" rx="12" fill="${bgColor ?? DEFAULT_COLOR}" stroke="#000" stroke-opacity="0.2" stroke-width="1"/>
   ${index !== undefined ? `<text x="${w / 2}" y="26" font-family="sans-serif" font-size="14" font-weight="bold" fill="#fff" fill-opacity="0.5" text-anchor="middle">${index}</text>` : ""}
-  <g transform="translate(${(w - 40) / 2}, 40)">${glyph}</g>
+  <g transform="translate(${(w - box) / 2}, ${glyphY}) scale(${scale})">${glyph}</g>
   <text x="${w / 2}" y="${h - 18}" font-family="sans-serif" font-size="14" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(label)}</text>
 </svg>`);
 }

@@ -43,6 +43,6 @@ export class SendAction extends SingletonAction {
             action.setImage(renderDisconnectedImage("SEND"));
             return;
         }
-        action.setImage(renderActionKeyImage("SEND", "send"));
+        action.setImage(renderActionKeyImage("SEND", "send", undefined, 1.8, "#000"));
     }
 }
