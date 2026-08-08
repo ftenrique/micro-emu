@@ -103,13 +103,15 @@ const STRIP_W = 200;
 const STRIP_H = 100;
 
 /** Wraps strip body markup in the standard 200x100 canvas frame.
- * Returns a data URI (data:image/svg+xml,...) as expected by the pixmap
- * layout item's `value` property in setFeedback. */
+ * Returns a base64 data URI (data:image/svg+xml;base64,...) — the pixmap
+ * layout item requires either a file path, a base64 data URI with declared
+ * mime type, or raw SVG; percent-encoded URIs render as a blank/white box. */
 function stripSvg(body: string): string {
-    return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="${STRIP_W}" height="${STRIP_H}" viewBox="0 0 ${STRIP_W} ${STRIP_H}">
-  <rect x="2" y="2" width="${STRIP_W - 4}" height="${STRIP_H - 4}" rx="8" fill="#1a1a1a"/>
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${STRIP_W}" height="${STRIP_H}" viewBox="0 0 ${STRIP_W} ${STRIP_H}">
+  <rect x="0" y="0" width="${STRIP_W}" height="${STRIP_H}" fill="#000"/>
   ${body}
-</svg>`);
+</svg>`;
+    return `data:image/svg+xml;base64,${Buffer.from(svg, "utf-8").toString("base64")}`;
 }
 
 /** Renders an offline/disconnected strip canvas. */
