@@ -153,12 +153,56 @@ Use the existing MCP server (no second MCP server is needed):
   "model": "gpt-5",
   "effort": "high",
   "status": "working",
-  "progress": 65
+  "progress": 65,
+  "weekly_remaining": 73,
+  "five_hour_remaining": 28
 }
 ~~~
 
 Call the set_display_context tool with that object. Omitted or null fields are shown as neutral placeholders; text is truncated to the available window and task bodies/prompts are never inferred or logged.
+On Stream Deck + and + XL, swipe left on the touch strip for resource usage and right for project context. Repeating the same direction is safe. The usage screen shows weekly and five-hour percentages when supplied by the host; otherwise it keeps the active task, status, and progress visible instead of showing empty values.
 Use `--controller none` or the existing `--no-ajazz` alias to run without a physical controller. If more than one matching Stream Deck is connected, select one with `--controller-serial SERIAL`.
+
+### Stream Deck plugin (co-exists with other profiles)
+
+The bridge also ships a standard Elgato Stream Deck plugin that lets Codex Micro controls co-exist with other Stream Deck profiles and plugins. The official Stream Deck application keeps HID ownership; the plugin connects to the bridge daemon over TCP loopback and sends events as a virtual controller. This is the recommended mode when you want to use the Stream Deck app alongside Codex Micro.
+
+The plugin and the direct-HID `--controller streamdeck-*` mode are mutually exclusive per device: the direct-HID mode requires the official app to be closed, while the plugin mode requires it to be running.
+
+**Build and install the plugin:**
+
+```powershell
+npm run plugin:install
+npm run plugin:build
+npm run plugin:link
+```
+
+`plugin:link` symlinks the plugin into the Stream Deck plugins directory for development. For distribution, use `npm run plugin:pack` to produce a `.streamDeckPlugin` package in `artifacts/`.
+
+**Run the daemon:**
+
+```powershell
+npm run bridge:daemon -- --port auto
+```
+
+Or let the plugin autostart the daemon by setting the `MICRO_EMU_BRIDGE_EXE` environment variable to the bridge executable path before launching Stream Deck.
+
+**Available actions:**
+
+| Action | Description |
+|--------|-------------|
+| Agent Button | AG00–AG05 — select the agent index in settings |
+| Action Button | ACT06–ACT08 — select the action index and an icon in settings |
+| Task Card | Renders a task-board slot with title and status |
+| Knob | SD+ dial — emulates the Codex Micro rotor (`ENC_CW`/`ENC_CC`, press = `ENC_CLK`); touch strip shows task number, project, and shortened name |
+| Crux Horizontal | SD+ dial — emulates the crux left/right axis (radial X); press is assignable (default `ACT12` Send); touch strip shows model / effort |
+| Crux Vertical | SD+ dial — emulates the crux up/down axis (radial Y); press is assignable (default `ACT10` Mic); touch strip shows 5-hour and weekly usage limits as bars with exact percentages |
+| Mic | ACT10 microphone toggle |
+| Send | ACT12 send-to-Codex |
+| Arrow Key | Virtual arrow/rotor key for keypad-only decks |
+
+All actions reuse the existing Codex Micro `v.oai.hid`/`v.oai.rad` mappings — no new protocol messages are introduced.
+
 ## Integrate with Codex through MCP
 
 The bridge includes a local Model Context Protocol (MCP) server over STDIO.

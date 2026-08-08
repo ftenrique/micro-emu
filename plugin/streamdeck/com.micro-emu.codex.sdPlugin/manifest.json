@@ -1,0 +1,167 @@
+{
+    "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+    "Actions": [
+        {
+            "Icon": "imgs/actions/agent",
+            "Name": "Agent Button",
+            "States": [
+                {
+                    "Image": "imgs/actions/agent"
+                }
+            ],
+            "Tooltip": "Codex Micro agent button (AG00-AG05). Select the agent index in settings.",
+            "UUID": "com.micro-emu.codex.agent",
+            "PropertyInspectorPath": "ui/agent.html",
+            "Controllers": ["Keypad"]
+        },
+        {
+            "Icon": "imgs/actions/action",
+            "Name": "Action Button",
+            "States": [
+                {
+                    "Image": "imgs/actions/action"
+                }
+            ],
+            "Tooltip": "Codex Micro action button (ACT06-ACT08). Select the action index in settings.",
+            "UUID": "com.micro-emu.codex.action",
+            "PropertyInspectorPath": "ui/action.html",
+            "Controllers": ["Keypad"]
+        },
+        {
+            "Icon": "imgs/actions/task",
+            "Name": "Task Card",
+            "States": [
+                {
+                    "Image": "imgs/actions/task"
+                }
+            ],
+            "Tooltip": "Codex Micro task card slot. Renders task title and status from the bridge daemon.",
+            "UUID": "com.micro-emu.codex.task",
+            "PropertyInspectorPath": "ui/task.html",
+            "Controllers": ["Keypad"]
+        },
+        {
+            "Icon": "imgs/actions/knob",
+            "Name": "Knob",
+            "Controllers": ["Encoder"],
+            "Encoder": {
+                "layout": "layouts/canvas.json",
+                "TriggerDescription": {
+                    "Push": "Rotor click (ENC_CLK)",
+                    "Rotate": "Rotor (ENC_CW/ENC_CC)",
+                    "Touch": "Rotor click (ENC_CLK)"
+                }
+            },
+            "States": [
+                {
+                    "Image": "imgs/actions/knob"
+                }
+            ],
+            "Tooltip": "Codex Micro rotor knob. Rotate for ENC_CW/ENC_CC, press for ENC_CLK. Shows task number, project, and name on the touch strip.",
+            "UUID": "com.micro-emu.codex.knob"
+        },
+        {
+            "Icon": "imgs/actions/crux-h",
+            "Name": "Crux Horizontal",
+            "Controllers": ["Encoder"],
+            "Encoder": {
+                "layout": "layouts/canvas.json",
+                "TriggerDescription": {
+                    "Push": "Assignable action (default Send)",
+                    "Rotate": "Left / Right",
+                    "Touch": "Assignable action (default Send)"
+                }
+            },
+            "States": [
+                {
+                    "Image": "imgs/actions/crux-h"
+                }
+            ],
+            "Tooltip": "Codex Micro crux left/right axis. Rotate for radial X; press for an assignable action (default ACT12 Send). Shows model and effort on the touch strip.",
+            "UUID": "com.micro-emu.codex.crux-h",
+            "PropertyInspectorPath": "ui/crux-h.html"
+        },
+        {
+            "Icon": "imgs/actions/crux-v",
+            "Name": "Crux Vertical",
+            "Controllers": ["Encoder"],
+            "Encoder": {
+                "layout": "layouts/canvas.json",
+                "TriggerDescription": {
+                    "Push": "Assignable action (default Mic)",
+                    "Rotate": "Up / Down",
+                    "Touch": "Assignable action (default Mic)"
+                }
+            },
+            "States": [
+                {
+                    "Image": "imgs/actions/crux-v"
+                }
+            ],
+            "Tooltip": "Codex Micro crux up/down axis. Rotate for radial Y; press for an assignable action (default ACT10 Mic). Shows the 5-hour and weekly usage limits on the touch strip.",
+            "UUID": "com.micro-emu.codex.crux-v",
+            "PropertyInspectorPath": "ui/crux-v.html"
+        },
+        {
+            "Icon": "imgs/actions/mic",
+            "Name": "Mic",
+            "States": [
+                {
+                    "Image": "imgs/actions/mic"
+                }
+            ],
+            "Tooltip": "Codex Micro microphone toggle (ACT10).",
+            "UUID": "com.micro-emu.codex.mic",
+            "Controllers": ["Keypad"]
+        },
+        {
+            "Icon": "imgs/actions/send",
+            "Name": "Send",
+            "States": [
+                {
+                    "Image": "imgs/actions/send"
+                }
+            ],
+            "Tooltip": "Codex Micro send-to-Codex button (ACT12).",
+            "UUID": "com.micro-emu.codex.send",
+            "Controllers": ["Keypad"]
+        },
+        {
+            "Icon": "imgs/actions/arrow",
+            "Name": "Arrow Key",
+            "States": [
+                {
+                    "Image": "imgs/actions/arrow"
+                }
+            ],
+            "Tooltip": "Codex Micro virtual arrow key. Select direction in settings; emits encoder turn events like the XL virtual layout.",
+            "UUID": "com.micro-emu.codex.arrow",
+            "PropertyInspectorPath": "ui/arrow.html",
+            "Controllers": ["Keypad"]
+        }
+    ],
+    "Author": "micro-emu",
+    "Category": "Codex Micro",
+    "CategoryIcon": "imgs/plugin",
+    "CodePath": "bin/plugin.js",
+    "Description": "Codex Micro emulation controls for Stream Deck. Connects to the rp2040-bridge daemon to send agent buttons, dials, and task actions to Codex through the RP2040 HID interface. Co-exists with other Stream Deck profiles and plugins.",
+    "Icon": "imgs/plugin",
+    "Name": "Codex Micro",
+    "Nodejs": {
+        "Version": "20",
+        "Debug": "enabled"
+    },
+    "OS": [
+        {
+            "Platform": "windows",
+            "MinimumVersion": "10"
+        }
+    ],
+    "UUID": "com.micro-emu.codex",
+    "Version": "0.1.0.0",
+    "SDKVersion": 3,
+    "Software": {
+        "MinimumVersion": "6.9"
+    },
+    "URL": "https://github.com/ftenrique/micro-emu"
+}
