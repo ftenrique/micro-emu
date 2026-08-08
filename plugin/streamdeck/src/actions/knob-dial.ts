@@ -28,7 +28,11 @@ export class KnobDialAction extends SingletonAction {
     }
 
     onWillAppear(ev: WillAppearEvent): void {
-        this.refresh(ev.action as DialAction);
+        const action = ev.action as DialAction;
+        if (action.isDial()) {
+            action.setFeedbackLayout("layouts/canvas.json");
+        }
+        this.refresh(action);
     }
 
     onDialRotate(ev: DialRotateEvent): void {

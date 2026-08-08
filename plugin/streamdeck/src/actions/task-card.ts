@@ -54,6 +54,7 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
             return;
         }
         const taskCard = this.ctx.getTaskCard(slot);
+        const enabled = taskCard ? Number(taskCard.e ?? 1) !== 0 : false;
         const status = taskCard
             ? ((taskCard.status as string) ?? (taskCard.state as string) ?? "")
             : "";
@@ -61,6 +62,11 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
             ? ((taskCard.agent as string) ?? null)
             : null;
         const color = taskCard?.color ?? taskCard?.c;
+        // When the slot has no task or is disabled, show a dimmed placeholder.
+        if (!taskCard || !enabled) {
+            action.setImage(renderTaskCardImage(slot, null, "", 0x263238));
+            return;
+        }
         action.setImage(renderTaskCardImage(slot, agent, status, color));
     }
 }

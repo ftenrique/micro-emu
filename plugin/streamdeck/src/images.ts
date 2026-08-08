@@ -79,11 +79,11 @@ export function renderTaskCardImage(
     const digitH = 5 * cell;
     const originX = Math.floor((w - digitW) / 2);
     const originY = h - digitH - 16;
-    const agentLabel = agent ? agent.toLowerCase() : "";
+    const agentLabel = agent ? agent.toUpperCase() : "";
 
     return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
   <rect x="4" y="4" width="${w - 8}" height="${h - 8}" rx="12" fill="${color}" stroke="#000" stroke-opacity="0.2" stroke-width="1"/>
-  <text x="${w / 2}" y="24" font-family="sans-serif" font-size="13" font-weight="bold" fill="#fff" fill-opacity="0.8" text-anchor="middle">${escapeXml(agentLabel)}</text>
+  <text x="${w / 2}" y="22" font-family="sans-serif" font-size="16" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(agentLabel)}</text>
   ${renderDigit(slot, originX, originY, cell, "#c4c2ff")}
   ${status ? `<text x="${w / 2}" y="${h - 6}" font-family="sans-serif" font-size="9" fill="#fff" fill-opacity="0.6" text-anchor="middle">${escapeXml(status.toUpperCase())}</text>` : ""}
 </svg>`);
@@ -102,7 +102,9 @@ export function renderDisconnectedImage(label: string): string {
 const STRIP_W = 200;
 const STRIP_H = 100;
 
-/** Wraps strip body markup in the standard 200x100 canvas frame. */
+/** Wraps strip body markup in the standard 200x100 canvas frame.
+ * Returns a data URI (data:image/svg+xml,...) as expected by the pixmap
+ * layout item's `value` property in setFeedback. */
 function stripSvg(body: string): string {
     return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="${STRIP_W}" height="${STRIP_H}" viewBox="0 0 ${STRIP_W} ${STRIP_H}">
   <rect x="2" y="2" width="${STRIP_W - 4}" height="${STRIP_H - 4}" rx="8" fill="#1a1a1a"/>

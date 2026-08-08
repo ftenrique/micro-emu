@@ -1,4 +1,4 @@
-import {
+﻿import {
     action,
     SingletonAction,
     type WillAppearEvent,
@@ -30,7 +30,11 @@ export class CruxHorizontalAction extends SingletonAction<CruxDialSettings> {
     }
 
     onWillAppear(ev: WillAppearEvent<CruxDialSettings>): void {
-        this.refresh(ev.action as DialAction<CruxDialSettings>, ev.payload.settings);
+        const action = ev.action as DialAction<CruxDialSettings>;
+        if (action.isDial()) {
+            action.setFeedbackLayout("layouts/canvas.json");
+        }
+        this.refresh(action, ev.payload.settings);
     }
 
     onDidReceiveSettings(ev: DidReceiveSettingsEvent<CruxDialSettings>): void {
