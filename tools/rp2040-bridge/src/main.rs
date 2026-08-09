@@ -547,10 +547,14 @@ fn display_context_for_controller(
 
 fn desired_context(bridge: &BridgeRuntime) -> Option<DisplayContext> {
     bridge
-        .task_board
-        .selected_display_context(&bridge.task_device_id)
-        .and_then(|value| DisplayContext::from_value(&value).ok())
-        .or_else(|| bridge.last_display_context.clone())
+        .last_display_context
+        .clone()
+        .or_else(|| {
+            bridge
+                .task_board
+                .selected_display_context(&bridge.task_device_id)
+                .and_then(|value| DisplayContext::from_value(&value).ok())
+        })
         .or_else(|| Some(connection_default_context()))
         .map(|context| display_context_for_controller(bridge, &context))
 }
@@ -623,6 +627,7 @@ pub(crate) fn refresh_task_board(bridge: &mut BridgeRuntime) -> Result<(), Strin
         if let Err(error) = result {
             device.shutdown();
             eprintln!("device {device_id} render failed: {error}");
+            bridge.task_board.set_device(&device_id, 0, false);
         } else {
             survivors.push((device_id, device, slots));
         }
@@ -715,8 +720,14 @@ pub(crate) fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
             1_u16,
         )
     } else {
-        let (serial, firmware, port, sequence) = open_serial_runtime(&options.port)?;
-        (Some(serial), firmware, port, sequence)
+        match open_serial_runtime(&options.port) {
+            Ok((serial, firmware, port, sequence)) => (Some(serial), firmware, port, sequence),
+            Err(error) if options.port == "auto" => {
+                eprintln!("RP2040 unavailable at startup; continuing without serial: {error}");
+                (None, String::from("disconnected"), String::from("auto"), 1_u16)
+            }
+            Err(error) => return Err(error),
+        }
     };
     let controller = connect_controller(options.controller, options.controller_serial.as_deref())?;
     let task_device_id = controller
@@ -1512,7 +1523,10 @@ fn handle_mcp_request(request: Value, bridge: &mut BridgeRuntime) -> Result<(), 
             "protocolVersion": mcp::PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "micro-emu-rp2040-bridge", "version": "0.1.0"},
-            "instructions": "Use bridge_status first. The colored numbered LCD cards and READY dashboard are standby indicators until you publish live state with set_thread_status or set_display_context. Hardware actions target the RP2040 on the configured serial port."
+            "instructions": format!(
+                "Use bridge_status first. The colored numbered LCD cards and READY dashboard are standby indicators until you publish live state. Publish task cards with set_thread_status or publish_tasks. {} Hardware actions target the RP2040 on the configured serial port.",
+                mcp::DISPLAY_CONTEXT_INSTRUCTIONS
+            )
         }),
         "ping" => json!({}),
         "resources/list" => json!({"resources": []}),
@@ -1934,6 +1948,64 @@ mod tests {
             Some("Codex refresh")
         );
     }
+
+    #[test]
+    fn task_refresh_does_not_replace_mcp_display_context() {
+        let rendered = Arc::new(Mutex::new(None));
+        let contexts = Arc::new(Mutex::new(None));
+        let mut bridge = test_bridge_with_context(rendered, Arc::clone(&contexts));
+        bridge.task_mode = true;
+        bridge.has_explicit_task_state = true;
+        bridge
+            .task_board
+            .set_device(bridge.task_device_id.clone(), 6, true);
+
+        call_set_display_context(
+            &mut bridge,
+            &json!({
+                "task": "Live context",
+                "model": "gpt-live",
+                "effort": "medium",
+                "weekly_remaining": 41,
+                "five_hour_remaining": 87
+            }),
+        );
+        bridge
+            .task_board
+            .publish_tasks(
+                1,
+                crate::routing::AgentId::Codex,
+                &json!({"tasks": [{
+                    "task_id": "stale",
+                    "title": "Stale card",
+                    "state": "running",
+                    "context": {
+                        "model": "gpt-5.2",
+                        "effort": "high",
+                        "weekly_remaining": 62,
+                        "five_hour_remaining": 62
+                    }
+                }]}),
+                1,
+            )
+            .expect("publish task");
+        bridge
+            .task_board
+            .select(&bridge.task_device_id, 0, 2)
+            .expect("select task");
+
+        refresh_task_board(&mut bridge).expect("refresh task board");
+        let context = contexts
+            .lock()
+            .expect("context lock")
+            .clone()
+            .expect("context");
+        assert_eq!(context.model.as_deref(), Some("gpt-live"));
+        assert_eq!(context.effort.as_deref(), Some("medium"));
+        assert_eq!(context.weekly_remaining, Some(41));
+        assert_eq!(context.five_hour_remaining, Some(87));
+    }
+
     #[test]
     fn display_context_is_broadcast_to_aux_controllers() {
         let primary_context = Arc::new(Mutex::new(None));

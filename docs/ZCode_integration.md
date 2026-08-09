@@ -375,7 +375,9 @@ XL as the physical controller.
   "model": "GLM-5.2",
   "effort": "high",
   "status": "running",
-  "progress": 42
+  "progress": 42,
+  "weekly_remaining": 73,
+  "five_hour_remaining": 28
 }}}
 ```
 

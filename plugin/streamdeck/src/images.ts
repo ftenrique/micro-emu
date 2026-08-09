@@ -73,7 +73,12 @@ export function renderTaskCardImage(
     status: string,
     colorOverride?: unknown,
 ): string {
-    const color = normalizeColor(colorOverride) ?? (status ? (STATUS_COLORS[status.toLowerCase()] ?? DEFAULT_COLOR) : DEFAULT_COLOR);
+    const normalizedStatus = status.toLowerCase();
+    // Codex can send a white legacy `c` value with an idle thstatus entry.
+    // Idle task buttons retain their initial dark-grey state regardless of it.
+    const color = normalizedStatus === "idle"
+        ? STATUS_COLORS.idle
+        : normalizeColor(colorOverride) ?? (status ? (STATUS_COLORS[normalizedStatus] ?? DEFAULT_COLOR) : DEFAULT_COLOR);
     const w = 144;
     const h = 144;
     const cell = Math.floor(Math.min(w, h) / 10);

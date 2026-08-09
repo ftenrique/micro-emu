@@ -3,10 +3,11 @@ use crate::controller::{ControllerKind, DisplayContext, PhysicalController};
 use hidapi::{HidApi, HidDevice};
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb, RgbImage, imageops};
 use serde_json::Value;
+use std::ffi::CString;
 use std::io::Cursor;
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const VENDOR_ID: u16 = 0x0fd9;
 const PLUS_PID: u16 = 0x0084;
@@ -16,10 +17,13 @@ const OUTPUT_REPORT_BYTES: usize = 1024;
 const FEATURE_REPORT_BYTES: usize = 32;
 const INPUT_REPORT_BYTES: usize = 512;
 const STATUS_SLOTS: usize = 8;
-const HID_WRITE_RETRIES: usize = 2;
-const HID_REPORT_SETTLE: Duration = Duration::from_millis(12);
-const HID_IMAGE_SETTLE: Duration = Duration::from_millis(80);
-const HID_DEVICE_SETTLE: Duration = Duration::from_millis(250);
+const HID_WRITE_RETRIES: usize = 4;
+// HID writes are synchronous. Small pacing windows keep older firmware happy
+// without turning initial state replay into a long serialized startup.
+const HID_REPORT_SETTLE: Duration = Duration::from_millis(5);
+const HID_IMAGE_SETTLE: Duration = Duration::from_millis(20);
+const HID_DEVICE_SETTLE: Duration = Duration::from_millis(100);
+const HID_WINDOW_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const DIGITS: [[u8; 15]; STATUS_SLOTS] = [
     [0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1],
     [1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1],
@@ -36,6 +40,12 @@ enum Rotation {
     None,
     Rotate90Ccw,
     Rotate180,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayMode {
+    Context,
+    Usage,
 }
 
 #[derive(Clone, Copy)]
@@ -179,7 +189,14 @@ pub fn connect(
         let visible = api
             .device_list()
             .filter(|info| info.vendor_id() == VENDOR_ID)
-            .map(|info| format!("{:04X}:{:04X} serial={:?}", info.vendor_id(), info.product_id(), info.serial_number()))
+            .map(|info| {
+                format!(
+                    "{:04X}:{:04X} serial={:?}",
+                    info.vendor_id(),
+                    info.product_id(),
+                    info.serial_number()
+                )
+            })
             .collect::<Vec<_>>();
         eprintln!(
             "Stream Deck HID attach failed model={} vid={:04X} pid={:04X} requested_serial={:?} visible_vendor_devices={:?}",
@@ -197,6 +214,7 @@ pub fn connect(
         ));
     }
     let info = candidates[0];
+    let path = info.path().to_owned();
     let serial = info.serial_number().map(str::to_owned);
     let device = api.open_path(info.path()).map_err(|error| {
         format!(
@@ -214,6 +232,7 @@ pub fn connect(
         profile.model, VENDOR_ID, profile.pid, serial
     );
     let mut result = StreamDeckDevice {
+        path,
         device: Some(device),
         profile,
         serial,
@@ -222,6 +241,12 @@ pub fn connect(
         last_colors: [None; STATUS_SLOTS],
         last_agents: std::array::from_fn(|_| None),
         last_display_context: None,
+        display_context: None,
+        display_mode: DisplayMode::Context,
+        last_display_mode: None,
+        pending_display_context: None,
+        pending_display_mode: None,
+        last_display_write_at: None,
         write_lock: Mutex::new(()),
     };
     result.initialize()?;
@@ -253,6 +278,7 @@ fn validate_unit_info(device: &HidDevice, profile: Profile) -> Result<(), String
 
 struct StreamDeckDevice {
     device: Option<HidDevice>,
+    path: CString,
     write_lock: Mutex<()>,
     profile: Profile,
     serial: Option<String>,
@@ -261,19 +287,29 @@ struct StreamDeckDevice {
     last_colors: [Option<(u32, u8)>; STATUS_SLOTS],
     last_agents: [Option<String>; STATUS_SLOTS],
     last_display_context: Option<DisplayContext>,
+    display_context: Option<DisplayContext>,
+    display_mode: DisplayMode,
+    last_display_mode: Option<DisplayMode>,
+    pending_display_context: Option<DisplayContext>,
+    pending_display_mode: Option<DisplayMode>,
+    last_display_write_at: Option<Instant>,
 }
 
 impl StreamDeckDevice {
+    fn reopen_device(&mut self) -> Result<(), String> {
+        let api = HidApi::new().map_err(|error| error.to_string())?;
+        let device = api
+            .open_path(self.path.as_c_str())
+            .map_err(|error| format!("could not reopen Stream Deck HID handle: {error}"))?;
+        validate_unit_info(&device, self.profile)?;
+        thread::sleep(HID_DEVICE_SETTLE);
+        self.device = Some(device);
+        Ok(())
+    }
     fn initialize(&mut self) -> Result<(), String> {
         self.set_brightness(100)?;
+        // A full-LCD fill clears the display before normal state replay paints active keys.
         self.fill_screen([0, 0, 0])?;
-        for key in 0..self.profile.key_count {
-            self.fill_key(key as u8, [0, 0, 0])?;
-        }
-        if let Some((width, height)) = self.profile.window {
-            let image = encode_image(width, height, [0, 0, 0], None, false, self.profile.rotation)?;
-            self.send_image(0x0b, 0, &image, 0, 8)?;
-        }
         for key in 0..self.profile.key_count {
             if let Some(icon) = icon_for_key(self.profile.kind, key) {
                 let image = encode_icon_image(self.profile.key_size, icon, self.profile.rotation)?;
@@ -291,13 +327,12 @@ impl StreamDeckDevice {
         self.send_feature(&[0x03, 0x05, rgb[0], rgb[1], rgb[2]])
     }
 
-    fn fill_key(&self, key: u8, rgb: [u8; 3]) -> Result<(), String> {
-        self.send_feature(&[0x03, 0x06, key, rgb[0], rgb[1], rgb[2]])
-    }
-
     fn send_feature(&self, payload: &[u8]) -> Result<(), String> {
         if payload.len() > FEATURE_REPORT_BYTES {
-            return Err(format!("Stream Deck feature payload is too large: {} bytes", payload.len()));
+            return Err(format!(
+                "Stream Deck feature payload is too large: {} bytes",
+                payload.len()
+            ));
         }
         let mut report = [0_u8; FEATURE_REPORT_BYTES];
         report[..payload.len()].copy_from_slice(payload);
@@ -305,7 +340,10 @@ impl StreamDeckDevice {
             .write_lock
             .lock()
             .map_err(|_| "Stream Deck HID write lock was poisoned".to_owned())?;
-        let device = self.device.as_ref().expect("Stream Deck HID handle is present");
+        let device = self
+            .device
+            .as_ref()
+            .expect("Stream Deck HID handle is present");
         let mut last_error = None;
         for attempt in 0..=HID_WRITE_RETRIES {
             match device.send_feature_report(&report) {
@@ -328,7 +366,7 @@ impl StreamDeckDevice {
     }
 
     fn send_image(
-        &self,
+        &mut self,
         command: u8,
         target: u8,
         image: &[u8],
@@ -337,11 +375,6 @@ impl StreamDeckDevice {
     ) -> Result<(), String> {
         let capacity = OUTPUT_REPORT_BYTES - header_len;
         let total_chunks = (image.len() + capacity - 1) / capacity;
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| "Stream Deck HID write lock was poisoned".to_owned())?;
-        let device = self.device.as_ref().expect("Stream Deck HID handle is present");
         for (index, chunk) in image.chunks(capacity).enumerate() {
             let mut report = vec![0_u8; OUTPUT_REPORT_BYTES];
             report[0] = 0x02;
@@ -369,7 +402,18 @@ impl StreamDeckDevice {
             let mut last_error = None;
             let mut written_ok = false;
             for attempt in 0..=HID_WRITE_RETRIES {
-                match device.write(&report) {
+                let write_result = {
+                    let _guard = self
+                        .write_lock
+                        .lock()
+                        .map_err(|_| "Stream Deck HID write lock was poisoned".to_owned())?;
+                    let device = self
+                        .device
+                        .as_ref()
+                        .expect("Stream Deck HID handle is present");
+                    device.write(&report)
+                };
+                match write_result {
                     Ok(written) if written == report.len() => {
                         written_ok = true;
                         break;
@@ -382,7 +426,10 @@ impl StreamDeckDevice {
                     }
                 }
                 if attempt < HID_WRITE_RETRIES {
-                    thread::sleep(Duration::from_millis(10 * (attempt as u64 + 1)));
+                    thread::sleep(Duration::from_millis(75 * (attempt as u64 + 1)));
+                    if let Err(error) = self.reopen_device() {
+                        last_error = Some(format!("{last_error:?}; HID reopen failed: {error}"));
+                    }
                 }
             }
             if !written_ok {
@@ -393,7 +440,9 @@ impl StreamDeckDevice {
                     total_chunks,
                     image.len()
                 );
-                return Err(format!("Stream Deck image report failed after retries: {error}"));
+                return Err(format!(
+                    "Stream Deck image report failed after retries: {error}"
+                ));
             }
             thread::sleep(HID_REPORT_SETTLE);
         }
@@ -401,7 +450,7 @@ impl StreamDeckDevice {
         Ok(())
     }
 
-    fn write_key_image(&self, key: usize, image: &[u8]) -> Result<(), String> {
+    fn write_key_image(&mut self, key: usize, image: &[u8]) -> Result<(), String> {
         self.send_image(0x07, key as u8, image, 0, 8)
     }
 
@@ -414,12 +463,50 @@ impl StreamDeckDevice {
         let payload = &report[4..end];
         match report[1] {
             0x00 => self.key_events(payload),
-            0x02 => Vec::new(),
+            0x02 => {
+                self.touch_events(payload);
+                Vec::new()
+            }
             0x03 if self.profile.encoder_count > 0 => self.encoder_events(payload),
             _ => Vec::new(),
         }
     }
 
+    fn touch_events(&mut self, payload: &[u8]) {
+        if self.profile.window.is_none() || payload.len() < 10 || payload[0] != 0x03 {
+            return;
+        }
+        let start_x = u16::from_le_bytes([payload[2], payload[3]]);
+        let start_y = u16::from_le_bytes([payload[4], payload[5]]);
+        let end_x = u16::from_le_bytes([payload[6], payload[7]]);
+        let end_y = u16::from_le_bytes([payload[8], payload[9]]);
+        let horizontal = end_x.abs_diff(start_x);
+        let vertical = end_y.abs_diff(start_y);
+        // The device has already classified 0x03 as a completed flick. Keep
+        // only a generous direction check instead of rejecting short swipes.
+        if horizontal == 0 || horizontal.saturating_mul(2) < vertical {
+            return;
+        }
+        // Directional selection is idempotent, so repeating a swipe cannot
+        // switch to the target screen and immediately switch back.
+        let next_mode = if end_x < start_x {
+            DisplayMode::Usage
+        } else {
+            DisplayMode::Context
+        };
+        if next_mode == self.display_mode {
+            return;
+        }
+        self.display_mode = next_mode;
+        let context = self.display_context.clone().unwrap_or_default();
+        self.pending_display_context = Some(context);
+        self.pending_display_mode = Some(self.display_mode);
+        if self.device.is_some()
+            && let Err(error) = self.flush_display_context(true)
+        {
+            eprintln!("Stream Deck display mode switch failed: {error}");
+        }
+    }
     fn key_events(&mut self, payload: &[u8]) -> Vec<PhysicalEvent> {
         let mut events = Vec::new();
         for (index, &state) in payload.iter().take(self.profile.key_count).enumerate() {
@@ -473,6 +560,43 @@ impl StreamDeckDevice {
         }
         events
     }
+    fn flush_display_context(&mut self, force: bool) -> Result<(), String> {
+        let Some(context) = self.pending_display_context.clone() else {
+            return Ok(());
+        };
+        let mode = self.pending_display_mode.unwrap_or(self.display_mode);
+        if self.last_display_context.as_ref() == Some(&context)
+            && self.last_display_mode == Some(mode)
+        {
+            self.pending_display_context = None;
+            self.pending_display_mode = None;
+            return Ok(());
+        }
+        if !force
+            && self
+                .last_display_write_at
+                .is_some_and(|written_at| written_at.elapsed() < HID_WINDOW_MIN_INTERVAL)
+        {
+            return Ok(());
+        }
+        if let Some((width, height)) = self.profile.window {
+            let image = match mode {
+                DisplayMode::Context => {
+                    render_window_image(&context, width, height, self.profile.rotation)?
+                }
+                DisplayMode::Usage => {
+                    render_usage_image(&context, width, height, self.profile.rotation)?
+                }
+            };
+            self.send_image(0x0b, 0, &image, 0, 8)?;
+            self.last_display_write_at = Some(Instant::now());
+        }
+        self.last_display_context = Some(context);
+        self.last_display_mode = Some(mode);
+        self.pending_display_context = None;
+        self.pending_display_mode = None;
+        Ok(())
+    }
 }
 
 impl PhysicalController for StreamDeckDevice {
@@ -486,6 +610,7 @@ impl PhysicalController for StreamDeckDevice {
         self.serial.as_deref()
     }
     fn poll(&mut self, timeout_ms: i32) -> Result<Vec<PhysicalEvent>, String> {
+        self.flush_display_context(false)?;
         let mut report = vec![0_u8; INPUT_REPORT_BYTES];
         let read = self
             .device
@@ -493,7 +618,9 @@ impl PhysicalController for StreamDeckDevice {
             .expect("Stream Deck HID handle is present")
             .read_timeout(&mut report, timeout_ms)
             .map_err(|error| error.to_string())?;
-        Ok(self.events_from_report(&report[..read]))
+        let events = self.events_from_report(&report[..read]);
+        self.flush_display_context(false)?;
+        Ok(events)
     }
     fn apply_rgb_config(&mut self, parameters: &Value) -> Result<(), String> {
         if !parameters.is_object() {
@@ -501,29 +628,59 @@ impl PhysicalController for StreamDeckDevice {
         }
         Ok(())
     }
-fn apply_thread_status(&mut self, parameters: &Value) -> Result<(), String> {
-        let Some(entries) = parameters.as_array() else { return Err("v.oai.thstatus parameters must be an array".to_owned()); };
+    fn apply_thread_status(&mut self, parameters: &Value) -> Result<(), String> {
+        let Some(entries) = parameters.as_array() else {
+            return Err("v.oai.thstatus parameters must be an array".to_owned());
+        };
         let mut colors = self.last_colors;
         let mut agents = self.last_agents.clone();
         for entry in entries {
-            let Some(id) = entry.get("id").and_then(Value::as_u64) else { continue; };
-            if id >= STATUS_SLOTS as u64 { continue; }
+            let Some(id) = entry.get("id").and_then(Value::as_u64) else {
+                continue;
+            };
+            if id >= STATUS_SLOTS as u64 {
+                continue;
+            }
             let index = id as usize;
             let color = entry.get("c").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let brightness = entry.get("b").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.0, 1.0);
+            let brightness = entry
+                .get("b")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
             if entry.get("e").and_then(Value::as_u64) == Some(0) || brightness <= f64::EPSILON {
                 colors[index] = None;
                 agents[index] = None;
             } else {
                 colors[index] = Some((color & 0x00ff_ffff, (brightness * 100.0) as u8));
-                agents[index] = entry.get("agent").and_then(Value::as_str).map(str::to_owned);
+                agents[index] = entry
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
             }
         }
         for (index, color) in colors.into_iter().enumerate() {
-            if self.last_colors[index] == color && self.last_agents[index] == agents[index] { continue; }
+            if self.last_colors[index] == color && self.last_agents[index] == agents[index] {
+                continue;
+            }
             let image = match color {
-                Some((rgb, brightness)) => encode_image_with_agent(self.profile.key_size, self.profile.key_size, rgb_bytes(rgb, brightness), Some(index), true, self.profile.rotation, agents[index].as_deref())?,
-                None => encode_image(self.profile.key_size, self.profile.key_size, [0, 0, 0], None, false, self.profile.rotation)?,
+                Some((rgb, brightness)) => encode_image_with_agent(
+                    self.profile.key_size,
+                    self.profile.key_size,
+                    rgb_bytes(rgb, brightness),
+                    Some(index),
+                    true,
+                    self.profile.rotation,
+                    agents[index].as_deref(),
+                )?,
+                None => encode_image(
+                    self.profile.key_size,
+                    self.profile.key_size,
+                    [0, 0, 0],
+                    None,
+                    false,
+                    self.profile.rotation,
+                )?,
             };
             self.write_key_image(index, &image)?;
             self.last_colors[index] = color;
@@ -532,15 +689,16 @@ fn apply_thread_status(&mut self, parameters: &Value) -> Result<(), String> {
         Ok(())
     }
     fn apply_display_context(&mut self, context: &DisplayContext) -> Result<(), String> {
-        if self.last_display_context.as_ref() == Some(context) {
+        self.display_context = Some(context.clone());
+        if self.last_display_context.as_ref() == Some(context)
+            && self.last_display_mode == Some(self.display_mode)
+            && self.pending_display_context.is_none()
+        {
             return Ok(());
         }
-        if let Some((width, height)) = self.profile.window {
-            let image = render_window_image(context, width, height, self.profile.rotation)?;
-            self.send_image(0x0b, 0, &image, 0, 8)?;
-        }
-        self.last_display_context = Some(context.clone());
-        Ok(())
+        self.pending_display_context = Some(context.clone());
+        self.pending_display_mode = Some(self.display_mode);
+        self.flush_display_context(false)
     }
 
     fn shutdown(&mut self) {
@@ -555,40 +713,45 @@ fn render_window_image(
     rotation: Rotation,
 ) -> Result<Vec<u8>, String> {
     let mut image: RgbImage = ImageBuffer::from_pixel(width, height, Rgb([5, 8, 15]));
-    let project = context.project.as_deref().unwrap_or("CODEX");
-    let task = context.task.as_deref().unwrap_or("BRIDGE");
-    let model = context.model.as_deref().unwrap_or("MODEL");
-    let effort = context.effort.as_deref().unwrap_or("EFFORT");
+    let project = context.project.as_deref().unwrap_or("MICRO-EMU");
+    let task = context.task.as_deref().unwrap_or("WAITING FOR TASK");
+    let model = context.model.as_deref().unwrap_or("CODEX");
+    let effort = context.effort.as_deref().unwrap_or("DEFAULT");
     let status = context.status.as_deref().unwrap_or("READY");
 
+    draw_text(&mut image, task, 16, 8, 2, [230, 235, 245]);
     draw_text(
         &mut image,
-        &format!("{project}  /  {task}"),
+        &format!("{project}  |  {model}  |  {effort}"),
         16,
-        10,
-        2,
-        [230, 235, 245],
-    );
-    draw_text(
-        &mut image,
-        &format!("{model}  /  {effort}  /  {status}"),
-        16,
-        48,
-        2,
+        38,
+        1,
         [112, 205, 255],
+    );
+    let progress_label = context
+        .progress
+        .map(|progress| format!("  {progress}%"))
+        .unwrap_or_default();
+    draw_text(
+        &mut image,
+        &format!("{status}{progress_label}"),
+        16,
+        62,
+        1,
+        [160, 225, 190],
     );
 
     if let Some(progress) = context.progress {
         let x0 = 16_u32;
-        let y0 = height.saturating_sub(10);
+        let y0 = height.saturating_sub(14);
         let bar_width = width.saturating_sub(32);
-        for y in y0..height.saturating_sub(4) {
+        for y in y0..height.saturating_sub(6) {
             for x in x0..x0.saturating_add(bar_width) {
                 image.put_pixel(x, y, Rgb([20, 32, 48]));
             }
         }
         let fill_width = bar_width * u32::from(progress) / 100;
-        for y in y0..height.saturating_sub(4) {
+        for y in y0..height.saturating_sub(6) {
             for x in x0..x0.saturating_add(fill_width) {
                 image.put_pixel(x, y, Rgb([65, 190, 125]));
             }
@@ -601,6 +764,111 @@ fn render_window_image(
         .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Jpeg)
         .map_err(|error| error.to_string())?;
     Ok(bytes)
+}
+
+fn render_usage_image(
+    context: &DisplayContext,
+    width: u32,
+    height: u32,
+    rotation: Rotation,
+) -> Result<Vec<u8>, String> {
+    let mut image: RgbImage = ImageBuffer::from_pixel(width, height, Rgb([5, 8, 15]));
+    let task = context.task.as_deref().unwrap_or("ACTIVE TASK");
+    draw_text(
+        &mut image,
+        &format!("LIMITS  |  {task}"),
+        16,
+        6,
+        2,
+        [230, 235, 245],
+    );
+    if context.weekly_remaining.is_none() && context.five_hour_remaining.is_none() {
+        let status = context.status.as_deref().unwrap_or("READY");
+        let progress = context
+            .progress
+            .map(|value| format!("  |  PROGRESS {value}%"))
+            .unwrap_or_default();
+        draw_text(
+            &mut image,
+            "USAGE LIMIT DATA NOT PUBLISHED",
+            16,
+            40,
+            1,
+            [245, 175, 65],
+        );
+        draw_text(
+            &mut image,
+            &format!("STATUS {status}{progress}"),
+            16,
+            64,
+            1,
+            [160, 225, 190],
+        );
+    } else {
+        let gap = 24;
+        let column_width = width.saturating_sub(32 + gap) / 2;
+        draw_usage_meter(
+            &mut image,
+            "WEEKLY",
+            context.weekly_remaining,
+            16,
+            38,
+            column_width,
+        );
+        draw_usage_meter(
+            &mut image,
+            "5-HOUR",
+            context.five_hour_remaining,
+            16 + column_width + gap,
+            38,
+            column_width,
+        );
+    }
+    let image = rotate_image(&image, rotation);
+    let mut bytes = Vec::new();
+    DynamicImage::ImageRgb8(image)
+        .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Jpeg)
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
+}
+
+fn draw_usage_meter(
+    image: &mut RgbImage,
+    label: &str,
+    remaining: Option<u8>,
+    x: u32,
+    y: u32,
+    width: u32,
+) {
+    draw_text(image, label, x, y, 1, [112, 205, 255]);
+    let value = remaining
+        .map(|value| format!("{value}%"))
+        .unwrap_or_else(|| "NOT SET".to_owned());
+    draw_text(image, &value, x + 78, y - 1, 2, [230, 235, 245]);
+    let bar_x = x + 150;
+    let bar_y = y + 2;
+    let bar_width = width.saturating_sub(150);
+    let bar_height = 14;
+    for yy in bar_y..bar_y + bar_height {
+        for xx in bar_x..bar_x + bar_width {
+            image.put_pixel(xx, yy, Rgb([20, 32, 48]));
+        }
+    }
+    if let Some(value) = remaining {
+        let fill_width = bar_width * u32::from(value) / 100;
+        let color = if value < 20 {
+            [220, 85, 85]
+        } else if value < 50 {
+            [245, 175, 65]
+        } else {
+            [65, 190, 125]
+        };
+        for yy in bar_y..bar_y + bar_height {
+            for xx in bar_x..bar_x + fill_width {
+                image.put_pixel(xx, yy, Rgb(color));
+            }
+        }
+    }
 }
 
 fn draw_text(image: &mut RgbImage, text: &str, x: u32, y: u32, scale: u32, color: [u8; 3]) {
@@ -1033,29 +1301,58 @@ fn draw_circle(
         }
     }
 }
-fn encode_image(width: u32, height: u32, rgb: [u8; 3], digit: Option<usize>, draw_digits: bool, rotation: Rotation) -> Result<Vec<u8>, String> {
+fn encode_image(
+    width: u32,
+    height: u32,
+    rgb: [u8; 3],
+    digit: Option<usize>,
+    draw_digits: bool,
+    rotation: Rotation,
+) -> Result<Vec<u8>, String> {
     encode_image_with_agent(width, height, rgb, digit, draw_digits, rotation, None)
 }
 
-fn encode_image_with_agent(width: u32, height: u32, rgb: [u8; 3], digit: Option<usize>, draw_digits: bool, rotation: Rotation, agent: Option<&str>) -> Result<Vec<u8>, String> {
+fn encode_image_with_agent(
+    width: u32,
+    height: u32,
+    rgb: [u8; 3],
+    digit: Option<usize>,
+    draw_digits: bool,
+    rotation: Rotation,
+    agent: Option<&str>,
+) -> Result<Vec<u8>, String> {
     let mut image: RgbImage = ImageBuffer::from_pixel(width, height, Rgb(rgb));
     if draw_digits {
-        if let Some(agent) = agent { draw_agent_label(&mut image, agent); }
+        if let Some(agent) = agent {
+            draw_agent_label(&mut image, agent);
+        }
         let cell = (width.min(height) / 10).max(6);
         let origin_x = (width - 3 * cell) / 2;
-        let origin_y = height.saturating_sub(5 * cell + 6);
+        let origin_y = height.saturating_sub(5 * cell + 16);
         if let Some(digit) = digit {
-            for row in 0..5 { for column in 0..3 {
-                if DIGITS[digit][row * 3 + column] == 0 { continue; }
-                for y in 2..cell.saturating_sub(2) { for x in 2..cell.saturating_sub(2) {
-                    image.put_pixel(origin_x + column as u32 * cell + x, origin_y + row as u32 * cell + y, Rgb([196, 194, 255]));
-                }}
-            }}
+            for row in 0..5 {
+                for column in 0..3 {
+                    if DIGITS[digit][row * 3 + column] == 0 {
+                        continue;
+                    }
+                    for y in 2..cell.saturating_sub(2) {
+                        for x in 2..cell.saturating_sub(2) {
+                            image.put_pixel(
+                                origin_x + column as u32 * cell + x,
+                                origin_y + row as u32 * cell + y,
+                                Rgb([196, 194, 255]),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
     let image = rotate_image(&image, rotation);
     let mut bytes = Vec::new();
-    DynamicImage::ImageRgb8(image).write_to(&mut Cursor::new(&mut bytes), ImageFormat::Jpeg).map_err(|error| error.to_string())?;
+    DynamicImage::ImageRgb8(image)
+        .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Jpeg)
+        .map_err(|error| error.to_string())?;
     Ok(bytes)
 }
 
@@ -1066,27 +1363,37 @@ fn draw_agent_label(image: &mut RgbImage, agent: &str) {
     let start_x = image.width().saturating_sub(width) / 2;
     for (index, ch) in text.chars().enumerate() {
         let glyph = agent_glyph(ch);
-        for row in 0..5 { for column in 0..3 {
-            if glyph[row * 3 + column] == 0 { continue; }
-            for y in 0..scale { for x in 0..scale {
-                image.put_pixel(start_x + index as u32 * 4 * scale + column as u32 * scale + x, 4 + row as u32 * scale + y, Rgb([196, 194, 255]));
-            }}
-        }}
+        for row in 0..5 {
+            for column in 0..3 {
+                if glyph[row * 3 + column] == 0 {
+                    continue;
+                }
+                for y in 0..scale {
+                    for x in 0..scale {
+                        image.put_pixel(
+                            start_x + index as u32 * 4 * scale + column as u32 * scale + x,
+                            4 + row as u32 * scale + y,
+                            Rgb([196, 194, 255]),
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
 fn agent_glyph(ch: char) -> [u8; 15] {
     match ch {
-        'c' => [0,1,1,1,0,0,1,0,0,1,0,0,0,1,1],
-        'd' => [1,1,0,1,0,1,1,0,1,1,0,1,1,1,0],
-        'e' => [1,1,1,1,0,0,1,1,0,1,0,0,1,1,1],
-        'h' => [1,0,1,1,0,1,1,1,1,1,0,1,1,0,1],
-        'm' => [1,0,1,1,1,1,1,1,1,1,0,1,1,0,1],
-        'o' => [0,1,0,1,0,1,1,0,1,1,0,1,0,1,0],
-        'r' => [1,1,0,1,0,1,1,1,0,1,0,1,1,0,1],
-        's' => [0,1,1,1,0,0,0,1,0,0,0,1,1,1,0],
-        'x' => [1,0,1,0,1,0,0,1,0,0,1,0,1,0,1],
-        'z' => [1,1,1,0,0,1,0,1,0,1,0,0,1,1,1],
+        'c' => [0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 1],
+        'd' => [1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0],
+        'e' => [1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 1],
+        'h' => [1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1],
+        'm' => [1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1],
+        'o' => [0, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0],
+        'r' => [1, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+        's' => [0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0],
+        'x' => [1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1],
+        'z' => [1, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1],
         _ => [0; 15],
     }
 }
@@ -1109,13 +1416,20 @@ mod tests {
         let mut device = StreamDeckDevice {
             device: None,
             write_lock: Mutex::new(()),
+            path: CString::new("test").expect("test path"),
             profile: PLUS,
             serial: None,
             pressed_keys: vec![false; 8],
             pressed_encoders: vec![false; 4],
             last_colors: [None; STATUS_SLOTS],
-        last_agents: std::array::from_fn(|_| None),
+            last_agents: std::array::from_fn(|_| None),
             last_display_context: None,
+            display_context: None,
+            display_mode: DisplayMode::Context,
+            last_display_mode: None,
+            pending_display_context: None,
+            pending_display_mode: None,
+            last_display_write_at: None,
         };
         let first = device.events_from_report(&report(0x00, &[1, 0, 0, 0, 0, 0, 0, 0]));
         assert_eq!(
@@ -1137,13 +1451,20 @@ mod tests {
         let mut device = StreamDeckDevice {
             device: None,
             write_lock: Mutex::new(()),
+            path: CString::new("test").expect("test path"),
             profile: PLUS,
             serial: None,
             pressed_keys: vec![false; 8],
             pressed_encoders: vec![false; 4],
             last_colors: [None; STATUS_SLOTS],
-        last_agents: std::array::from_fn(|_| None),
+            last_agents: std::array::from_fn(|_| None),
             last_display_context: None,
+            display_context: None,
+            display_mode: DisplayMode::Context,
+            last_display_mode: None,
+            pending_display_context: None,
+            pending_display_mode: None,
+            last_display_write_at: None,
         };
         assert_eq!(
             device.events_from_report(&report(0x03, &[1, 2, 255, 0, 0])),
@@ -1164,17 +1485,72 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_flicks_are_directional_and_idempotent() {
+        let mut device = StreamDeckDevice {
+            device: None,
+            write_lock: Mutex::new(()),
+            path: CString::new("test").expect("test path"),
+            profile: PLUS,
+            serial: None,
+            pressed_keys: vec![false; 8],
+            pressed_encoders: vec![false; 4],
+            last_colors: [None; STATUS_SLOTS],
+            last_agents: std::array::from_fn(|_| None),
+            last_display_context: None,
+            display_context: Some(DisplayContext {
+                weekly_remaining: Some(73),
+                five_hour_remaining: Some(28),
+                ..DisplayContext::default()
+            }),
+            display_mode: DisplayMode::Context,
+            last_display_mode: None,
+            pending_display_context: None,
+            pending_display_mode: None,
+            last_display_write_at: Some(Instant::now()),
+        };
+        let left = [0x03, 0, 138, 2, 20, 0, 100, 0, 22, 0];
+        device.events_from_report(&report(0x02, &left));
+        assert_eq!(device.display_mode, DisplayMode::Usage);
+        device.events_from_report(&report(0x02, &left));
+        assert_eq!(device.display_mode, DisplayMode::Usage);
+        let updated = DisplayContext {
+            weekly_remaining: Some(42),
+            five_hour_remaining: Some(81),
+            ..DisplayContext::default()
+        };
+        device
+            .apply_display_context(&updated)
+            .expect("usage refresh");
+        assert_eq!(device.pending_display_context, Some(updated));
+
+        let right = [0x03, 0, 100, 0, 20, 0, 138, 2, 22, 0];
+        device.events_from_report(&report(0x02, &right));
+        assert_eq!(device.display_mode, DisplayMode::Context);
+
+        let vertical = [0x03, 0, 100, 0, 0, 0, 110, 0, 100, 0];
+        device.events_from_report(&report(0x02, &vertical));
+        assert_eq!(device.display_mode, DisplayMode::Context);
+    }
+
+    #[test]
     fn xl_snapshot_handles_multiple_keys_and_release() {
         let mut device = StreamDeckDevice {
             device: None,
             write_lock: Mutex::new(()),
+            path: CString::new("test").expect("test path"),
             profile: XL,
             serial: None,
             pressed_keys: vec![false; 32],
             pressed_encoders: Vec::new(),
             last_colors: [None; STATUS_SLOTS],
-        last_agents: std::array::from_fn(|_| None),
+            last_agents: std::array::from_fn(|_| None),
             last_display_context: None,
+            display_context: None,
+            display_mode: DisplayMode::Context,
+            last_display_mode: None,
+            pending_display_context: None,
+            pending_display_mode: None,
+            last_display_write_at: None,
         };
         let mut pressed = vec![0_u8; 32];
         pressed[0] = 1;
@@ -1203,13 +1579,20 @@ mod tests {
         let mut device = StreamDeckDevice {
             device: None,
             write_lock: Mutex::new(()),
+            path: CString::new("test").expect("test path"),
             profile: XL,
             serial: None,
             pressed_keys: vec![false; 32],
             pressed_encoders: Vec::new(),
             last_colors: [None; STATUS_SLOTS],
-        last_agents: std::array::from_fn(|_| None),
+            last_agents: std::array::from_fn(|_| None),
             last_display_context: None,
+            display_context: None,
+            display_mode: DisplayMode::Context,
+            last_display_mode: None,
+            pending_display_context: None,
+            pending_display_mode: None,
+            last_display_write_at: None,
         };
         let mut pressed = vec![0_u8; 32];
         for index in [11, 14, 18, 19, 20, 27, 29, 30, 31] {
@@ -1277,13 +1660,20 @@ mod tests {
         let mut device = StreamDeckDevice {
             device: None,
             write_lock: Mutex::new(()),
+            path: CString::new("test").expect("test path"),
             profile: XL,
             serial: None,
             pressed_keys: vec![false; 32],
             pressed_encoders: Vec::new(),
             last_colors: [None; STATUS_SLOTS],
-        last_agents: std::array::from_fn(|_| None),
+            last_agents: std::array::from_fn(|_| None),
             last_display_context: None,
+            display_context: None,
+            display_mode: DisplayMode::Context,
+            last_display_mode: None,
+            pending_display_context: None,
+            pending_display_mode: None,
+            last_display_write_at: None,
         };
         let mut reserved = vec![0_u8; 32];
         reserved[9] = 1;
@@ -1313,7 +1703,9 @@ mod tests {
             effort: Some("high".to_owned()),
             status: Some("working".to_owned()),
             progress: Some(65),
-                    task_id: None,
+            task_id: None,
+            weekly_remaining: None,
+            five_hour_remaining: None,
         };
         let image = render_window_image(&context, 800, 100, Rotation::None).unwrap();
         assert_eq!(
@@ -1324,6 +1716,24 @@ mod tests {
         let blank =
             render_window_image(&DisplayContext::default(), 800, 100, Rotation::None).unwrap();
         assert_ne!(image, blank);
+    }
+
+    #[test]
+    fn usage_screen_renders_numeric_and_graphical_limits() {
+        let context = DisplayContext {
+            weekly_remaining: Some(73),
+            five_hour_remaining: Some(28),
+            ..DisplayContext::default()
+        };
+        let image = render_usage_image(&context, 800, 100, Rotation::None).unwrap();
+        assert_eq!(
+            image::load_from_memory(&image).unwrap().dimensions(),
+            (800, 100)
+        );
+        assert!(image.len() > 100);
+        let missing =
+            render_usage_image(&DisplayContext::default(), 800, 100, Rotation::None).unwrap();
+        assert_ne!(image, missing);
     }
 
     #[test]

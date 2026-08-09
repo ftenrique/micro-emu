@@ -33,16 +33,34 @@ pub struct ProxyOptions {
 /// Runs the STDIO<->TCP proxy. Returns when stdin closes or the daemon
 /// connection is permanently lost.
 pub fn run_proxy(options: ProxyOptions) -> Result<(), String> {
-    eprintln!("proxy [{}] starting agent={} connect={} autostart={} daemon_args={:?}", log_context(), options.agent.as_str(), options.connect, options.autostart, options.daemon_args);
+    eprintln!(
+        "proxy [{}] starting agent={} connect={} autostart={} daemon_args={:?}",
+        log_context(),
+        options.agent.as_str(),
+        options.connect,
+        options.autostart,
+        options.daemon_args
+    );
     let stream = connect_with_retry(&options)?;
-    eprintln!("proxy [{}] connected to daemon at {}", log_context(), options.connect);
+    eprintln!(
+        "proxy [{}] connected to daemon at {}",
+        log_context(),
+        options.connect
+    );
     let read_stream = stream
         .try_clone()
         .map_err(|error| format!("could not clone proxy socket: {error}"))?;
     let mut write_stream = stream;
 
     // Send the hello line identifying the agent.
-    let instance_id = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|duration| duration.as_nanos()).unwrap_or(0));
+    let instance_id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    );
     let hello = json!({"bridge": "hello", "version": 1, "agent": options.agent.as_str(), "instance_id": instance_id, "capabilities": {"focus": true}});
     let hello_line = serde_json::to_string(&hello).map_err(|e| e.to_string())?;
     write_stream
@@ -50,7 +68,11 @@ pub fn run_proxy(options: ProxyOptions) -> Result<(), String> {
         .and_then(|_| write_stream.write_all(b"\n"))
         .and_then(|_| write_stream.flush())
         .map_err(|error| format!("failed to send hello: {error}"))?;
-    eprintln!("proxy [{}] sent bridge hello instance={}", log_context(), instance_id);
+    eprintln!(
+        "proxy [{}] sent bridge hello instance={}",
+        log_context(),
+        instance_id
+    );
 
     // Channel for lines read from the daemon.
     let (daemon_tx, daemon_rx) = mpsc::channel::<Result<String, String>>();
@@ -178,21 +200,29 @@ fn connect_with_retry(options: &ProxyOptions) -> Result<TcpStream, String> {
     for attempt in 0..max_attempts {
         match TcpStream::connect(&options.connect) {
             Ok(stream) => {
-                eprintln!("proxy [{}] TCP connect succeeded attempt={} address={}", log_context(), attempt + 1, options.connect);
+                eprintln!(
+                    "proxy [{}] TCP connect succeeded attempt={} address={}",
+                    log_context(),
+                    attempt + 1,
+                    options.connect
+                );
                 return Ok(stream);
             }
             Err(error) => {
                 if options.autostart && !autostarted && attempt > 0 {
                     eprintln!(
                         "proxy [{}] daemon not reachable at {} ({error}); autostarting",
-                        log_context(), options.connect
+                        log_context(),
+                        options.connect
                     );
                     autostart_daemon(options)?;
                     autostarted = true;
                 } else if attempt > 0 {
                     eprintln!(
                         "proxy [{}] connect attempt {} to {} failed: {error}",
-                        log_context(), attempt + 1, options.connect
+                        log_context(),
+                        attempt + 1,
+                        options.connect
                     );
                 }
                 thread::sleep(delay);
@@ -214,19 +244,38 @@ fn autostart_daemon(options: &ProxyOptions) -> Result<(), String> {
     });
     // A losing proxy must wait for the winner rather than spawning a second daemon.
     if lock_guard.is_none() {
-        eprintln!("proxy [{}] autostart lock held by another process; waiting", log_context());
+        eprintln!(
+            "proxy [{}] autostart lock held by another process; waiting",
+            log_context()
+        );
         return wait_for_daemon(&options.connect, Duration::from_secs(15));
     }
     if TcpStream::connect(&options.connect).is_ok() {
-        eprintln!("proxy [{}] daemon became reachable before spawn", log_context());
+        eprintln!(
+            "proxy [{}] daemon became reachable before spawn",
+            log_context()
+        );
         return Ok(());
     }
     let mut command = Command::new(&options.exe);
     command.arg("--daemon");
-    for arg in &options.daemon_args { command.arg(arg); }
-    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit());
-    let child = command.spawn().map_err(|error| format!("failed to autostart daemon: {error}"))?;
-    eprintln!("proxy [{}] autostarted daemon pid={} exe={} args={:?}", log_context(), child.id(), options.exe, options.daemon_args);
+    for arg in &options.daemon_args {
+        command.arg(arg);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let child = command
+        .spawn()
+        .map_err(|error| format!("failed to autostart daemon: {error}"))?;
+    eprintln!(
+        "proxy [{}] autostarted daemon pid={} exe={} args={:?}",
+        log_context(),
+        child.id(),
+        options.exe,
+        options.daemon_args
+    );
     // Keep the lock alive until the listener is observable.
     let result = wait_for_daemon(&options.connect, Duration::from_secs(10));
     eprintln!("proxy [{}] daemon wait result={:?}", log_context(), result);
@@ -236,7 +285,9 @@ fn autostart_daemon(options: &ProxyOptions) -> Result<(), String> {
 fn wait_for_daemon(address: &str, timeout: Duration) -> Result<(), String> {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if TcpStream::connect(address).is_ok() { return Ok(()); }
+        if TcpStream::connect(address).is_ok() {
+            return Ok(());
+        }
         thread::sleep(Duration::from_millis(100));
     }
     Err(format!("daemon did not become reachable at {address}"))
@@ -244,7 +295,11 @@ fn wait_for_daemon(address: &str, timeout: Duration) -> Result<(), String> {
 
 fn daemon_lockfile_path() -> Option<PathBuf> {
     let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
-    Some(PathBuf::from(local_app_data).join("micro-emu").join("bridge-daemon.lock"))
+    Some(
+        PathBuf::from(local_app_data)
+            .join("micro-emu")
+            .join("bridge-daemon.lock"),
+    )
 }
 
 struct LockGuard {
@@ -260,14 +315,23 @@ impl Drop for LockGuard {
 }
 
 fn acquire_lock(path: &PathBuf) -> Option<LockGuard> {
-    let open = || std::fs::OpenOptions::new().write(true).create_new(true).open(path);
+    let open = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    };
     match open() {
         Ok(mut file) => {
             let _ = writeln!(file, "{}", std::process::id());
-            Some(LockGuard { path: path.clone(), file: Some(file) })
+            Some(LockGuard {
+                path: path.clone(),
+                file: Some(file),
+            })
         }
         Err(_) => {
-            let stale = std::fs::metadata(path).ok()
+            let stale = std::fs::metadata(path)
+                .ok()
                 .and_then(|metadata| metadata.modified().ok())
                 .and_then(|modified| modified.elapsed().ok())
                 .is_some_and(|age| age > Duration::from_secs(10));
@@ -275,7 +339,10 @@ fn acquire_lock(path: &PathBuf) -> Option<LockGuard> {
                 let _ = std::fs::remove_file(path);
                 if let Ok(mut file) = open() {
                     let _ = writeln!(file, "{}", std::process::id());
-                    return Some(LockGuard { path: path.clone(), file: Some(file) });
+                    return Some(LockGuard {
+                        path: path.clone(),
+                        file: Some(file),
+                    });
                 }
             }
             None
@@ -287,7 +354,14 @@ mod tests {
     use super::*;
     #[test]
     fn lock_guard_is_exclusive_and_releases() {
-        let path = std::env::temp_dir().join(format!("micro-emu-lock-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let path = std::env::temp_dir().join(format!(
+            "micro-emu-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = std::fs::remove_file(&path);
         let guard = acquire_lock(&path).expect("first lock should win");
         assert!(acquire_lock(&path).is_none());

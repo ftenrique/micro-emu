@@ -1,4 +1,4 @@
-﻿//! Task-instance scheduling for daemon mode.
+//! Task-instance scheduling for daemon mode.
 //!
 //! The legacy bridge partitioned six physical slots by agent product.  The
 //! daemon now treats a task as the schedulable resource and maps tasks onto a
@@ -60,12 +60,12 @@ pub enum TaskState {
 impl TaskState {
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.unwrap_or("queued") {
-            "queued" => Ok(Self::Queued),
-            "running" => Ok(Self::Running),
-            "waiting" => Ok(Self::Waiting),
-            "error" => Ok(Self::Error),
+            "queued" | "idle" | "ready" => Ok(Self::Queued),
+            "running" | "active" | "working" => Ok(Self::Running),
+            "waiting" | "blocked" => Ok(Self::Waiting),
+            "error" | "failed" => Ok(Self::Error),
             "paused" => Ok(Self::Paused),
-            "completed" => Ok(Self::Completed),
+            "completed" | "complete" | "done" => Ok(Self::Completed),
             "reconnecting" => Ok(Self::Reconnecting),
             other => Err(format!("unsupported task state: {other}")),
         }
@@ -96,8 +96,18 @@ impl TaskState {
     fn eligible(self) -> bool {
         !matches!(self, Self::Reconnecting)
     }
-}
 
+    fn display_color(self) -> u32 {
+        match self {
+            Self::Queued | Self::Reconnecting => 0x37474f,
+            Self::Running => 0x1565c0,
+            Self::Waiting | Self::Paused => 0xef6c00,
+            Self::Error => 0xb71c1c,
+            Self::Completed => 0x2e7d32,
+        }
+    }
+
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskCard {
     pub task_id: String,
@@ -286,13 +296,19 @@ impl TaskBoard {
             .chars()
             .take(160)
             .collect::<String>();
-        let state = TaskState::parse(object.get("state").and_then(Value::as_str).or_else(|| {
-            if object.get("e").and_then(Value::as_u64) == Some(0) {
-                Some("completed")
-            } else {
-                None
-            }
-        }))?;
+        let state = TaskState::parse(
+            object
+                .get("state")
+                .or_else(|| object.get("status"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    if object.get("e").and_then(Value::as_u64) == Some(0) {
+                        Some("completed")
+                    } else {
+                        None
+                    }
+                }),
+        )?;
         let priority = object
             .get("priority")
             .and_then(Value::as_u64)
@@ -521,12 +537,19 @@ impl TaskBoard {
                 } else {
                     task.title.clone()
                 };
+                // Task status updates often omit `c`; emitting zero in that
+                // case suppresses the Stream Deck status palette. Queued
+                // cards always retain the initial dark-grey idle background.
+                let color = match task.state {
+                    TaskState::Queued | TaskState::Reconnecting => task.state.display_color(),
+                    _ => task.color.unwrap_or_else(|| task.state.display_color()),
+                };
                 json!({
-                    "id": slot,
                     "e": u8::from(task.state != TaskState::Completed),
+                    "id": slot,
                     "t": title,
                     "status": task.state.as_str(),
-                    "c": task.color.unwrap_or(0),
+                    "c": color,
                     "b": f64::from(task.brightness) / 100.0,
                     "progress": task.progress,
                     "task_id": task.task_id,
@@ -682,6 +705,23 @@ mod tests {
         assert_eq!(card.color, Some(0x112233));
         assert_eq!(card.brightness, 80);
         assert_eq!(card.legacy_key.as_deref(), Some("AG00"));
+    }
+
+    #[test]
+    fn legacy_status_field_sets_active_card_state_and_palette() {
+        let mut board = TaskBoard::new();
+        board.set_device("plus", 8, true);
+        board
+            .publish_legacy_status(
+                4,
+                AgentId::Codex,
+                &json!([{"i":0,"e":1,"t":"build","status":"working"}]),
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(board.tasks().next().unwrap().state, TaskState::Running);
+        assert_eq!(board.rendered_slots("plus", 1)[0]["c"], 0x1565c0);
     }
 
     #[test]

@@ -36,7 +36,9 @@ impl AgentId {
             "codex" => Ok(Self::Codex),
             "zcode" => Ok(Self::ZCode),
             "hermes" => Ok(Self::Hermes),
-            _ => Err(format!("agent must be codex, zcode, or hermes (got {value})")),
+            _ => Err(format!(
+                "agent must be codex, zcode, or hermes (got {value})"
+            )),
         }
     }
 
@@ -98,7 +100,11 @@ impl ActiveSet {
 
     /// Returns the active agents in priority order.
     pub fn iter(&self) -> Vec<AgentId> {
-        AGENTS.iter().copied().filter(|a| self.contains(*a)).collect()
+        AGENTS
+            .iter()
+            .copied()
+            .filter(|a| self.contains(*a))
+            .collect()
     }
 }
 
@@ -212,9 +218,7 @@ impl BufferedEvent {
     /// Returns the timestamp of the event regardless of variant.
     pub fn timestamp_ms(&self) -> u128 {
         match self {
-            Self::Key { timestamp_ms, .. } | Self::Partition { timestamp_ms, .. } => {
-                *timestamp_ms
-            }
+            Self::Key { timestamp_ms, .. } | Self::Partition { timestamp_ms, .. } => *timestamp_ms,
         }
     }
 
@@ -331,7 +335,10 @@ impl EventRouting {
         let event = BufferedEvent::Partition {
             keys: partition.keys_for(agent),
             slots: partition.slots_for(agent),
-            agents: active_agents.iter().map(|a| a.as_str().to_owned()).collect(),
+            agents: active_agents
+                .iter()
+                .map(|a| a.as_str().to_owned())
+                .collect(),
             timestamp_ms,
         };
         self.queue_mut(agent).push(event);
@@ -378,29 +385,25 @@ impl FusedLcdState {
     /// inactive slot is cleared.
     pub fn fused_array(&self, partition: &Partition) -> Vec<Value> {
         (0..LCD_SLOTS)
-            .map(|s| {
-                match partition.owner_of(s as u8) {
-                    Some(agent) => {
-                        let slots = partition.slots_for(agent);
-                        let local_index = slots.iter().position(|&slot| slot == s);
-                        match local_index {
-                            Some(li) => {
-                                let Some(mut entry) = self.entries[agent.index()][li].clone() else {
-                                    return json!({"e": 0});
-                                };
-                                normalize_render_entry(&mut entry, s, agent);
-                                entry
-                            },
-                            None => json!({"e": 0}),
+            .map(|s| match partition.owner_of(s as u8) {
+                Some(agent) => {
+                    let slots = partition.slots_for(agent);
+                    let local_index = slots.iter().position(|&slot| slot == s);
+                    match local_index {
+                        Some(li) => {
+                            let Some(mut entry) = self.entries[agent.index()][li].clone() else {
+                                return json!({"e": 0});
+                            };
+                            normalize_render_entry(&mut entry, s, agent);
+                            entry
                         }
+                        None => json!({"e": 0}),
                     }
-                    None => json!({"e": 0}),
                 }
+                None => json!({"e": 0}),
             })
             .collect()
     }
-
-
 
     /// Replaces the entire state from a full six-slot array, distributing
     /// entries to the owning agents' local buffers via the current partition.
@@ -422,7 +425,9 @@ fn normalize_render_entry(entry: &mut Value, slot: usize, agent: AgentId) {
         object.insert("i".to_owned(), Value::from(slot));
         object.insert("agent".to_owned(), Value::from(agent.as_str()));
         if let Some(value) = object.get("b").and_then(Value::as_f64) {
-            if value > 1.0 { object.insert("b".to_owned(), Value::from((value / 100.0).clamp(0.0, 1.0))); }
+            if value > 1.0 {
+                object.insert("b".to_owned(), Value::from((value / 100.0).clamp(0.0, 1.0)));
+            }
         }
     }
 }
@@ -569,7 +574,8 @@ mod tests {
             {"i": 1, "e": 1, "t": "codex-1"},
             {"i": 2, "e": 1, "t": "codex-2"}
         ]);
-        lcd.merge_from_agent(AgentId::Codex, &status, &partition).unwrap();
+        lcd.merge_from_agent(AgentId::Codex, &status, &partition)
+            .unwrap();
         let fused = lcd.fused_array(&partition);
         assert_eq!(fused.len(), 6);
         assert_eq!(fused[0]["t"], "codex-0");
@@ -592,13 +598,15 @@ mod tests {
             {"i": 1, "e": 1, "t": "codex-1"},
             {"i": 2, "e": 1, "t": "codex-2"}
         ]);
-        lcd.merge_from_agent(AgentId::Codex, &codex_status, &partition).unwrap();
+        lcd.merge_from_agent(AgentId::Codex, &codex_status, &partition)
+            .unwrap();
         let hermes_status = json!([
             {"i": 0, "e": 1, "t": "hermes-3"},
             {"i": 1, "e": 1, "t": "hermes-4"},
             {"i": 2, "e": 1, "t": "hermes-5"}
         ]);
-        lcd.merge_from_agent(AgentId::Hermes, &hermes_status, &partition).unwrap();
+        lcd.merge_from_agent(AgentId::Hermes, &hermes_status, &partition)
+            .unwrap();
         let fused = lcd.fused_array(&partition);
         assert_eq!(fused[0]["t"], "codex-0");
         assert_eq!(fused[1]["t"], "codex-1");
@@ -623,7 +631,8 @@ mod tests {
             {"i": 4, "e": 1, "t": "c4"},
             {"i": 5, "e": 1, "t": "c5"}
         ]);
-        lcd.merge_from_agent(AgentId::Codex, &status, &codex_alone).unwrap();
+        lcd.merge_from_agent(AgentId::Codex, &status, &codex_alone)
+            .unwrap();
         let fused = lcd.fused_array(&codex_alone);
         assert_eq!(fused[5]["t"], "c5");
 
@@ -657,7 +666,8 @@ mod tests {
             {"i": 0, "e": 1, "t": "c-a"},
             {"i": 1, "e": 1, "t": "c-b"}
         ]);
-        lcd.merge_from_agent(AgentId::Codex, &codex_status, &partition).unwrap();
+        lcd.merge_from_agent(AgentId::Codex, &codex_status, &partition)
+            .unwrap();
         let fused = lcd.fused_array(&partition);
         assert_eq!(fused[0]["t"], "c-a");
         assert_eq!(fused[3]["t"], "c-b");
@@ -718,6 +728,10 @@ mod tests {
     }
 
     fn partition_owners_as_agents(partition: &Partition) -> Vec<AgentId> {
-        AGENTS.iter().copied().filter(|a| !partition.slots_for(*a).is_empty()).collect()
+        AGENTS
+            .iter()
+            .copied()
+            .filter(|a| !partition.slots_for(*a).is_empty())
+            .collect()
     }
 }

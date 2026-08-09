@@ -39,7 +39,12 @@
     "bridge:proxy:zcode": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline -- --mcp-proxy --agent zcode --autostart",
     "bridge:proxy:hermes": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline -- --mcp-proxy --agent hermes --autostart",
     "driver:check": "powershell -NoProfile -ExecutionPolicy Bypass -File driver/vhf-spike/scripts/check-toolchain.ps1",
-    "driver:build": "powershell -NoProfile -ExecutionPolicy Bypass -File driver/vhf-spike/scripts/build-driver.ps1"
+    "driver:build": "powershell -NoProfile -ExecutionPolicy Bypass -File driver/vhf-spike/scripts/build-driver.ps1",
+    "plugin:install": "npm --prefix plugin/streamdeck install",
+    "plugin:build": "npm --prefix plugin/streamdeck run build",
+    "plugin:watch": "npm --prefix plugin/streamdeck run watch",
+    "plugin:link": "npm --prefix plugin/streamdeck run link",
+    "plugin:pack": "npm --prefix plugin/streamdeck run pack"
   },
   "engines": {
     "node": ">=20"

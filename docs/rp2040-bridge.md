@@ -332,3 +332,11 @@ Call `publish_tasks` with snapshot semantics and stable `task_id` values. The re
 
 TCP sessions are registered before hello, require a valid hello before tools are exposed, and may share a client kind. Hello metadata includes a generated instance id and focus capability. Disconnects retain cards for 30 seconds for stable-id republish/reclaim. `bridge_status` version 2 exposes sessions, devices, assignments, overflow, per-device selection, queue depth, and leases.
 LCD task tiles now show a compact owning-agent label (`codex`, `zcode`, or `hermes`) above a smaller slot number. The color tile and task assignment behavior are unchanged; blank/unassigned tiles remain black.
+
+## Stream Deck plugin controller
+
+The daemon accepts a second session role alongside agent MCP sessions: a **controller hello** with `role: "controller"` and `controller: "streamdeck-plugin"`. When a plugin session connects, the daemon creates a `PluginController` (a virtual `PhysicalController` backed by the session's TCP channels) and registers it as an aux controller in the `BridgeRuntime`. Inbound plugin lines (`{"type":"event","kind":"button|encoder-turn|encoder-button",...}`) are translated to `PhysicalEvent`s; outbound render lines (`{"type":"render","render":"threadStatus|displayContext|rgbConfig",...}`) push state to the plugin for key image and touch-strip updates.
+
+The plugin reports its task-slot capacity with `{"type":"capacity","taskSlots":N}` (clamped to 64). On disconnect, the daemon detaches the controller and removes it from the task board. The plugin can autostart the daemon process when the TCP connect fails (mirrors the proxy `--autostart` path).
+
+This mode is mutually exclusive with the direct-HID `--controller streamdeck-*` backends per device: the plugin requires the official Stream Deck app to be running (it owns HID), while the direct-HID mode requires it to be closed.

@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+pub const DISPLAY_CONTEXT_INSTRUCTIONS: &str = "The RP2040 v.oai.thstatus path updates task cards only; it does not update the dashboard model, effort, weekly_remaining, or five_hour_remaining fields. Call set_display_context with the current live metadata at task start and again whenever any display-context value changes. Standby or test values on the display are not live context.";
 
 pub fn start_input_reader() -> Receiver<Result<Value, String>> {
     let (sender, receiver) = mpsc::channel();
@@ -89,7 +90,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "set_thread_status",
-                "description": "Publish live Codex task/status state to the assigned LCD slots using v.oai.thstatus. The colored numbered cards shown before this call are standby indicators, not task data; call this whenever task status changes. Use bridge_status to see which slots you own.",
+                "description": "Publish live Codex task/status state to the assigned LCD slots using v.oai.thstatus. The colored numbered cards shown before this call are standby indicators, not task data; call this whenever task status changes. This updates task cards only: call set_display_context separately for live model, effort, and usage metadata. Use bridge_status to see which slots you own.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"status": {"type": "array", "items": {"type": "object"}}},
@@ -99,7 +100,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "publish_tasks",
-                "description": "Publish the complete live task-card snapshot for this MCP session. This replaces the standby LCD indicators; call it at task start and whenever the task list or progress changes.",
+                "description": "Publish the complete live task-card snapshot for this MCP session. This replaces the standby LCD indicators; call it at task start and whenever the task list or progress changes. Task-card updates do not change display-context model, effort, or usage fields; publish those separately with set_display_context.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -111,7 +112,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "set_display_context",
-                "description": "Publish live project/task/model/status/progress metadata to the Stream Deck+ dashboard. The READY strip is standby context; call this at task start and when the active task or progress changes.",
+                "description": "Publish live project/task/model/effort/status/progress and remaining weekly/five-hour usage metadata to the connected device displays. Call this at task start and whenever any display-context value changes; v.oai.thstatus and task-card tools do not update model, effort, or usage. A horizontal Stream Deck + swipe alternates the context and usage screens.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -122,6 +123,8 @@ pub fn tools() -> Value {
                         "status": {"type": ["string", "null"]},
                         "progress": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
                         "task_id": {"type": ["string", "null"]},
+                        "weekly_remaining": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+                        "five_hour_remaining": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
                     },
                     "additionalProperties": false
                 }
@@ -183,7 +186,11 @@ pub fn tool_available(name: &str, agent: Option<AgentId>) -> bool {
     match agent {
         Some(AgentId::Hermes) => matches!(
             name,
-            "bridge_status" | "poll_events" | "set_thread_status" | "publish_tasks" | "set_rgb_config"
+            "bridge_status"
+                | "poll_events"
+                | "set_thread_status"
+                | "publish_tasks"
+                | "set_rgb_config"
         ),
         Some(AgentId::ZCode) => matches!(
             name,
@@ -212,4 +219,26 @@ pub fn poll_events_tool() -> Value {
             "additionalProperties": false
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_guidance_requires_live_display_context_updates() {
+        assert!(DISPLAY_CONTEXT_INSTRUCTIONS.contains("Call set_display_context"));
+        assert!(
+            DISPLAY_CONTEXT_INSTRUCTIONS.contains("whenever any display-context value changes")
+        );
+
+        let tools = tools();
+        let definitions = tools["tools"].as_array().expect("tool definitions");
+        let context_tool = definitions
+            .iter()
+            .find(|tool| tool["name"] == "set_display_context")
+            .expect("set_display_context tool");
+        let description = context_tool["description"].as_str().expect("description");
+        assert!(description.contains("task-card tools do not update model, effort, or usage"));
+    }
 }

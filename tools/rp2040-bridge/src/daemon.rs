@@ -4,6 +4,7 @@
 //! See `run_daemon` for the entry point invoked from `main.rs` when the
 //! `--daemon` flag is set.
 
+use crate::controller::PhysicalController;
 use crate::mcp;
 use crate::routing::{ActiveSet, AgentId, Partition};
 use serde_json::{Value, json};
@@ -45,11 +46,24 @@ pub(crate) struct HelloInfo {
 
 pub enum SessionMessage {
     /// Registers the response writer before the session sends its hello.
-    Connected { session_id: usize, writer: Sender<Result<Value, String>> },
+    Connected {
+        session_id: usize,
+        writer: Sender<Result<Value, String>>,
+    },
     /// A parsed JSON-RPC request from the session.
     Request { session_id: usize, request: Value },
     /// The session identified its agent via the hello line.
     Hello { session_id: usize, info: HelloInfo },
+    /// A Stream Deck plugin controller session announced itself. The daemon
+    /// creates a `PluginController` from the provided channels and registers
+    /// it as an aux controller.
+    ControllerHello {
+        session_id: usize,
+        instance_id: String,
+        task_slots: usize,
+        events: crate::plugin_controller::PluginEventReceiver,
+        writer: crate::plugin_controller::PluginWriter,
+    },
     /// The session disconnected.
     Disconnected { session_id: usize },
     /// An I/O or parse error on the session.
@@ -96,7 +110,14 @@ fn effective_active_set(session_agents: ActiveSet, codex_hardware_active: bool) 
 /// Runs the daemon: owns the hardware via a single `BridgeRuntime` and
 /// serves multiple MCP sessions over TCP loopback.
 pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
-    eprintln!("daemon [{}] starting bind={} port={} controller={} serial={:?}", log_context(), options.bind, options.bridge_options.port, options.bridge_options.controller.as_str(), options.bridge_options.controller_serial);
+    eprintln!(
+        "daemon [{}] starting bind={} port={} controller={} serial={:?}",
+        log_context(),
+        options.bind,
+        options.bridge_options.port,
+        options.bridge_options.controller.as_str(),
+        options.bridge_options.controller_serial
+    );
     let listener = TcpListener::bind(&options.bind)
         .map_err(|error| format!("failed to bind {}: {error}", options.bind))?;
     let local = listener
@@ -124,8 +145,13 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     // the deadline until which the daemon should wait before responding with
     // an empty result.
     let mut pending_polls: Vec<PendingPoll> = Vec::new();
-    let mut serial_retry_at = None;
+    let mut serial_retry_at = (!bridge.has_serial() && options.bridge_options.port != "none")
+        .then(Instant::now);
     let mut serial_retry_delay = crate::SERIAL_RETRY_INITIAL_DELAY;
+
+    // Plugin controller sessions: maps session_id to the device_id of the
+    // PluginController registered in aux_controllers.
+    let mut plugin_sessions: Vec<(usize, String)> = Vec::new();
 
     // Acceptor thread.
     let accept_tx = session_tx.clone();
@@ -139,11 +165,28 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         while let Ok(msg) = session_rx.try_recv() {
             match msg {
                 SessionMessage::Connected { session_id, writer } => {
-                    eprintln!("daemon [{}] session connected id={session_id}", log_context());
-                    sessions.push(SessionHandle { id: session_id, agent: None, instance_id: None, focus_capable: false, writer, events: VecDeque::new() });
+                    eprintln!(
+                        "daemon [{}] session connected id={session_id}",
+                        log_context()
+                    );
+                    sessions.push(SessionHandle {
+                        id: session_id,
+                        agent: None,
+                        instance_id: None,
+                        focus_capable: false,
+                        writer,
+                        events: VecDeque::new(),
+                    });
                 }
                 SessionMessage::Hello { session_id, info } => {
-                    eprintln!("daemon [{}] hello session={} agent={} instance={:?} focus={}", log_context(), session_id, info.agent.as_str(), info.instance_id, info.focus_capable);
+                    eprintln!(
+                        "daemon [{}] hello session={} agent={} instance={:?} focus={}",
+                        log_context(),
+                        session_id,
+                        info.agent.as_str(),
+                        info.instance_id,
+                        info.focus_capable
+                    );
                     let agent = info.agent;
                     handle_hello(&mut sessions, session_id, info);
                     session_agents.insert(agent);
@@ -153,8 +196,20 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     session_id,
                     request,
                 } => {
-                    let method = request.get("method").and_then(Value::as_str).unwrap_or("<notification-or-invalid>");
-                    eprintln!("daemon [{}] request session={} method={} id={}", log_context(), session_id, method, request.get("id").map(Value::to_string).unwrap_or_else(|| "-".to_owned()));
+                    let method = request
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<notification-or-invalid>");
+                    eprintln!(
+                        "daemon [{}] request session={} method={} id={}",
+                        log_context(),
+                        session_id,
+                        method,
+                        request
+                            .get("id")
+                            .map(Value::to_string)
+                            .unwrap_or_else(|| "-".to_owned())
+                    );
                     handle_request(
                         &mut sessions,
                         session_id,
@@ -163,8 +218,47 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                         &mut pending_polls,
                     )?;
                 }
+                SessionMessage::ControllerHello {
+                    session_id,
+                    instance_id,
+                    task_slots,
+                    events,
+                    writer,
+                } => {
+                    eprintln!(
+                        "daemon [{}] controller hello session={} instance={instance_id} slots={task_slots}",
+                        log_context(),
+                        session_id
+                    );
+                    let controller = crate::plugin_controller::PluginController::new(
+                        instance_id,
+                        task_slots,
+                        events,
+                        writer,
+                    );
+                    let device_id = controller.device_id();
+                    let slots = controller.task_slot_count();
+                    if slots > 0 {
+                        bridge.task_board.set_device(device_id.clone(), slots, true);
+                    }
+                    bridge
+                        .aux_controllers
+                        .push((device_id.clone(), Box::new(controller), slots));
+                    plugin_sessions.push((session_id, device_id.clone()));
+                    let _ = crate::refresh_task_board(&mut bridge);
+                }
                 SessionMessage::Disconnected { session_id } => {
-                    eprintln!("daemon [{}] session disconnected id={session_id}", log_context());
+                    eprintln!(
+                        "daemon [{}] session disconnected id={session_id}",
+                        log_context()
+                    );
+                    // Plugin controller session: detach the aux controller.
+                    if let Some(device_id) = remove_plugin_session(&mut plugin_sessions, session_id)
+                    {
+                        detach_plugin_controller(&mut bridge, &device_id);
+                        let _ = crate::refresh_task_board(&mut bridge);
+                        continue;
+                    }
                     let removed_agent = find_session_agent(&sessions, session_id);
                     bridge.task_board.disconnect_session(session_id, now_ms());
                     let _ = crate::refresh_task_board(&mut bridge);
@@ -178,7 +272,16 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     }
                 }
                 SessionMessage::Error { session_id, error } => {
-                    eprintln!("daemon [{}] session error id={session_id}: {error}", log_context());
+                    eprintln!(
+                        "daemon [{}] session error id={session_id}: {error}",
+                        log_context()
+                    );
+                    if let Some(device_id) = remove_plugin_session(&mut plugin_sessions, session_id)
+                    {
+                        detach_plugin_controller(&mut bridge, &device_id);
+                        let _ = crate::refresh_task_board(&mut bridge);
+                        continue;
+                    }
                     let removed_agent = find_session_agent(&sessions, session_id);
                     bridge.task_board.disconnect_session(session_id, now_ms());
                     let _ = crate::refresh_task_board(&mut bridge);
@@ -213,15 +316,28 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                                     if bridge.task_mode
                                         && crate::codex::method(&message) == Some("v.oai.thstatus")
                                     {
-                                        if let Some(parameters) = message.get("p").or_else(|| message.get("params")) {
+                                        if let Some(parameters) =
+                                            message.get("p").or_else(|| message.get("params"))
+                                        {
                                             // The serial status is an explicit Codex update even
                                             // when an optional task field cannot be adapted. Keep
                                             // it authoritative and let the renderer fall back to
                                             // the fused status buffer rather than standby cards.
                                             bridge.has_explicit_task_state = true;
-                                            match bridge.task_board.publish_codex_hid_status(parameters, now_ms()) {
-                                                Ok(()) => eprintln!("Codex HID status accepted entries={}", parameters.as_array().map(Vec::len).unwrap_or(0)),
-                                                Err(error) => eprintln!("Codex task status adapter fallback: {error}"),
+                                            match bridge
+                                                .task_board
+                                                .publish_codex_hid_status(parameters, now_ms())
+                                            {
+                                                Ok(()) => eprintln!(
+                                                    "Codex HID status accepted entries={}",
+                                                    parameters
+                                                        .as_array()
+                                                        .map(Vec::len)
+                                                        .unwrap_or(0)
+                                                ),
+                                                Err(error) => eprintln!(
+                                                    "Codex task status adapter fallback: {error}"
+                                                ),
                                             }
                                             let _ = crate::refresh_task_board(&mut bridge);
                                         }
@@ -369,9 +485,12 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
                 for agent in &active_list {
-                    bridge
-                        .routing
-                        .push_partition_event(*agent, &new_partition, &active_list, now_ms);
+                    bridge.routing.push_partition_event(
+                        *agent,
+                        &new_partition,
+                        &active_list,
+                        now_ms,
+                    );
                 }
             }
         }
@@ -425,7 +544,10 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
         .peer_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
-    eprintln!("daemon [{}] session {id} connected from {peer}", log_context());
+    eprintln!(
+        "daemon [{}] session {id} connected from {peer}",
+        log_context()
+    );
 
     let read_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -438,10 +560,38 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
         }
     };
 
-    let (writer_tx, writer_rx) = mpsc::channel::<Result<Value, String>>();
     let mut write_stream = stream;
+    let mut reader = BufReader::new(read_stream);
 
-    // Writer thread.
+    // Read the first line to determine the session type (controller hello,
+    // agent hello, or a raw MCP request) before setting up the writer.
+    let mut first_line = String::new();
+    let first_read = reader.read_line(&mut first_line);
+    let first_line_trimmed = first_line.trim();
+    let first_line_owned = if first_line_trimmed.is_empty() {
+        String::new()
+    } else {
+        first_line_trimmed.to_owned()
+    };
+
+    if let Err(error) = first_read {
+        let _ = tx.send(SessionMessage::Error {
+            session_id: id,
+            error: format!("read failed: {error}"),
+        });
+        return;
+    }
+
+    // Stream Deck plugin controller session.
+    if let Some((instance_id, task_slots)) =
+        crate::plugin_controller::parse_controller_hello(&first_line_owned)
+    {
+        handle_plugin_session(id, write_stream, reader, tx, instance_id, task_slots);
+        return;
+    }
+
+    // MCP agent session: set up the response writer and register the session.
+    let (writer_tx, writer_rx) = mpsc::channel::<Result<Value, String>>();
     let _writer_thread = thread::Builder::new()
         .name(format!("daemon-session-{id}-write"))
         .spawn(move || {
@@ -453,8 +603,7 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
                 };
                 if let Err(error) = write_stream
                     .write_all(line.as_bytes())
-                    .and_then(|_| write_stream.write_all(b"
-"))
+                    .and_then(|_| write_stream.write_all(b"\n"))
                     .and_then(|_| write_stream.flush())
                 {
                     eprintln!("session {id} write failed: {error}");
@@ -463,49 +612,35 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
             }
         });
 
-    if tx.send(SessionMessage::Connected { session_id: id, writer: writer_tx }).is_err() {
+    if tx
+        .send(SessionMessage::Connected {
+            session_id: id,
+            writer: writer_tx,
+        })
+        .is_err()
+    {
         return;
     }
 
-    // Reader loop.
-    let reader = BufReader::new(read_stream);
-    let mut first_line = true;
+    // Process the first line (agent hello or MCP request), then the rest.
+    if !first_line_owned.is_empty() {
+        if let Some(mut info) = parse_hello_info(&first_line_owned) {
+            if info.instance_id.is_none() {
+                info.instance_id = Some(format!("session-{id}"));
+            }
+            let _ = tx.send(SessionMessage::Hello {
+                session_id: id,
+                info,
+            });
+        } else {
+            forward_mcp_line(&tx, id, &first_line_owned);
+        }
+    }
+
     for line in reader.lines() {
         match line {
             Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => {
-                if first_line {
-                    first_line = false;
-                    if let Some(mut info) = parse_hello_info(&line) {
-                        if info.instance_id.is_none() {
-                            info.instance_id = Some(format!("session-{id}"));
-                        }
-                        let _ = tx.send(SessionMessage::Hello { session_id: id, info });
-                        continue;
-                    }
-                    // Fall through: treat as a normal MCP request.
-                }
-                match serde_json::from_str::<Value>(&line) {
-                    Ok(request) => {
-                        if tx
-                            .send(SessionMessage::Request {
-                                session_id: id,
-                                request,
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = tx.send(SessionMessage::Error {
-                            session_id: id,
-                            error: format!("invalid JSON: {error}"),
-                        });
-                        return;
-                    }
-                }
-            }
+            Ok(line) => forward_mcp_line(&tx, id, &line),
             Err(error) => {
                 let _ = tx.send(SessionMessage::Error {
                     session_id: id,
@@ -519,37 +654,203 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
     let _ = tx.send(SessionMessage::Disconnected { session_id: id });
 }
 
+fn forward_mcp_line(tx: &Sender<SessionMessage>, id: usize, line: &str) {
+    match serde_json::from_str::<Value>(line) {
+        Ok(request) => {
+            if tx
+                .send(SessionMessage::Request {
+                    session_id: id,
+                    request,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+        Err(error) => {
+            let _ = tx.send(SessionMessage::Error {
+                session_id: id,
+                error: format!("invalid JSON: {error}"),
+            });
+        }
+    }
+}
+
+/// Handles a Stream Deck plugin controller session: forwards inbound lines to
+/// the controller's event channel and writes outbound render lines to the
+/// socket.
+fn handle_plugin_session(
+    id: usize,
+    write_stream: TcpStream,
+    reader: BufReader<TcpStream>,
+    tx: Sender<SessionMessage>,
+    instance_id: String,
+    task_slots: usize,
+) {
+    eprintln!(
+        "daemon [{}] plugin controller session {id} instance={instance_id} slots={task_slots}",
+        log_context()
+    );
+
+    let (events_tx, events_rx) = mpsc::channel::<Value>();
+    let (plugin_writer_tx, plugin_writer_rx) = mpsc::channel::<Value>();
+
+    // Plugin writer thread: drains outbound render lines and writes them to
+    // the socket as newline-delimited JSON.
+    let write_thread = thread::Builder::new()
+        .name(format!("daemon-plugin-{id}-write"))
+        .spawn(move || {
+            let mut write_stream = write_stream;
+            for message in plugin_writer_rx.iter() {
+                let line = serde_json::to_string(&message).unwrap_or_default();
+                if let Err(error) = write_stream
+                    .write_all(line.as_bytes())
+                    .and_then(|_| write_stream.write_all(b"\n"))
+                    .and_then(|_| write_stream.flush())
+                {
+                    eprintln!("plugin session {id} write failed: {error}");
+                    break;
+                }
+            }
+        });
+
+    if let Err(error) = write_thread {
+        let _ = tx.send(SessionMessage::Error {
+            session_id: id,
+            error: format!("failed to spawn plugin writer: {error}"),
+        });
+        return;
+    }
+
+    if tx
+        .send(SessionMessage::ControllerHello {
+            session_id: id,
+            instance_id,
+            task_slots,
+            events: events_rx,
+            writer: plugin_writer_tx,
+        })
+        .is_err()
+    {
+        return;
+    }
+
+    // Reader loop: forward all inbound lines to the controller's event channel.
+    for line in reader.lines() {
+        match line {
+            Ok(line) if line.trim().is_empty() => continue,
+            Ok(line) => {
+                match serde_json::from_str::<Value>(&line) {
+                    Ok(value) => {
+                        if events_tx.send(value).is_err() {
+                            // Controller was dropped (daemon detach); stop reading.
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("plugin session {id} invalid JSON: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = tx.send(SessionMessage::Error {
+                    session_id: id,
+                    error: format!("read failed: {error}"),
+                });
+                return;
+            }
+        }
+    }
+    eprintln!(
+        "daemon [{}] plugin session {id} reader reached EOF",
+        log_context()
+    );
+    let _ = tx.send(SessionMessage::Disconnected { session_id: id });
+}
+
 fn parse_hello_info(line: &str) -> Option<HelloInfo> {
     let value: Value = serde_json::from_str(line).ok()?;
     if value.get("bridge").and_then(Value::as_str) != Some(BRIDGE_HELLO) {
         return None;
     }
-    let agent = value.get("agent").and_then(Value::as_str).and_then(|s| AgentId::parse(s).ok())?;
-    let instance_id = value.get("instance_id").or_else(|| value.get("instance"))
+    let agent = value
+        .get("agent")
+        .and_then(Value::as_str)
+        .and_then(|s| AgentId::parse(s).ok())?;
+    let instance_id = value
+        .get("instance_id")
+        .or_else(|| value.get("instance"))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty() && value.chars().count() <= 160)
         .map(str::to_owned);
-    let focus_capable = value.get("focus").and_then(Value::as_bool)
-        .or_else(|| value.get("capabilities").and_then(|v| v.get("focus")).and_then(Value::as_bool))
+    let focus_capable = value
+        .get("focus")
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            value
+                .get("capabilities")
+                .and_then(|v| v.get("focus"))
+                .and_then(Value::as_bool)
+        })
         .unwrap_or(false);
-    Some(HelloInfo { agent, instance_id, focus_capable })
-}
-
-fn parse_hello(line: &str) -> Option<AgentId> {
-    parse_hello_info(line).map(|info| info.agent)
+    Some(HelloInfo {
+        agent,
+        instance_id,
+        focus_capable,
+    })
 }
 
 fn handle_hello(sessions: &mut Vec<SessionHandle>, session_id: usize, info: HelloInfo) {
     if let Some(session) = sessions.iter_mut().find(|s| s.id == session_id) {
         session.agent = Some(info.agent);
-        session.instance_id = Some(info.instance_id.unwrap_or_else(|| format!("session-{session_id}")));
+        session.instance_id = Some(
+            info.instance_id
+                .unwrap_or_else(|| format!("session-{session_id}")),
+        );
         session.focus_capable = info.focus_capable;
-        eprintln!("session {session_id} registered as agent {} (instance {}, focus={})", info.agent.as_str(), session.instance_id.as_deref().unwrap_or("unknown"), session.focus_capable);
+        eprintln!(
+            "session {session_id} registered as agent {} (instance {}, focus={})",
+            info.agent.as_str(),
+            session.instance_id.as_deref().unwrap_or("unknown"),
+            session.focus_capable
+        );
     }
 }
 
 fn remove_session(sessions: &mut Vec<SessionHandle>, session_id: usize) {
     sessions.retain(|s| s.id != session_id);
+}
+
+/// Removes a plugin session mapping and returns the device_id if found.
+fn remove_plugin_session(
+    plugin_sessions: &mut Vec<(usize, String)>,
+    session_id: usize,
+) -> Option<String> {
+    let pos = plugin_sessions
+        .iter()
+        .position(|(id, _)| *id == session_id)?;
+    let (_, device_id) = plugin_sessions.remove(pos);
+    Some(device_id)
+}
+
+/// Detaches a plugin controller from `aux_controllers` by device_id, shutting
+/// it down and removing it from the task board.
+fn detach_plugin_controller(bridge: &mut crate::BridgeRuntime, device_id: &str) {
+    let mut survivors = Vec::new();
+    let mut removed = false;
+    for (id, mut device, slots) in std::mem::take(&mut bridge.aux_controllers) {
+        if id == device_id {
+            device.shutdown();
+            eprintln!("plugin controller {device_id} detached");
+            removed = true;
+        } else {
+            survivors.push((id, device, slots));
+        }
+    }
+    bridge.aux_controllers = survivors;
+    if removed {
+        bridge.task_board.set_device(device_id, 0, false);
+    }
 }
 
 fn find_session_agent(sessions: &[SessionHandle], session_id: usize) -> Option<AgentId> {
@@ -591,7 +892,15 @@ fn handle_request(
     };
     let agent = find_session_agent(sessions, session_id);
     let Some(agent) = agent else {
-        send_to_session(sessions, session_id, mcp::error_response(Some(id), -32000, "daemon session must send a valid bridge hello first"));
+        send_to_session(
+            sessions,
+            session_id,
+            mcp::error_response(
+                Some(id),
+                -32000,
+                "daemon session must send a valid bridge hello first",
+            ),
+        );
         return Ok(());
     };
     let instructions = match Some(agent) {
@@ -602,10 +911,11 @@ fn handle_request(
                 "{} agent. Use bridge_status first. Your keys: {:?}, LCD slots: {:?}. \
                  Use poll_events to receive key presses and partition change notifications. \
                  The colored numbered LCD cards and READY dashboard shown before an explicit update are standby indicators only. \
-                 Publish live task state with publish_tasks or set_thread_status, and live dashboard metadata with set_display_context, at task start and whenever state changes.",
+                 Publish live task state with publish_tasks or set_thread_status. {}",
                 a.as_str(),
                 keys,
-                slots
+                slots,
+                mcp::DISPLAY_CONTEXT_INSTRUCTIONS
             )
         }
         None => "Use bridge_status first. Hardware actions target the RP2040 on the configured serial port.".to_owned(),
@@ -676,18 +986,27 @@ fn call_tool_for(
         "set_thread_status" => call_set_thread_status(bridge, arguments, agent, session_id),
         "publish_tasks" => {
             let agent_id = agent.unwrap_or(AgentId::Codex);
-            match bridge.task_board.publish_tasks(session_id, agent_id, arguments, now_ms()) {
+            match bridge
+                .task_board
+                .publish_tasks(session_id, agent_id, arguments, now_ms())
+            {
                 Ok(result) => {
                     bridge.has_explicit_task_state = true;
                     let _ = crate::refresh_task_board(bridge);
-                    push_session_event(sessions, session_id, json!({"type":"layout_changed","tasks":result.get("tasks"),"ts":now_ms()}));
+                    push_session_event(
+                        sessions,
+                        session_id,
+                        json!({"type":"layout_changed","tasks":result.get("tasks"),"ts":now_ms()}),
+                    );
                     mcp::text_result(result)
                 }
                 Err(error) => mcp::tool_error(error),
             }
         }
         "set_display_context" => crate::call_set_display_context(bridge, arguments),
-        "set_rgb_config" if bridge.task_mode => mcp::tool_error("set_rgb_config is daemon-managed; configure RGB on the bridge"),
+        "set_rgb_config" if bridge.task_mode => {
+            mcp::tool_error("set_rgb_config is daemon-managed; configure RGB on the bridge")
+        }
         "set_rgb_config" => crate::call_set_rgb_config(bridge, arguments),
         "device_status" => crate::call_device_status(bridge),
         "poll_events" => {
@@ -701,29 +1020,26 @@ fn call_tool_for(
             if !session_events.is_empty() {
                 mcp::text_result(json!({"events": session_events}))
             } else {
-            let queue = bridge.routing.queue_mut(agent);
-            if !queue.is_empty() {
-                let events: Vec<Value> = queue
-                    .drain()
-                    .into_iter()
-                    .map(|e| e.to_json())
-                    .collect();
-                mcp::text_result(json!({"events": events}))
-            } else if timeout_ms > 0 {
-                // Defer the response: register a pending poll.
-                // Cancel any previous pending poll for this session.
-                pending_polls.retain(|p| p.session_id != session_id);
-                pending_polls.push(PendingPoll {
-                    session_id,
-                    agent,
-                    deadline: Instant::now() + Duration::from_millis(timeout_ms),
-                    request_id: id,
-                });
-                // Return a sentinel that the caller should not send.
-                Value::Null
-            } else {
-                mcp::text_result(json!({"events": []}))
-            }
+                let queue = bridge.routing.queue_mut(agent);
+                if !queue.is_empty() {
+                    let events: Vec<Value> =
+                        queue.drain().into_iter().map(|e| e.to_json()).collect();
+                    mcp::text_result(json!({"events": events}))
+                } else if timeout_ms > 0 {
+                    // Defer the response: register a pending poll.
+                    // Cancel any previous pending poll for this session.
+                    pending_polls.retain(|p| p.session_id != session_id);
+                    pending_polls.push(PendingPoll {
+                        session_id,
+                        agent,
+                        deadline: Instant::now() + Duration::from_millis(timeout_ms),
+                        request_id: id,
+                    });
+                    // Return a sentinel that the caller should not send.
+                    Value::Null
+                } else {
+                    mcp::text_result(json!({"events": []}))
+                }
             }
         }
         _ => mcp::tool_error(format!("unknown MCP tool: {name}")),
@@ -744,12 +1060,22 @@ fn call_set_thread_status(
     }
     let agent = agent.unwrap_or(AgentId::Codex);
     if bridge.task_mode {
-        return match bridge.task_board.publish_legacy_status(session_id, agent, status, now_ms()) {
-            Ok(result) => { bridge.has_explicit_task_state = true; let _ = crate::refresh_task_board(bridge); mcp::text_result(result) }
+        return match bridge
+            .task_board
+            .publish_legacy_status(session_id, agent, status, now_ms())
+        {
+            Ok(result) => {
+                bridge.has_explicit_task_state = true;
+                let _ = crate::refresh_task_board(bridge);
+                mcp::text_result(result)
+            }
             Err(error) => mcp::tool_error(error),
         };
     }
-    let fused = match bridge.fused_lcd.merge_from_agent(agent, status, &bridge.partition) {
+    let fused = match bridge
+        .fused_lcd
+        .merge_from_agent(agent, status, &bridge.partition)
+    {
         Ok(fused) => {
             bridge.has_explicit_task_state = true;
             fused
@@ -776,13 +1102,18 @@ fn call_set_thread_status(
 
 fn daemon_bridge_status(bridge: &crate::BridgeRuntime, sessions: &[SessionHandle]) -> Value {
     let mut status = crate::bridge_status(bridge, "daemon");
-    let session_values = sessions.iter().map(|session| json!({
-        "session_id": session.id,
-        "agent": session.agent.map(|agent| agent.as_str()),
-        "instance_id": session.instance_id,
-        "focus_capable": session.focus_capable,
-        "queue_depth": session.events.len()
-    })).collect::<Vec<_>>();
+    let session_values = sessions
+        .iter()
+        .map(|session| {
+            json!({
+                "session_id": session.id,
+                "agent": session.agent.map(|agent| agent.as_str()),
+                "instance_id": session.instance_id,
+                "focus_capable": session.focus_capable,
+                "queue_depth": session.events.len()
+            })
+        })
+        .collect::<Vec<_>>();
     if let Some(object) = status.as_object_mut() {
         object.insert("sessions".to_owned(), json!(session_values));
         object.insert("sessionCount".to_owned(), json!(session_values.len()));
@@ -790,18 +1121,27 @@ fn daemon_bridge_status(bridge: &crate::BridgeRuntime, sessions: &[SessionHandle
     status
 }
 fn now_ms() -> u128 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn push_session_event(sessions: &mut [SessionHandle], session_id: usize, event: Value) {
     if let Some(session) = sessions.iter_mut().find(|session| session.id == session_id) {
-        if session.events.len() >= 256 { session.events.pop_front(); }
+        if session.events.len() >= 256 {
+            session.events.pop_front();
+        }
         session.events.push_back(event);
     }
 }
 
 fn drain_session_events(sessions: &mut Vec<SessionHandle>, session_id: usize) -> Vec<Value> {
-    sessions.iter_mut().find(|session| session.id == session_id).map(|session| session.events.drain(..).collect()).unwrap_or_default()
+    sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .map(|session| session.events.drain(..).collect())
+        .unwrap_or_default()
 }
 fn resolve_pending_polls(
     pending_polls: &mut Vec<PendingPoll>,
@@ -812,7 +1152,10 @@ fn resolve_pending_polls(
     let mut resolved = Vec::new();
     pending_polls.retain(|poll| {
         let queue = bridge.routing.queue(poll.agent);
-        let session_has_events = sessions.iter().find(|session| session.id == poll.session_id).is_some_and(|session| !session.events.is_empty());
+        let session_has_events = sessions
+            .iter()
+            .find(|session| session.id == poll.session_id)
+            .is_some_and(|session| !session.events.is_empty());
         if session_has_events || !queue.is_empty() || now >= poll.deadline {
             let mut events = drain_session_events(sessions, poll.session_id);
             if events.is_empty() {
@@ -846,16 +1189,40 @@ mod tests {
     #[test]
     fn parses_hello_line() {
         let line = r#"{"bridge":"hello","agent":"hermes"}"#;
-        assert_eq!(parse_hello(line), Some(AgentId::Hermes));
+        assert_eq!(
+            parse_hello_info(line).map(|i| i.agent),
+            Some(AgentId::Hermes)
+        );
         let line = r#"{"bridge":"hello","agent":"codex"}"#;
-        assert_eq!(parse_hello(line), Some(AgentId::Codex));
+        assert_eq!(
+            parse_hello_info(line).map(|i| i.agent),
+            Some(AgentId::Codex)
+        );
         let line = r#"{"bridge":"hello","agent":"zcode"}"#;
-        assert_eq!(parse_hello(line), Some(AgentId::ZCode));
+        assert_eq!(
+            parse_hello_info(line).map(|i| i.agent),
+            Some(AgentId::ZCode)
+        );
         let line = r#"{"jsonrpc":"2.0","method":"initialize","id":1}"#;
-        assert_eq!(parse_hello(line), None);
+        assert_eq!(parse_hello_info(line).map(|i| i.agent), None);
     }
 
-#[test]
+    #[test]
+    fn controller_hello_is_distinguished_from_agent_hello() {
+        let controller_line = r#"{"bridge":"hello","version":1,"role":"controller","controller":"streamdeck-plugin","instance_id":"p-1","taskSlots":6}"#;
+        assert!(crate::plugin_controller::parse_controller_hello(controller_line).is_some());
+        // An agent hello must not be mistaken for a controller hello.
+        assert!(
+            crate::plugin_controller::parse_controller_hello(
+                r#"{"bridge":"hello","agent":"codex"}"#
+            )
+            .is_none()
+        );
+        // A controller hello with a missing instance_id is rejected.
+        assert!(crate::plugin_controller::parse_controller_hello(r#"{"bridge":"hello","role":"controller","controller":"streamdeck-plugin","taskSlots":4}"#).is_none());
+    }
+
+    #[test]
     fn versioned_hello_carries_instance_and_focus() {
         let info = parse_hello_info(r#"{"bridge":"hello","version":1,"agent":"zcode","instance_id":"z-1","capabilities":{"focus":true}}"#).unwrap();
         assert_eq!(info.agent, AgentId::ZCode);
@@ -870,7 +1237,7 @@ mod tests {
             instance_id: Some("one".to_owned()),
             focus_capable: false,
             writer: mpsc::channel().0,
-            events: VecDeque::new()
+            events: VecDeque::new(),
         }];
         // New session id=2 claims Hermes.
         sessions.push(SessionHandle {
@@ -879,9 +1246,17 @@ mod tests {
             instance_id: None,
             focus_capable: false,
             writer: mpsc::channel().0,
-            events: VecDeque::new()
+            events: VecDeque::new(),
         });
-        handle_hello(&mut sessions, 2, HelloInfo { agent: AgentId::Hermes, instance_id: Some("test".to_owned()), focus_capable: true });
+        handle_hello(
+            &mut sessions,
+            2,
+            HelloInfo {
+                agent: AgentId::Hermes,
+                instance_id: Some("test".to_owned()),
+                focus_capable: true,
+            },
+        );
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].agent, Some(AgentId::Hermes));
         assert_eq!(sessions[1].id, 2);
