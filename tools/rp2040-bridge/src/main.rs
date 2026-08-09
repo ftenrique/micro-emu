@@ -556,9 +556,8 @@ fn desired_context(bridge: &BridgeRuntime) -> Option<DisplayContext> {
 }
 
 /// Auto-derives a display context from the Codex CLI config and session
-/// files, combined with thstatus slot data. This gives the strips real
-/// model/effort/project data without relying on the CLI to proactively
-/// call `set_display_context`.
+/// files, combined with thstatus slot data and live usage from the
+/// ChatGPT backend API.
 pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
     if bridge.has_explicit_display_context {
         return;
@@ -567,6 +566,8 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
     let (model, effort) = read_codex_config();
     // Read project (cwd) from the most recent Codex session file.
     let project = read_latest_codex_session_cwd();
+    // Fetch live usage (5-hour and weekly remaining) from the ChatGPT API.
+    let (five_hour_remaining, weekly_remaining) = fetch_codex_usage();
 
     // Find the first enabled task across all devices for status.
     let mut best: Option<(String, usize, u32)> = None;
@@ -604,8 +605,8 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
         status: Some(status),
         progress: None,
         task_id,
-        weekly_remaining: None,
-        five_hour_remaining: None,
+        weekly_remaining,
+        five_hour_remaining,
     };
     bridge.last_display_context = Some(context);
 }
@@ -715,6 +716,73 @@ fn find_latest_session_file(dir: &std::path::Path) -> Option<std::path::PathBuf>
         }
     }
     latest.map(|(p, _)| p)
+}
+
+/// Fetches live Codex usage (5-hour and weekly remaining percentages) from
+/// the ChatGPT backend API, using the auth tokens from `~/.codex/auth.json`.
+/// Returns (five_hour_remaining, weekly_remaining) as percentages 0-100,
+/// or (None, None) if the fetch fails.
+fn fetch_codex_usage() -> (Option<u8>, Option<u8>) {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    let auth_path = std::path::Path::new(&home).join(".codex").join("auth.json");
+    let Ok(auth_content) = std::fs::read_to_string(&auth_path) else {
+        return (None, None);
+    };
+    let Ok(auth) = serde_json::from_str::<Value>(&auth_content) else {
+        return (None, None);
+    };
+    let tokens = match auth.get("tokens") {
+        Some(t) => t,
+        None => return (None, None),
+    };
+    let access_token = tokens.get("access_token").and_then(Value::as_str);
+    let account_id = tokens.get("account_id").and_then(Value::as_str);
+    let (Some(access_token), Some(account_id)) = (access_token, account_id) else {
+        return (None, None);
+    };
+
+    let url = "https://chatgpt.com/backend-api/wham/usage";
+    let response = match ureq::get(url)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("ChatGPT-Account-Id", account_id)
+        .set("User-Agent", "codex-cli")
+        .set("Accept", "application/json")
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+    {
+        Ok(response) => response,
+        Err(_) => return (None, None),
+    };
+    let body: Value = match response.into_json() {
+        Ok(body) => body,
+        Err(_) => return (None, None),
+    };
+
+    // Parse rate_limit windows. The API may return 5-hour and/or weekly
+    // windows in either primary_window or secondary_window, so classify
+    // by limit_window_seconds (like the codex-usage-streamdeck project).
+    let rate_limit = match body.get("rate_limit") {
+        Some(rl) => rl,
+        None => return (None, None),
+    };
+    let mut five_hour: Option<u8> = None;
+    let mut weekly: Option<u8> = None;
+    for key in &["primary_window", "secondary_window"] {
+        let Some(window) = rate_limit.get(key) else { continue };
+        let Some(seconds) = window.get("limit_window_seconds").and_then(Value::as_u64) else { continue };
+        if seconds == 0 { continue; }
+        let Some(used_percent) = window.get("used_percent").and_then(Value::as_f64) else { continue };
+        let remaining = (100.0 - used_percent).round().clamp(0.0, 100.0) as u8;
+        // <= 24 hours = 5-hour window; >= 3 days = weekly window.
+        if seconds <= 24 * 60 * 60 && five_hour.is_none() {
+            five_hour = Some(remaining);
+        } else if seconds >= 3 * 24 * 60 * 60 && weekly.is_none() {
+            weekly = Some(remaining);
+        }
+    }
+    (five_hour, weekly)
 }
 
 fn now_ms() -> u128 {

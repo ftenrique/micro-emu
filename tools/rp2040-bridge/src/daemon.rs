@@ -31,6 +31,10 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:48360";
 /// fluctuations; this prevents LCD churn.
 const REPARTITION_DEBOUNCE: Duration = Duration::from_millis(750);
 
+/// How often to refresh the auto-derived display context (which includes
+/// a live usage API call). 5 minutes balances freshness with API load.
+const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+
 /// Internal greeting sent by a proxy as its first line to identify which
 /// agent it represents. The daemon consumes it and does not forward it to
 /// the MCP client.
@@ -131,6 +135,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     let mut session_agents = ActiveSet::new();
     let mut codex_hardware_active = bridge.has_serial();
     let mut pending_repartition_at: Option<Instant> = None;
+    let mut next_usage_refresh_at: Option<Instant> = None;
     {
         let active = effective_active_set(session_agents, codex_hardware_active);
         bridge.partition = Partition::compute(active);
@@ -511,6 +516,21 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
 
         // Resolve pending long-polls that have events or have timed out.
         resolve_pending_polls(&mut pending_polls, &mut sessions, &mut bridge, now);
+
+        // Periodically refresh the auto-derived display context to keep
+        // usage data (5-hour / weekly remaining) current.
+        if next_usage_refresh_at.is_none() {
+            next_usage_refresh_at = Some(now + USAGE_REFRESH_INTERVAL);
+        }
+        if let Some(refresh_at) = next_usage_refresh_at {
+            if now >= refresh_at {
+                next_usage_refresh_at = Some(now + USAGE_REFRESH_INTERVAL);
+                if !bridge.has_explicit_display_context {
+                    crate::auto_derive_display_context(&mut bridge);
+                    let _ = crate::refresh_task_board(&mut bridge);
+                }
+            }
+        }
 
         // Brief sleep to avoid busy-looping.
         thread::sleep(Duration::from_millis(10));
