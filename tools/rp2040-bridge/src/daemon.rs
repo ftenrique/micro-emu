@@ -313,8 +313,13 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                         match bridge.codex_decoder.feed(&frame.payload) {
                             Ok(messages) => {
                                 for message in messages {
+                                    let method = crate::codex::method(&message);
+                                    eprintln!("DEBUG msg method={:?} body={}", method, serde_json::to_string(&message).unwrap_or_default());
+                                    if method == Some("device.status") {
+                                        eprintln!("DEBUG device.status response: {}", serde_json::to_string(&message).unwrap_or_default());
+                                    }
                                     if bridge.task_mode
-                                        && crate::codex::method(&message) == Some("v.oai.thstatus")
+                                        && method == Some("v.oai.thstatus")
                                     {
                                         if let Some(parameters) =
                                             message.get("p").or_else(|| message.get("params"))
@@ -339,6 +344,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                                                     "Codex task status adapter fallback: {error}"
                                                 ),
                                             }
+                                            crate::auto_derive_display_context(&mut bridge);
                                             let _ = crate::refresh_task_board(&mut bridge);
                                         }
                                     }

@@ -151,21 +151,41 @@ export function renderKnobStrip(ctx: StripContext): string {
   <text x="${STRIP_W / 2}" y="84" font-family="sans-serif" font-size="10" fill="#666" text-anchor="middle">KNOB</text>`);
 }
 
-/** Crux horizontal strip: model / effort of the selected task. */
+/** Crux horizontal strip: model / effort, or status / progress as fallback. */
 export function renderCruxHStrip(ctx: StripContext, clickLabel: string): string {
-    const model = truncate(ctx.model ?? "—", 20);
-    const effort = truncate(ctx.effort ?? "—", 14);
-    return stripSvg(`<text x="10" y="24" font-family="sans-serif" font-size="10" fill="#666">MODEL</text>
-  <text x="${STRIP_W / 2}" y="46" font-family="sans-serif" font-size="15" font-weight="bold" fill="#ce93d8" text-anchor="middle">${escapeXml(model)}</text>
-  <text x="10" y="70" font-family="sans-serif" font-size="10" fill="#666">EFFORT</text>
-  <text x="${STRIP_W / 2}" y="88" font-family="sans-serif" font-size="13" font-weight="bold" fill="#ffcc80" text-anchor="middle">${escapeXml(effort)}</text>
+    const hasModel = ctx.model != null && ctx.model !== "";
+    const hasEffort = ctx.effort != null && ctx.effort !== "";
+    const status = ctx.status ?? "—";
+    const progress = ctx.progress != null ? `${ctx.progress}%` : "—";
+    const topLabel = hasModel ? "MODEL" : "STATUS";
+    const topValue = truncate(hasModel ? (ctx.model as string) : status.toUpperCase(), 20);
+    const topColor = hasModel ? "#ce93d8" : STATUS_COLORS[status.toLowerCase()] ?? "#ce93d8";
+    const bottomLabel = hasEffort ? "EFFORT" : "PROGRESS";
+    const bottomValue = truncate(hasEffort ? (ctx.effort as string) : progress, 14);
+    const bottomColor = hasEffort ? "#ffcc80" : "#90caf9";
+    return stripSvg(`<text x="10" y="24" font-family="sans-serif" font-size="10" fill="#666">${topLabel}</text>
+  <text x="${STRIP_W / 2}" y="46" font-family="sans-serif" font-size="15" font-weight="bold" fill="${topColor}" text-anchor="middle">${escapeXml(topValue)}</text>
+  <text x="10" y="70" font-family="sans-serif" font-size="10" fill="#666">${bottomLabel}</text>
+  <text x="${STRIP_W / 2}" y="88" font-family="sans-serif" font-size="13" font-weight="bold" fill="${bottomColor}" text-anchor="middle">${escapeXml(bottomValue)}</text>
   <text x="${STRIP_W - 8}" y="16" font-family="monospace" font-size="9" fill="#546e7a" text-anchor="end">◄► ${escapeXml(clickLabel)}</text>`);
 }
 
-/** Crux vertical strip: 5-hour and weekly usage limits as bars + percent. */
+/** Crux vertical strip: usage bars, or status/progress as fallback. */
 export function renderCruxVStrip(ctx: StripContext, clickLabel: string): string {
-    return stripSvg(`${usageBar("5H", ctx.five_hour_remaining, 26)}
+    const hasUsage = ctx.five_hour_remaining != null || ctx.weekly_remaining != null;
+    if (hasUsage) {
+        return stripSvg(`${usageBar("5H", ctx.five_hour_remaining, 26)}
   ${usageBar("WK", ctx.weekly_remaining, 62)}
+  <text x="${STRIP_W - 8}" y="16" font-family="monospace" font-size="9" fill="#546e7a" text-anchor="end">▲▼ ${escapeXml(clickLabel)}</text>`);
+    }
+    // Fallback: show status and progress as text when no usage data.
+    const status = (ctx.status ?? "idle").toUpperCase();
+    const progress = ctx.progress != null ? `${ctx.progress}%` : "—";
+    const statusColor = STATUS_COLORS[(ctx.status ?? "idle").toLowerCase()] ?? "#37474f";
+    return stripSvg(`<text x="10" y="30" font-family="sans-serif" font-size="10" fill="#666">STATUS</text>
+  <text x="${STRIP_W / 2}" y="50" font-family="sans-serif" font-size="16" font-weight="bold" fill="${statusColor}" text-anchor="middle">${escapeXml(status)}</text>
+  <text x="10" y="72" font-family="sans-serif" font-size="10" fill="#666">PROGRESS</text>
+  <text x="${STRIP_W / 2}" y="90" font-family="sans-serif" font-size="14" font-weight="bold" fill="#90caf9" text-anchor="middle">${escapeXml(progress)}</text>
   <text x="${STRIP_W - 8}" y="16" font-family="monospace" font-size="9" fill="#546e7a" text-anchor="end">▲▼ ${escapeXml(clickLabel)}</text>`);
 }
 

@@ -433,6 +433,11 @@ pub struct BridgeRuntime {
     pub has_explicit_task_state: bool,
     pub last_rgb_config: Option<Value>,
     pub last_display_context: Option<DisplayContext>,
+    /// Whether `last_display_context` was set by an explicit MCP
+    /// `set_display_context` call (true) or auto-derived from thstatus
+    /// data (false). Auto-derived context is overwritten by the next
+    /// thstatus update; explicit context persists until the next call.
+    pub has_explicit_display_context: bool,
     pub firmware: String,
     pub port: String,
     pub codex_decoder: CodexDecoder,
@@ -548,6 +553,72 @@ fn display_context_for_controller(
 
 fn desired_context(bridge: &BridgeRuntime) -> Option<DisplayContext> {
     desired_context_for_device(bridge, &bridge.task_device_id)
+}
+
+/// Auto-derives a display context from thstatus entries and stores it as
+/// `last_display_context` when no explicit MCP `set_display_context` has
+/// been called. The thstatus entries from the RP2040 carry only slot
+/// colors and enabled state — no model, effort, or usage — so those
+/// fields are left null and shown as "—" on the strips. The status is
+/// derived from the slot color, matching the HID palette.
+pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
+    if bridge.has_explicit_display_context {
+        return;
+    }
+    // Find the first enabled task across all devices.
+    let mut best: Option<(String, usize, u32, String)> = None;
+    for task in bridge.task_board.tasks() {
+        if task.state == crate::tasks::TaskState::Completed {
+            continue;
+        }
+        let Some(ref assignment) = bridge.task_board.assignment(&task.task_id) else {
+            continue;
+        };
+        let color = task.color.unwrap_or(0x37474f);
+        let slot = assignment.slot.slot;
+        let device_id = assignment.slot.device_id.clone();
+        // Prefer the first enabled slot on any device.
+        if best.is_none() || slot < best.as_ref().unwrap().1 {
+            best = Some((device_id, slot, color, task.state.as_str().to_owned()));
+        }
+    }
+    let Some((device_id, slot, color, _state_str)) = best else {
+        return;
+    };
+    let status = color_to_status(color);
+    let context = DisplayContext {
+        project: Some("Codex".to_owned()),
+        task: Some(format!("Slot {}", slot + 1)),
+        model: None,
+        effort: None,
+        status: Some(status.to_owned()),
+        progress: None,
+        task_id: Some(format!("codex-hid:{}", slot)),
+        weekly_remaining: None,
+        five_hour_remaining: None,
+    };
+    bridge.last_display_context = Some(context);
+    let _ = bridge.task_board.select(&device_id, slot, now_ms());
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Maps a thstatus color to a status string, matching the HID palette.
+fn color_to_status(color: u32) -> &'static str {
+    match color {
+        0x1565c0 => "working",
+        0x6a1b9a => "thinking",
+        0xef6c00 => "waiting",
+        0xb71c1c => "error",
+        0x2e7d32 => "done",
+        0x0277bd => "ready",
+        _ => "idle",
+    }
 }
 
 /// Computes the display context for a specific controller device, looking
@@ -781,6 +852,7 @@ pub(crate) fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
         has_explicit_task_state: false,
         last_rgb_config: None,
         last_display_context: None,
+        has_explicit_display_context: false,
         firmware,
         port,
         codex_decoder: CodexDecoder::default(),
@@ -1276,6 +1348,7 @@ pub(crate) fn call_set_display_context(bridge: &mut BridgeRuntime, arguments: &V
         Err(error) => return mcp::tool_error(error),
     };
     bridge.last_display_context = Some(context.clone());
+    bridge.has_explicit_display_context = true;
 
     let render_context = display_context_for_controller(bridge, &context, &bridge.task_device_id);
     let primary_error = bridge
@@ -1425,6 +1498,7 @@ fn call_tool(request: &Value, bridge: &mut BridgeRuntime) -> Value {
                 Err(error) => return mcp::tool_error(error),
             };
             bridge.last_display_context = Some(context.clone());
+            bridge.has_explicit_display_context = true;
             let render_context = display_context_for_controller(bridge, &context, &bridge.task_device_id);
             let apply_result = bridge
                 .controller
@@ -1820,6 +1894,7 @@ mod tests {
             has_explicit_task_state: false,
             last_rgb_config: None,
             last_display_context: None,
+            has_explicit_display_context: false,
             firmware: "test".to_owned(),
             port: "none".to_owned(),
             codex_decoder: CodexDecoder::default(),
