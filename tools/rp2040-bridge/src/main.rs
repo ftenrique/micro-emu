@@ -555,18 +555,21 @@ fn desired_context(bridge: &BridgeRuntime) -> Option<DisplayContext> {
     desired_context_for_device(bridge, &bridge.task_device_id)
 }
 
-/// Auto-derives a display context from thstatus entries and stores it as
-/// `last_display_context` when no explicit MCP `set_display_context` has
-/// been called. The thstatus entries from the RP2040 carry only slot
-/// colors and enabled state — no model, effort, or usage — so those
-/// fields are left null and shown as "—" on the strips. The status is
-/// derived from the slot color, matching the HID palette.
+/// Auto-derives a display context from the Codex CLI config and session
+/// files, combined with thstatus slot data. This gives the strips real
+/// model/effort/project data without relying on the CLI to proactively
+/// call `set_display_context`.
 pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
     if bridge.has_explicit_display_context {
         return;
     }
-    // Find the first enabled task across all devices.
-    let mut best: Option<(String, usize, u32, String)> = None;
+    // Read model and effort from the Codex CLI config.
+    let (model, effort) = read_codex_config();
+    // Read project (cwd) from the most recent Codex session file.
+    let project = read_latest_codex_session_cwd();
+
+    // Find the first enabled task across all devices for status.
+    let mut best: Option<(String, usize, u32)> = None;
     for task in bridge.task_board.tasks() {
         if task.state == crate::tasks::TaskState::Completed {
             continue;
@@ -577,28 +580,141 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
         let color = task.color.unwrap_or(0x37474f);
         let slot = assignment.slot.slot;
         let device_id = assignment.slot.device_id.clone();
-        // Prefer the first enabled slot on any device.
         if best.is_none() || slot < best.as_ref().unwrap().1 {
-            best = Some((device_id, slot, color, task.state.as_str().to_owned()));
+            best = Some((device_id, slot, color));
         }
     }
-    let Some((device_id, slot, color, _state_str)) = best else {
-        return;
+
+    let (status, task_id, task_label) = if let Some((device_id, slot, color)) = best {
+        let _ = bridge.task_board.select(&device_id, slot, now_ms());
+        (
+            color_to_status(color).to_owned(),
+            Some(format!("codex-hid:{}", slot)),
+            Some(format!("Task {}", slot + 1)),
+        )
+    } else {
+        ("idle".to_owned(), None, None)
     };
-    let status = color_to_status(color);
+
     let context = DisplayContext {
-        project: Some("Codex".to_owned()),
-        task: Some(format!("Slot {}", slot + 1)),
-        model: None,
-        effort: None,
-        status: Some(status.to_owned()),
+        project,
+        task: task_label,
+        model,
+        effort,
+        status: Some(status),
         progress: None,
-        task_id: Some(format!("codex-hid:{}", slot)),
+        task_id,
         weekly_remaining: None,
         five_hour_remaining: None,
     };
     bridge.last_display_context = Some(context);
-    let _ = bridge.task_board.select(&device_id, slot, now_ms());
+}
+
+/// Reads `~/.codex/config.toml` and extracts the top-level `model` and
+/// `model_reasoning_effort` values. Returns (model, effort).
+fn read_codex_config() -> (Option<String>, Option<String>) {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    let config_path = std::path::Path::new(&home).join(".codex").join("config.toml");
+    let Ok(content) = std::fs::read_to_string(&config_path) else {
+        return (None, None);
+    };
+    let mut model = None;
+    let mut effort = None;
+    let mut in_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Track whether we're inside a [section] — only parse top-level keys.
+        if trimmed.starts_with('[') {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            if let Some(value) = parse_toml_kv(trimmed, "model") {
+                model = Some(value);
+            }
+            if let Some(value) = parse_toml_kv(trimmed, "model_reasoning_effort") {
+                effort = Some(value);
+            }
+        }
+    }
+    (model, effort)
+}
+
+/// Parses a `key = "value"` or `key = value` TOML line.
+fn parse_toml_kv(line: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key} = ");
+    let rest = line.strip_prefix(&prefix)?;
+    let rest = rest.trim();
+    // Strip quotes if present.
+    if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
+        Some(rest[1..rest.len() - 1].to_owned())
+    } else if rest.starts_with('\'') && rest.ends_with('\'') && rest.len() >= 2 {
+        Some(rest[1..rest.len() - 1].to_owned())
+    } else {
+        Some(rest.to_owned())
+    }
+}
+
+/// Reads the most recent Codex CLI session file and extracts the `cwd`
+/// field, returning the directory name as the project name.
+fn read_latest_codex_session_cwd() -> Option<String> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    let sessions_dir = std::path::Path::new(&home)
+        .join(".codex")
+        .join("sessions");
+    // Find the most recently modified .jsonl file recursively.
+    let latest = find_latest_session_file(&sessions_dir)?;
+    let Ok(content) = std::fs::read_to_string(&latest) else {
+        return None;
+    };
+    // The first line is session_meta with a `cwd` field.
+    let first_line = content.lines().next()?;
+    let value: Value = serde_json::from_str(first_line).ok()?;
+    let cwd = value
+        .get("payload")
+        .and_then(|p| p.get("cwd"))
+        .and_then(Value::as_str)?;
+    // Extract just the directory name.
+    let name = std::path::Path::new(cwd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(cwd);
+    Some(name.to_owned())
+}
+
+/// Recursively finds the most recently modified .jsonl file under `dir`.
+fn find_latest_session_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    let mut latest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(sub_path) = find_latest_session_file(&path) {
+                if let Ok(metadata) = std::fs::metadata(&sub_path) {
+                    if let Ok(modified) = metadata.modified() {
+                        if latest.as_ref().map(|(_, t)| modified > *t).unwrap_or(true) {
+                            latest = Some((sub_path, modified));
+                        }
+                    }
+                }
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if let Ok(metadata) = entry.metadata() {
+                if let Ok(modified) = metadata.modified() {
+                    if latest.as_ref().map(|(_, t)| modified > *t).unwrap_or(true) {
+                        latest = Some((path, modified));
+                    }
+                }
+            }
+        }
+    }
+    latest.map(|(p, _)| p)
 }
 
 fn now_ms() -> u128 {

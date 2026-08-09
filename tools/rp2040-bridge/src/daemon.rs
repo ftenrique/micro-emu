@@ -191,6 +191,10 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     handle_hello(&mut sessions, session_id, info);
                     session_agents.insert(agent);
                     pending_repartition_at = Some(Instant::now() + REPARTITION_DEBOUNCE);
+                    // Auto-derive display context when a Codex session
+                    // connects — the config/session files may have changed.
+                    crate::auto_derive_display_context(&mut bridge);
+                    let _ = crate::refresh_task_board(&mut bridge);
                 }
                 SessionMessage::Request {
                     session_id,
