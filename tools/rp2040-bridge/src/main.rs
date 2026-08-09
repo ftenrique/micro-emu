@@ -533,8 +533,9 @@ fn desired_primary_cards(bridge: &BridgeRuntime) -> Vec<Value> {
 fn display_context_for_controller(
     bridge: &BridgeRuntime,
     context: &DisplayContext,
+    device_id: &str,
 ) -> DisplayContext {
-    let Some(slot) = bridge.task_board.selected_slot(&bridge.task_device_id) else {
+    let Some(slot) = bridge.task_board.selected_slot(device_id) else {
         return context.clone();
     };
     let Some(task) = context.task.as_deref() else {
@@ -546,17 +547,23 @@ fn display_context_for_controller(
 }
 
 fn desired_context(bridge: &BridgeRuntime) -> Option<DisplayContext> {
+    desired_context_for_device(bridge, &bridge.task_device_id)
+}
+
+/// Computes the display context for a specific controller device, looking
+/// up the selected task on that device rather than the primary controller.
+fn desired_context_for_device(bridge: &BridgeRuntime, device_id: &str) -> Option<DisplayContext> {
     bridge
         .last_display_context
         .clone()
         .or_else(|| {
             bridge
                 .task_board
-                .selected_display_context(&bridge.task_device_id)
+                .selected_display_context(device_id)
                 .and_then(|value| DisplayContext::from_value(&value).ok())
         })
         .or_else(|| Some(connection_default_context()))
-        .map(|context| display_context_for_controller(bridge, &context))
+        .map(|context| display_context_for_controller(bridge, &context, device_id))
 }
 
 fn apply_controller_state(
@@ -618,6 +625,7 @@ pub(crate) fn refresh_task_board(bridge: &mut BridgeRuntime) -> Result<(), Strin
         } else {
             connection_default_cards(slots)
         };
+        let context = desired_context_for_device(bridge, &device_id);
         let result = apply_controller_state(
             device.as_mut(),
             &cards,
@@ -1269,7 +1277,7 @@ pub(crate) fn call_set_display_context(bridge: &mut BridgeRuntime, arguments: &V
     };
     bridge.last_display_context = Some(context.clone());
 
-    let render_context = display_context_for_controller(bridge, &context);
+    let render_context = display_context_for_controller(bridge, &context, &bridge.task_device_id);
     let primary_error = bridge
         .controller
         .as_mut()
@@ -1417,7 +1425,7 @@ fn call_tool(request: &Value, bridge: &mut BridgeRuntime) -> Value {
                 Err(error) => return mcp::tool_error(error),
             };
             bridge.last_display_context = Some(context.clone());
-            let render_context = display_context_for_controller(bridge, &context);
+            let render_context = display_context_for_controller(bridge, &context, &bridge.task_device_id);
             let apply_result = bridge
                 .controller
                 .as_mut()
@@ -1878,7 +1886,7 @@ mod tests {
             ..DisplayContext::default()
         };
         assert_eq!(
-            display_context_for_controller(&no_selection, &raw_context)
+            display_context_for_controller(&no_selection, &raw_context, &no_selection.task_device_id)
                 .task
                 .as_deref(),
             Some("Raw task")

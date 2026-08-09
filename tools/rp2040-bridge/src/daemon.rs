@@ -453,6 +453,10 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                 session.events.push_back(event);
             }
         }
+        // A task-button press during poll may have changed the selected
+        // task; push the updated display context and cards to aux
+        // controllers so the strips reflect the new selection immediately.
+        let _ = crate::refresh_task_board(&mut bridge);
 
         // Track RP2040 attach/detach for Codex hardware activity.
         let now_has_serial = bridge.has_serial();
