@@ -191,17 +191,17 @@ Or let the plugin autostart the daemon by setting the `MICRO_EMU_BRIDGE_EXE` env
 
 | Action | Description |
 |--------|-------------|
-| Agent Button | AG00–AG05 — select the agent index in settings |
-| Action Button | ACT06–ACT08 — select the action index and an icon in settings |
+| Agent Button | AG00â€“AG05 â€” select the agent index in settings |
+| Action Button | ACT06â€“ACT08 â€” select the action index and an icon in settings |
 | Task Card | Renders a task-board slot with title and status |
-| Knob | SD+ dial — emulates the Codex Micro rotor (`ENC_CW`/`ENC_CC`, press = `ENC_CLK`); touch strip shows task number, project, and shortened name |
-| Crux Horizontal | SD+ dial — emulates the crux left/right axis (radial X); press is assignable (default `ACT12` Send); touch strip shows model / effort |
-| Crux Vertical | SD+ dial — emulates the crux up/down axis (radial Y); press is assignable (default `ACT10` Mic); touch strip shows 5-hour and weekly usage limits as bars with exact percentages |
+| Knob | SD+ dial â€” emulates the Codex Micro rotor (`ENC_CW`/`ENC_CC`, press = `ENC_CLK`); touch strip shows task number, project, and shortened name |
+| Crux Horizontal | SD+ dial â€” emulates the crux left/right axis (radial X); press is assignable (default `ACT12` Send); touch strip shows model / effort |
+| Crux Vertical | SD+ dial â€” emulates the crux up/down axis (radial Y); press is assignable (default `ACT10` Mic); touch strip shows 5-hour and weekly usage limits as bars with exact percentages |
 | Mic | ACT10 microphone toggle |
 | Send | ACT12 send-to-Codex |
 | Arrow Key | Virtual arrow/rotor key for keypad-only decks |
 
-All actions reuse the existing Codex Micro `v.oai.hid`/`v.oai.rad` mappings — no new protocol messages are introduced.
+All actions reuse the existing Codex Micro `v.oai.hid`/`v.oai.rad` mappings â€” no new protocol messages are introduced.
 
 ## Integrate with Codex through MCP
 
@@ -271,13 +271,13 @@ CLI, and IDE extension share the same MCP configuration on the host. Once
 connected, ask Codex to call `bridge_status` first. The bridge exposes these
 tools:
 
-- `bridge_status` â€” report firmware, serial port, and AJAZZ connection state.
-- `emit_key` â€” emit a synthetic Codex Micro key press/release.
-- `send_codex_message` â€” send one Codex Micro JSON message.
-- `set_thread_status` â€” update the six AJAZZ LCD status slots.
-- set_display_context — update the optional Stream Deck + project/task dashboard.
-- `set_rgb_config` â€” send `v.oai.rgbcfg` configuration.
-- `device_status` â€” request `device.status` from the RP2040 firmware.
+- `bridge_status` Ã¢â‚¬â€ report firmware, serial port, and AJAZZ connection state.
+- `emit_key` Ã¢â‚¬â€ emit a synthetic Codex Micro key press/release.
+- `send_codex_message` Ã¢â‚¬â€ send one Codex Micro JSON message.
+- `set_thread_status` Ã¢â‚¬â€ update the six AJAZZ LCD status slots.
+- set_display_context â€” update the optional Stream Deck + project/task dashboard.
+- `set_rgb_config` Ã¢â‚¬â€ send `v.oai.rgbcfg` configuration.
+- `device_status` Ã¢â‚¬â€ request `device.status` from the RP2040 firmware.
 
 When Codex owns the MCP process, do not start a second bridge process against
 the same COM port. Close any manually started `bridge:run` process before
@@ -292,11 +292,11 @@ connects to the daemon. This replaces the single-owner `--mcp` STDIO mode
 when you need multiple agents at the same time.
 
 ```text
-AJAZZ / Stream Deck ──HID── bridge daemon ──CDC── RP2040 ──HID── ChatGPT
-                                │ (127.0.0.1:48360)
-              ┌─────────────────┼─────────────────┐
+AJAZZ / Stream Deck â”€â”€HIDâ”€â”€ bridge daemon â”€â”€CDCâ”€â”€ RP2040 â”€â”€HIDâ”€â”€ ChatGPT
+                                â”‚ (127.0.0.1:48360)
+              â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
       proxy (codex)     proxy (zcode)     proxy (hermes)
-              │                │                  │
+              â”‚                â”‚                  â”‚
           Codex CLI        ZCode ADE      Hermes Desktop Agent
 ```
 
@@ -308,7 +308,7 @@ active. Priority order is **Codex > ZCode > Hermes**.
 - **1 agent active**: owns all 6 keys and slots.
 - **2 agents active**: higher-priority agent gets `AG00`-`AG02` / slots 1-3,
   lower gets `AG03`-`AG05` / slots 4-6.
-- **3 agents active**: column split — Codex `AG00`+`AG03`, ZCode `AG01`+`AG04`,
+- **3 agents active**: column split â€” Codex `AG00`+`AG03`, ZCode `AG01`+`AG04`,
   Hermes `AG02`+`AG05`.
 
 When the active set changes, the daemon debounces for 750 ms and repartitions.
@@ -340,7 +340,7 @@ mcp_servers:
     args: ["--mcp-proxy", "--agent", "hermes", "--autostart"]
 ```
 
-**ZCode** (Settings → MCP Servers, or `~/.zcode/config.json`):
+**ZCode** (Settings â†’ MCP Servers, or `~/.zcode/config.json`):
 
 ```json
 {
@@ -371,12 +371,12 @@ daemon binds only to `127.0.0.1:48360` (configurable with `--bind`).
 
 Hermes and ZCode see a filtered tool set:
 
-- `bridge_status` — report daemon, firmware, controller, and agent state.
-- `poll_events` — drain buffered physical key presses for your assigned keys.
+- `bridge_status` â€” report daemon, firmware, controller, and agent state.
+- `poll_events` â€” drain buffered physical key presses for your assigned keys.
   With `timeout_ms > 0`, waits up to that many milliseconds for events. Also
   delivers partition change notifications.
-- `set_thread_status` — update the LCD slots currently assigned to your agent.
-- `set_rgb_config` — send `v.oai.rgbcfg` configuration.
+- `set_thread_status` â€” update the LCD slots currently assigned to your agent.
+- `set_rgb_config` â€” send `v.oai.rgbcfg` configuration.
 
 ZCode additionally has access to `set_display_context` (Stream Deck + dashboard
 metadata). Codex retains all existing tools plus `poll_events`.
@@ -434,8 +434,7 @@ const press = keyEvent("AG00", 1, 0);
 
 ## Documentation
 
-- [Deployment](DEPLOYMENT.md) â€” build, flash, run, validate, and publish.
-- [RP2040 bridge details](docs/rp2040-bridge.md) â€” firmware and transport
+- [RP2040 bridge details](docs/rp2040-bridge.md) Ã¢â‚¬â€ firmware and transport
   architecture.
 - [Hermes integration](docs/Hermes_integration.md) - deploy the bridge with
   the Hermes Desktop Agent (standalone or alongside Codex).
@@ -443,7 +442,6 @@ const press = keyEvent("AG00", 1, 0);
   ZCode (Z.ai ADE), including the dynamic three-agent partition.
 - [Hardware profile](docs/hardware-profile.md) - verified AJAZZ interface and
   controls.
-- [Windows environment](docs/windows-environment.md) - inventory and system
   diagnostics.
 
 ## Security model

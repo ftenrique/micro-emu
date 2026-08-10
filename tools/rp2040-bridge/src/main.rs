@@ -10,6 +10,7 @@ mod serial;
 mod streamdeck;
 mod tasks;
 mod wire;
+mod zcode_state;
 
 use crate::codex::{CodexDecoder, RadialState, frame_json, messages_for_synthetic_key};
 use crate::controller::{ControllerKind, DeviceSpec, DisplayContext, PhysicalController};
@@ -570,7 +571,10 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
     let (five_hour_remaining, weekly_remaining) = fetch_codex_usage();
 
     // Find the first enabled task across all devices for status.
-    let mut best: Option<(String, usize, u32)> = None;
+    // Find the first enabled task across all devices for status.  Prefer the
+    // currently selected task (the one the user last pressed), falling back to
+    // the lowest-slot non-completed task.
+    let mut best: Option<(&str, usize, u32)> = None;
     for task in bridge.task_board.tasks() {
         if task.state == crate::tasks::TaskState::Completed {
             continue;
@@ -578,32 +582,60 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
         let Some(ref assignment) = bridge.task_board.assignment(&task.task_id) else {
             continue;
         };
-        let color = task.color.unwrap_or(0x37474f);
+        let color = task.color.unwrap_or_else(|| task.state.display_color());
         let slot = assignment.slot.slot;
-        let device_id = assignment.slot.device_id.clone();
         if best.is_none() || slot < best.as_ref().unwrap().1 {
-            best = Some((device_id, slot, color));
+            best = Some((task.task_id.as_str(), slot, color));
         }
     }
 
-    let (status, task_id, task_label) = if let Some((device_id, slot, color)) = best {
-        let _ = bridge.task_board.select(&device_id, slot, now_ms());
-        (
-            color_to_status(color).to_owned(),
-            Some(format!("codex-hid:{}", slot)),
-            Some(format!("Task {}", slot + 1)),
-        )
-    } else {
-        ("idle".to_owned(), None, None)
-    };
+    let (status, task_id, task_label, progress, context_model, context_effort) =
+        if let Some((task_id, slot, color)) = best {
+            // Extract everything we need from the task while holding only an
+            // immutable borrow, before the mutable `select()` below.
+            let task = bridge.task_board.tasks().find(|t| t.task_id == task_id);
+            let title = task
+                .map(|t| t.title.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| format!("Task {}", slot + 1));
+            let progress = task.and_then(|t| t.progress);
+            let context = task.map(|t| t.context.clone()).unwrap_or(Value::Null);
+            let ctx_model = context
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(model);
+            let ctx_effort = context
+                .get("effort")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(effort);
+            let task_id_owned = task_id.to_owned();
+            let device_id = bridge
+                .task_board
+                .assignment(task_id)
+                .map(|a| a.slot.device_id.clone())
+                .unwrap_or_default();
+            let _ = bridge.task_board.select(&device_id, slot, now_ms());
+            (
+                color_to_status(color).to_owned(),
+                Some(task_id_owned),
+                Some(title),
+                progress,
+                ctx_model,
+                ctx_effort,
+            )
+        } else {
+            ("idle".to_owned(), None, None, None, model, effort)
+        };
 
     let context = DisplayContext {
         project,
         task: task_label,
-        model,
-        effort,
+        model: context_model,
+        effort: context_effort,
         status: Some(status),
-        progress: None,
+        progress,
         task_id,
         weekly_remaining,
         five_hour_remaining,

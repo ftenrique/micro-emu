@@ -1,0 +1,402 @@
+//! Read-only access to ZCode's on-disk session state.
+//!
+//! ZCode stores its live agent state in a SQLite database at
+//! `~/.zcode/cli/db/db.sqlite`.  The daemon periodically polls this database
+//! to mirror active ZCode sessions on the Stream Deck task board, the same
+//! way Codex Micro activity arrives via `v.oai.thstatus` serial frames.
+//!
+//! All queries open the database read-only so the running ZCode process keeps
+//! its write lock undisturbed.  If the database is missing, locked, or has an
+//! unexpected schema, [`read_zcode_snapshot`] returns `None` so the caller can
+//! leave the existing board untouched rather than blanking it.
+
+use crate::tasks::CODEX_TASK_SLOTS;
+use rusqlite::{Connection, OpenFlags};
+use serde_json::{Value, json};
+use std::time::Duration;
+
+/// How many active sessions to surface on the combined task board.  The first
+/// [`CODEX_TASK_SLOTS`] slots on the Stream Deck+ mirror Codex Micro, so we
+/// cap the ZCode snapshot at the same number for a consistent layout.
+const MAX_ZCODE_TASKS: usize = CODEX_TASK_SLOTS;
+
+/// A session whose latest model request is still in flight is treated as
+/// running for this long after its last activity, so a card does not flip back
+/// to "queued" between tool calls within a single turn.
+const ACTIVITY_LIVENESS: Duration = Duration::from_secs(30);
+
+/// Returns the path to the ZCode CLI database, or `None` when the home
+/// directory cannot be resolved.
+pub fn zcode_db_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    Some(
+        std::path::Path::new(&home)
+            .join(".zcode")
+            .join("cli")
+            .join("db")
+            .join("db.sqlite"),
+    )
+}
+
+/// Reads the live ZCode session snapshot and returns it as a
+/// `{"tasks": [...]}` payload ready for [`crate::tasks::TaskBoard::publish_tasks`].
+///
+/// Returns `None` when the database is unavailable (missing, locked, or
+/// unreadable) so the caller can preserve the previously published board.
+pub fn read_zcode_snapshot(now_ms: u128) -> Option<Value> {
+    let path = zcode_db_path()?;
+    let connection = Connection::open_with_flags(
+        &path,
+        // Read-only: never acquire a write lock on ZCode's database.
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+
+    let mut statement = connection
+        .prepare(
+            "SELECT id, title, directory, task_type, time_updated
+             FROM session
+             WHERE time_archived IS NULL
+               AND task_type IN ('interactive', 'task')
+             ORDER BY time_updated DESC
+             LIMIT ?1;",
+        )
+        .ok()?;
+
+    let rows = statement
+        .query_map([MAX_ZCODE_TASKS as i64], |row| {
+            Ok(SessionRow {
+                id: row.get::<_, String>(0)?,
+                title: row.get::<_, String>(1)?,
+                directory: row.get::<_, String>(2)?,
+                time_updated: row.get::<_, i64>(4)?,
+            })
+        })
+        .ok()?;
+
+    let mut tasks = Vec::new();
+    for row in rows.flatten() {
+        if let Some(task) = build_task(&connection, &row, now_ms) {
+            tasks.push(task);
+        }
+    }
+
+    if tasks.is_empty() {
+        // Distinguish "DB readable but nothing active" from "DB missing".
+        // An empty array is a valid publish: it clears stale ZCode cards.
+        return Some(json!({"tasks": []}));
+    }
+    Some(json!({"tasks": tasks}))
+}
+
+struct SessionRow {
+    id: String,
+    title: String,
+    directory: String,
+    time_updated: i64,
+}
+
+/// Builds a single task object for one session, enriching it with the latest
+/// model-usage status and the model/effort selection.
+fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Option<Value> {
+    let latest = latest_model_usage(connection, &row.id)?;
+    let selection = model_selection(connection, &row.id);
+
+    let state = derive_state(&latest, row.time_updated, now_ms);
+    let model = selection
+        .as_ref()
+        .and_then(|s| s.model.clone())
+        .or(latest.model_id);
+    let effort = selection
+        .as_ref()
+        .and_then(|s| s.thought_level.clone())
+        .or(latest.variant);
+    let project = project_name(&row.directory);
+
+    // Running sessions rank above idle ones so they claim the lowest slots.
+    let priority = if state == "running" { 75 } else { 40 };
+
+    let context = json!({
+        "project": project,
+        "task": row.title,
+        "model": model,
+        "effort": effort,
+        "status": state,
+        "task_id": format!("zcode:{}", row.id),
+    });
+
+    Some(json!({
+        "task_id": format!("zcode:{}", row.id),
+        "title": row.title,
+        "state": state,
+        "priority": priority,
+        "context": context,
+    }))
+}
+
+/// The most recent `model_usage` row for a session, if any.
+struct ModelUsage {
+    status: String,
+    model_id: Option<String>,
+    variant: Option<String>,
+    started_at: i64,
+}
+
+fn latest_model_usage(connection: &Connection, session_id: &str) -> Option<ModelUsage> {
+    let mut statement = connection
+        .prepare(
+            "SELECT status, model_id, variant, started_at
+             FROM model_usage
+             WHERE session_id = ?1
+             ORDER BY started_at DESC
+             LIMIT 1;",
+        )
+        .ok()?;
+    statement
+        .query_row([session_id], |row| {
+            Ok(ModelUsage {
+                status: row.get(0)?,
+                model_id: row.get::<_, Option<String>>(1)?,
+                variant: row.get::<_, Option<String>>(2)?,
+                started_at: row.get(3)?,
+            })
+        })
+        .ok()
+}
+
+struct ModelSelection {
+    model: Option<String>,
+    thought_level: Option<String>,
+}
+
+fn model_selection(connection: &Connection, session_id: &str) -> Option<ModelSelection> {
+    let mut statement = connection
+        .prepare(
+            "SELECT data
+             FROM session_entry
+             WHERE session_id = ?1 AND type = 'runtime/model_selection'
+             ORDER BY time_created DESC
+             LIMIT 1;",
+        )
+        .ok()?;
+    let data: String = statement.query_row([session_id], |row| row.get(0)).ok()?;
+    let value: Value = serde_json::from_str(&data).ok()?;
+    Some(ModelSelection {
+        model: value
+            .get("modelId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        thought_level: value
+            .get("thoughtLevel")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// Maps the latest model-usage status and session recency to a task-board
+/// state.  A session is `running` while a model request is in flight, or for a
+/// short grace window after the last activity so brief gaps between tool calls
+/// do not flip the card back to idle.
+fn derive_state(latest: &ModelUsage, session_updated_ms: i64, now_ms: u128) -> &'static str {
+    match latest.status.as_str() {
+        "running" => "running",
+        "error" => "error",
+        "cancelled" => "queued",
+        "completed" | _ => {
+            let last = latest.started_at.max(session_updated_ms) as u128;
+            if now_ms.saturating_sub(last) <= ACTIVITY_LIVENESS.as_millis() {
+                "running"
+            } else {
+                "queued"
+            }
+        }
+    }
+}
+
+/// Reduces a workspace directory to a short project label (the final path
+/// segment), mirroring how Codex derives its project name from a session cwd.
+fn project_name(directory: &str) -> String {
+    std::path::Path::new(directory)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(directory)
+        .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Builds an in-memory database with the ZCode schema subset we query, for
+    /// deterministic mapping tests that do not touch the real database.
+    fn fixture_db() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id text primary key,
+                    project_id text not null,
+                    workspace_id text,
+                    parent_id text,
+                    slug text not null,
+                    directory text not null,
+                    path text,
+                    title text not null,
+                    version text not null,
+                    time_created integer not null,
+                    time_updated integer not null,
+                    time_archived integer,
+                    task_type text not null default 'interactive'
+                );
+                CREATE TABLE session_entry (
+                    id text primary key,
+                    session_id text not null,
+                    type text not null,
+                    time_created integer not null,
+                    time_updated integer not null,
+                    data text not null
+                );
+                CREATE TABLE model_usage (
+                    id text primary key,
+                    logical_request_id text not null,
+                    session_id text not null,
+                    provider_id text not null,
+                    model_id text not null,
+                    variant text,
+                    agent text,
+                    status text not null,
+                    started_at integer not null
+                );",
+            )
+            .unwrap();
+        connection
+    }
+
+    #[test]
+    fn maps_running_session_to_running_task() {
+        let connection = fixture_db();
+        connection
+            .execute(
+                "INSERT INTO session (id, project_id, slug, directory, title, version,
+                                      time_created, time_updated, task_type)
+                 VALUES ('sess_a', 'p1', 'a', 'D:\\proj\\micro-emu', 'Fix task buttons',
+                         '1', 1000, 5000, 'interactive')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO model_usage (id, logical_request_id, session_id, provider_id,
+                                          model_id, variant, agent, status, started_at)
+                 VALUES ('mu1', 'r1', 'sess_a', 'builtin:zai-coding-plan',
+                         'GLM-5.2', 'max', 'zcode-agent', 'running', 4900)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_entry (id, session_id, type, time_created, time_updated, data)
+                 VALUES ('se1', 'sess_a', 'runtime/model_selection', 1000, 1000,
+                         '{\"modelId\":\"GLM-5.2\",\"thoughtLevel\":\"max\"}')",
+                [],
+            )
+            .unwrap();
+
+        let row = SessionRow {
+            id: "sess_a".to_owned(),
+            title: "Fix task buttons".to_owned(),
+            directory: "D:\\proj\\micro-emu".to_owned(),
+            time_updated: 5000,
+        };
+        let task = build_task(&connection, &row, 6000).unwrap();
+        assert_eq!(task["task_id"], "zcode:sess_a");
+        assert_eq!(task["state"], "running");
+        assert_eq!(task["priority"], 75);
+        assert_eq!(task["context"]["model"], "GLM-5.2");
+        assert_eq!(task["context"]["effort"], "max");
+        assert_eq!(task["context"]["project"], "micro-emu");
+        assert_eq!(task["context"]["task"], "Fix task buttons");
+    }
+
+    #[test]
+    fn idle_completed_session_falls_back_to_queued_after_liveness() {
+        let connection = fixture_db();
+        connection
+            .execute(
+                "INSERT INTO session (id, project_id, slug, directory, title, version,
+                                      time_created, time_updated, task_type)
+                 VALUES ('sess_b', 'p1', 'b', 'D:\\proj\\other', 'Old task', '1',
+                         1000, 1000, 'interactive')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO model_usage (id, logical_request_id, session_id, provider_id,
+                                          model_id, variant, agent, status, started_at)
+                 VALUES ('mu2', 'r2', 'sess_b', 'builtin:zai-coding-plan',
+                         'GLM-5.2', 'max', 'zcode-agent', 'completed', 1000)",
+                [],
+            )
+            .unwrap();
+
+        let row = SessionRow {
+            id: "sess_b".to_owned(),
+            title: "Old task".to_owned(),
+            directory: "D:\\proj\\other".to_owned(),
+            time_updated: 1000,
+        };
+        // Well past the 30s liveness window.
+        let task = build_task(&connection, &row, 100_000).unwrap();
+        assert_eq!(task["state"], "queued");
+        assert_eq!(task["priority"], 40);
+    }
+
+    #[test]
+    fn recent_completed_session_stays_running_within_liveness() {
+        let connection = fixture_db();
+        connection
+            .execute(
+                "INSERT INTO session (id, project_id, slug, directory, title, version,
+                                      time_created, time_updated, task_type)
+                 VALUES ('sess_c', 'p1', 'c', 'D:\\proj\\other', 'Recent task', '1',
+                         1000, 10000, 'interactive')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO model_usage (id, logical_request_id, session_id, provider_id,
+                                          model_id, variant, agent, status, started_at)
+                 VALUES ('mu3', 'r3', 'sess_c', 'builtin:zai-coding-plan',
+                         'GLM-5.2', 'max', 'zcode-agent', 'completed', 9000)",
+                [],
+            )
+            .unwrap();
+
+        let row = SessionRow {
+            id: "sess_c".to_owned(),
+            title: "Recent task".to_owned(),
+            directory: "D:\\proj\\other".to_owned(),
+            time_updated: 10000,
+        };
+        // Within the 30s liveness window after the last activity.
+        let task = build_task(&connection, &row, 35_000).unwrap();
+        assert_eq!(task["state"], "running");
+    }
+
+    #[test]
+    fn missing_database_returns_none() {
+        // Point at a path that does not exist.
+        let snapshot = Connection::open_with_flags(
+            "/nonexistent/zcode-db-does-not-exist.sqlite",
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()
+        .and_then(|_| read_zcode_snapshot(0));
+        assert!(snapshot.is_none());
+    }
+}

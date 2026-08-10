@@ -1,73 +1,72 @@
 {
-  "$schema": "../schema/device-profile.schema.json",
-  "profileVersion": 1,
-  "status": "verified",
-  "model": "AJAZZ AKP03E",
-  "revision": "rev. 2, bcdDevice 0x0002",
-  "vendorId": "0x0300",
-  "productId": "0x3002",
-  "firmware": null,
-  "transport": "USB",
-  "interfaces": [
-    {
-      "interface": "MI_00",
-      "usagePage": "0xFFA0",
-      "usage": "0x0001",
-      "role": "vendor input and LCD output",
-      "inputReportBytes": 513,
-      "outputReportBytes": 1025,
-      "featureReportBytes": 0,
-      "readWriteOpen": true
-    },
-    {
-      "interface": "MI_01",
-      "usagePage": "0x0001",
-      "usage": "0x0006",
-      "role": "keyboard",
-      "inputReportBytes": 9,
-      "outputReportBytes": 2,
-      "featureReportBytes": 0,
-      "readWriteOpen": false
-    }
-  ],
-  "inputReportBytes": 513,
-  "outputReportBytes": 1025,
-  "featureReportBytes": 0,
-  "lcd": {
-    "keyCount": 6,
-    "sourceWidth": 126,
-    "sourceHeight": 126,
-    "transportWidth": 60,
-    "transportHeight": 60,
-    "pixelFormat": "JPEG",
-    "rotation": "90 degrees clockwise before encoding",
-    "writeProtocolVerified": true,
-    "verifiedPattern": "six numbered color tiles"
-  },
-  "controls": {
-    "lcdKeys": 6,
-    "encoders": 3,
-    "encoderPresses": 3,
-    "buttons": 9
-  },
-  "oemSoftwareClosedDuringProbe": true,
-  "canOpenFromUserProcess": true,
-  "canReadInputs": true,
-  "canUpdateOneDisplay": true,
-  "canUpdateAllDisplays": true,
-  "protocol": {
-    "generation": 3,
-    "hostInputPayloadBytes": 512,
-    "hostOutputPayloadBytes": 1024,
-    "reportIdPrefixBytes": 1,
-    "requiredInterface": "MI_00 / FFA0:0001",
-    "wrongInterfaceSymptom": "MI_01 accepts writes at the OS boundary but the firmware ignores them"
-  },
-  "evidence": [
-    "artifacts/hid-with-akp03-reconnected.json",
-    "artifacts/akp03e-rev2-explicit-mi00-events.jsonl",
-    "artifacts/akp03e-rev2-lower-buttons-encoder-presses.jsonl",
-    "tools/ajazz-hardware-test/src/main.rs",
-    "D:/Programming/!archived/deck/docs/hardware-bringup.md"
-  ]
+    "profileVersion":  1,
+    "status":  "verified",
+    "model":  "AJAZZ AKP03E",
+    "revision":  "rev. 2, bcdDevice 0x0002",
+    "vendorId":  "0x0300",
+    "productId":  "0x3002",
+    "firmware":  null,
+    "transport":  "USB",
+    "interfaces":  [
+                       {
+                           "interface":  "MI_00",
+                           "usagePage":  "0xFFA0",
+                           "usage":  "0x0001",
+                           "role":  "vendor input and LCD output",
+                           "inputReportBytes":  513,
+                           "outputReportBytes":  1025,
+                           "featureReportBytes":  0,
+                           "readWriteOpen":  true
+                       },
+                       {
+                           "interface":  "MI_01",
+                           "usagePage":  "0x0001",
+                           "usage":  "0x0006",
+                           "role":  "keyboard",
+                           "inputReportBytes":  9,
+                           "outputReportBytes":  2,
+                           "featureReportBytes":  0,
+                           "readWriteOpen":  false
+                       }
+                   ],
+    "inputReportBytes":  513,
+    "outputReportBytes":  1025,
+    "featureReportBytes":  0,
+    "lcd":  {
+                "keyCount":  6,
+                "sourceWidth":  126,
+                "sourceHeight":  126,
+                "transportWidth":  60,
+                "transportHeight":  60,
+                "pixelFormat":  "JPEG",
+                "rotation":  "90 degrees clockwise before encoding",
+                "writeProtocolVerified":  true,
+                "verifiedPattern":  "six numbered color tiles"
+            },
+    "controls":  {
+                     "lcdKeys":  6,
+                     "encoders":  3,
+                     "encoderPresses":  3,
+                     "buttons":  9
+                 },
+    "oemSoftwareClosedDuringProbe":  true,
+    "canOpenFromUserProcess":  true,
+    "canReadInputs":  true,
+    "canUpdateOneDisplay":  true,
+    "canUpdateAllDisplays":  true,
+    "protocol":  {
+                     "generation":  3,
+                     "hostInputPayloadBytes":  512,
+                     "hostOutputPayloadBytes":  1024,
+                     "reportIdPrefixBytes":  1,
+                     "requiredInterface":  "MI_00 / FFA0:0001",
+                     "wrongInterfaceSymptom":  "MI_01 accepts writes at the OS boundary but the firmware ignores them"
+                 },
+    "evidence":  [
+                     "artifacts/hid-with-akp03-reconnected.json",
+                     "artifacts/akp03e-rev2-explicit-mi00-events.jsonl",
+                     "artifacts/akp03e-rev2-lower-buttons-encoder-presses.jsonl",
+                     "tools/ajazz-hardware-test/src/main.rs",
+                     "D:/Programming/!archived/deck/docs/hardware-bringup.md"
+                 ]
 }

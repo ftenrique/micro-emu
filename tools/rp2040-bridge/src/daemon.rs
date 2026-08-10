@@ -35,6 +35,25 @@ const REPARTITION_DEBOUNCE: Duration = Duration::from_millis(750);
 /// a live usage API call). 5 minutes balances freshness with API load.
 const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How often the daemon polls ZCode's session database to mirror live
+/// activity on the task board. 3 seconds keeps the Stream Deck responsive
+/// without hammering the SQLite file.
+const ZCODE_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Synthetic owner session for ZCode cards published by the daemon's DB poll.
+/// Real MCP sessions are numbered from 1 upward by the acceptor, so this high
+/// value never collides in practice.  Presses on these cards are fanned out to
+/// every live ZCode session rather than to this id (see `route_task_device_events`).
+pub const ZCODE_POLL_SESSION: usize = 999;
+
+/// Owner session for the synthetic Codex HID cards published from `v.oai.thstatus`.
+/// Matches `publish_codex_hid_status`, which hardcodes session 0.
+const CODEX_HID_SESSION: usize = 0;
+
+/// How long after the last `v.oai.thstatus` frame the Codex HID cards are kept
+/// before they are considered stale (the RP2040 link is gone) and cleared.
+const THSTATUS_GRACE: Duration = Duration::from_secs(5);
+
 /// Internal greeting sent by a proxy as its first line to identify which
 /// agent it represents. The daemon consumes it and does not forward it to
 /// the MCP client.
@@ -157,6 +176,12 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     // Plugin controller sessions: maps session_id to the device_id of the
     // PluginController registered in aux_controllers.
     let mut plugin_sessions: Vec<(usize, String)> = Vec::new();
+
+    // ZCode auto-feed bookkeeping.  The daemon periodically polls ZCode's
+    // on-disk session database and publishes active sessions as task cards,
+    // mirroring how Codex activity arrives via `v.oai.thstatus`.
+    let mut last_thstatus_at: Option<Instant> = None;
+    let mut next_zcode_poll_at: Option<Instant> = None;
 
     // Acceptor thread.
     let accept_tx = session_tx.clone();
@@ -323,10 +348,6 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                             Ok(messages) => {
                                 for message in messages {
                                     let method = crate::codex::method(&message);
-                                    eprintln!("DEBUG msg method={:?} body={}", method, serde_json::to_string(&message).unwrap_or_default());
-                                    if method == Some("device.status") {
-                                        eprintln!("DEBUG device.status response: {}", serde_json::to_string(&message).unwrap_or_default());
-                                    }
                                     if bridge.task_mode
                                         && method == Some("v.oai.thstatus")
                                     {
@@ -338,6 +359,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                                             // it authoritative and let the renderer fall back to
                                             // the fused status buffer rather than standby cards.
                                             bridge.has_explicit_task_state = true;
+                                            last_thstatus_at = Some(Instant::now());
                                             match bridge
                                                 .task_board
                                                 .publish_codex_hid_status(parameters, now_ms())
@@ -464,7 +486,25 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         let _ = crate::refresh_task_board(&mut bridge);
         crate::poll_controller(&mut bridge, false)?;
         for (session_id, event) in bridge.pending_task_events.drain(..) {
-            if let Some(session) = sessions.iter_mut().find(|session| session.id == session_id) {
+            if session_id == ZCODE_POLL_SESSION {
+                // The auto-fed ZCode cards have no owning MCP session of their
+                // own; fan a press out to every live ZCode session so the agent
+                // receives the `task_selected` (and legacy key) event.
+                let targets: Vec<usize> = sessions
+                    .iter()
+                    .filter(|session| session.agent == Some(AgentId::ZCode))
+                    .map(|session| session.id)
+                    .collect();
+                for id in targets {
+                    if let Some(session) =
+                        sessions.iter_mut().find(|session| session.id == id)
+                    {
+                        session.events.push_back(event.clone());
+                    }
+                }
+            } else if let Some(session) =
+                sessions.iter_mut().find(|session| session.id == session_id)
+            {
                 session.events.push_back(event);
             }
         }
@@ -472,6 +512,65 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         // task; push the updated display context and cards to aux
         // controllers so the strips reflect the new selection immediately.
         let _ = crate::refresh_task_board(&mut bridge);
+
+        // Clear phantom Codex HID cards when the RP2040 link is gone.  The
+        // synthetic session 0 cards published from `v.oai.thstatus` never
+        // expire on their own; without this they keep hogging slots 0-5 and
+        // starve the ZCode auto-feed below.
+        let thstatus_stale = last_thstatus_at
+            .map(|seen| now.duration_since(seen) > THSTATUS_GRACE)
+            .unwrap_or(true);
+        if thstatus_stale && bridge.task_board.has_session_tasks(CODEX_HID_SESSION) {
+            bridge.task_board.clear_session(CODEX_HID_SESSION);
+            if !bridge.task_board.has_tasks() {
+                bridge.has_explicit_task_state = false;
+            }
+            let _ = crate::refresh_task_board(&mut bridge);
+        }
+
+        // ZCode auto-feed mirrors its on-disk state only while a ZCode proxy
+        // is live. ZCode retains historical sessions in its database, so an
+        // unconditional poll resurrects old tasks and can take over the board.
+        let zcode_active = sessions
+            .iter()
+            .any(|session| session.agent == Some(AgentId::ZCode));
+        if !zcode_active {
+            if bridge.task_board.has_session_tasks(ZCODE_POLL_SESSION) {
+                bridge.task_board.clear_session(ZCODE_POLL_SESSION);
+                let _ = crate::refresh_task_board(&mut bridge);
+            }
+            next_zcode_poll_at = None;
+        } else {
+            if next_zcode_poll_at.is_none() {
+                next_zcode_poll_at = Some(now + ZCODE_POLL_INTERVAL);
+            }
+            if let Some(poll_at) = next_zcode_poll_at {
+                if now >= poll_at {
+                    next_zcode_poll_at = Some(now + ZCODE_POLL_INTERVAL);
+                    if let Some(snapshot) = crate::zcode_state::read_zcode_snapshot(now_ms()) {
+                        match bridge.task_board.publish_tasks(
+                            ZCODE_POLL_SESSION,
+                            AgentId::ZCode,
+                            &snapshot,
+                            now_ms(),
+                        ) {
+                            Ok(_) => {
+                                bridge.has_explicit_task_state = true;
+                                let _ = crate::refresh_task_board(&mut bridge);
+                            }
+                            Err(error) => {
+                                eprintln!("zcode poll publish failed: {error}");
+                            }
+                        }
+                    }
+                    // Keep the touch-strip context fresh alongside the poll.
+                    if !bridge.has_explicit_display_context {
+                        crate::auto_derive_display_context(&mut bridge);
+                        let _ = crate::refresh_task_board(&mut bridge);
+                    }
+                }
+            }
+        }
 
         // Track RP2040 attach/detach for Codex hardware activity.
         let now_has_serial = bridge.has_serial();

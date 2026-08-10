@@ -250,31 +250,6 @@ function Get-PnpUtilInventory {
     }
 }
 
-function Get-ToolchainInventory {
-    $vhfHeaders = @(
-        Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" `
-            -Recurse -Filter "vhf.h" -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty FullName
-    )
-    $vhfLibraries = @(
-        Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Lib" `
-            -Recurse -Filter "vhfkm.lib" -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty FullName
-    )
-
-    $commands = [ordered]@{}
-    foreach ($name in @("cl", "msbuild", "dotnet", "node", "npm")) {
-        $command = Get-Command $name -ErrorAction SilentlyContinue
-        $commands[$name] = if ($command) { $command.Source } else { $null }
-    }
-
-    [ordered]@{
-        commands = $commands
-        vhfHeaders = $vhfHeaders
-        vhfLibraries = $vhfLibraries
-    }
-}
-
 $inventory = [ordered]@{
     schemaVersion = 1
     capturedAtUtc = [DateTime]::UtcNow.ToString("o")
@@ -282,7 +257,6 @@ $inventory = [ordered]@{
     operatingSystem = Get-RegistryOperatingSystem
     chatGptPackages = @(Get-ChatGptPackages)
     pnp = Get-PnpInventory
-    toolchain = Get-ToolchainInventory
 }
 
 $json = $inventory | ConvertTo-Json -Depth 12

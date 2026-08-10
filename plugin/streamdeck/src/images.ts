@@ -72,6 +72,8 @@ export function renderTaskCardImage(
     agent: string | null | undefined,
     status: string,
     colorOverride?: unknown,
+    startedAtMs?: number,
+    finishedAtMs?: number,
 ): string {
     const normalizedStatus = status.toLowerCase();
     // Codex can send a white legacy `c` value with an idle thstatus entry.
@@ -81,19 +83,33 @@ export function renderTaskCardImage(
         : normalizeColor(colorOverride) ?? (status ? (STATUS_COLORS[normalizedStatus] ?? DEFAULT_COLOR) : DEFAULT_COLOR);
     const w = 144;
     const h = 144;
-    const cell = Math.floor(Math.min(w, h) / 10);
+    // Keep the task number compact and high enough to reserve a clear footer.
+    const cell = 12;
     const digitW = 3 * cell;
     const digitH = 5 * cell;
     const originX = Math.floor((w - digitW) / 2);
-    const originY = h - digitH - 16;
+    const originY = 42;
     const agentLabel = agent ? agent.toUpperCase() : "";
+    const isFinished = normalizedStatus === "completed" || normalizedStatus === "done";
+    const elapsed = formatElapsed(startedAtMs, finishedAtMs, isFinished);
+    const timerColor = isFinished ? "#a5d6a7" : "#90caf9";
 
     return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
   <rect x="4" y="4" width="${w - 8}" height="${h - 8}" rx="12" fill="${color}" stroke="#000" stroke-opacity="0.2" stroke-width="1"/>
-  <text x="${w / 2}" y="22" font-family="sans-serif" font-size="16" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(agentLabel)}</text>
+  <text x="${w / 2}" y="19" font-family="sans-serif" font-size="14" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(agentLabel)}</text>
   ${renderDigit(slot, originX, originY, cell, "#c4c2ff")}
-  ${status ? `<text x="${w / 2}" y="${h - 6}" font-family="sans-serif" font-size="9" fill="#fff" fill-opacity="0.6" text-anchor="middle">${escapeXml(status.toUpperCase())}</text>` : ""}
+  ${status ? `<text x="${w / 2}" y="116" font-family="sans-serif" font-size="10" font-weight="bold" fill="#fff" fill-opacity="0.82" text-anchor="middle">${escapeXml(status.toUpperCase())}</text>` : ""}
+  ${elapsed ? `<text x="${w / 2}" y="135" font-family="monospace" font-size="13" font-weight="bold" fill="${timerColor}" text-anchor="middle">${elapsed}</text>` : ""}
 </svg>`);
+}
+
+/** Formats elapsed task time as minutes and seconds. */
+function formatElapsed(startedAtMs: number | undefined, finishedAtMs: number | undefined, finished: boolean): string | undefined {
+    if (!startedAtMs) return undefined;
+    const end = finished && finishedAtMs ? finishedAtMs : Date.now();
+    const seconds = Math.max(0, Math.floor((end - startedAtMs) / 1_000));
+    const minutes = Math.floor(seconds / 60);
+    return `${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
 /** Renders a disconnected/greyed key image as a Stream Deck image data URI. */

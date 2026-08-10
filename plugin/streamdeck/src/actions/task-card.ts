@@ -3,6 +3,8 @@ import type { JsonValue } from "@elgato/utils";
 import { PluginContext } from "../context";
 import { renderTaskCardImage, renderDisconnectedImage } from "../images";
 
+const TIMER_REFRESH_MS = 1_000;
+
 /** Settings for the Task Card action. */
 export interface TaskCardSettings {
     [key: string]: JsonValue;
@@ -16,11 +18,13 @@ type TaskCardInstance = KeyAction<TaskCardSettings> | DialAction<TaskCardSetting
 @action({ UUID: "com.micro-emu.codex.task" })
 export class TaskCardAction extends SingletonAction<TaskCardSettings> {
     private readonly ctx: PluginContext;
+    private readonly timer: ReturnType<typeof setInterval>;
 
     constructor(ctx: PluginContext) {
         super();
         this.ctx = ctx;
         this.ctx.addListener(() => this.refreshAll());
+        this.timer = setInterval(() => this.refreshRunningCards(), TIMER_REFRESH_MS);
     }
 
     onWillAppear(ev: WillAppearEvent<TaskCardSettings>): void {
@@ -47,6 +51,18 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
         }
     }
 
+    private refreshRunningCards(): void {
+        if (!this.ctx.isConnected()) return;
+        for (const action of this.actions) {
+            action.getSettings().then((settings) => {
+                const slot = Number(settings.slot ?? 0);
+                const card = this.ctx.getTaskCard(slot);
+                const status = String(card?.status ?? card?.state ?? "").toLowerCase();
+                if (status === "running" || status === "working" || status === "active") this.refresh(action, settings);
+            });
+        }
+    }
+
     private refresh(action: TaskCardInstance, settings: TaskCardSettings): void {
         const slot = Number(settings.slot ?? 0);
         if (!this.ctx.isConnected()) {
@@ -62,11 +78,21 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
             ? ((taskCard.agent as string) ?? null)
             : null;
         const color = taskCard?.color ?? taskCard?.c;
-        // When the slot has no task or is disabled, show a dimmed placeholder.
-        if (!taskCard || !enabled) {
+        // A completed card has e:0 in the device protocol, but remains visible
+        // on Stream Deck so its state and total time persist.
+        if (!taskCard || (!enabled && status.toLowerCase() !== "completed")) {
             action.setImage(renderTaskCardImage(slot, null, "", 0x263238));
             return;
         }
-        action.setImage(renderTaskCardImage(slot, agent, status, color));
+        action.setImage(renderTaskCardImage(
+            slot, agent, status, color,
+            timestamp(taskCard.started_at_ms),
+            timestamp(taskCard.finished_at_ms),
+        ));
     }
+}
+
+function timestamp(value: unknown): number | undefined {
+    const parsed = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }

@@ -40,7 +40,9 @@ export class KnobDialAction extends SingletonAction {
             ev.action.showAlert();
             return;
         }
-        const delta = ev.payload.ticks >= 0 ? 1 : -1;
+        // Stream Deck reports this dial's physical direction opposite to the
+        // Codex Micro rotor convention (positive = ENC_CW), so invert it.
+        const delta = ev.payload.ticks >= 0 ? -1 : 1;
         this.ctx.daemon.sendEncoderTurn(1, delta);
     }
 

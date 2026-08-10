@@ -15,3 +15,5 @@ driver/**/Release/
 firmware/**/build/
 .toolchains/
 .codex/
+.zcode/
+target-next/

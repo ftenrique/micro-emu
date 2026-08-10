@@ -97,7 +97,7 @@ impl TaskState {
         !matches!(self, Self::Reconnecting)
     }
 
-    fn display_color(self) -> u32 {
+    pub fn display_color(self) -> u32 {
         match self {
             Self::Queued | Self::Reconnecting => 0x37474f,
             Self::Running => 0x1565c0,
@@ -122,6 +122,11 @@ pub struct TaskCard {
     pub context: Value,
     pub legacy_key: Option<String>,
     pub updated_at_ms: u128,
+    /// When the task first entered its running state, in Unix milliseconds.
+    pub started_at_ms: Option<u128>,
+    /// When the task completed, in Unix milliseconds. Kept so controllers can
+    /// show the final elapsed time instead of resetting the card.
+    pub finished_at_ms: Option<u128>,
     pub reconnect_until_ms: Option<u128>,
 }
 
@@ -341,6 +346,8 @@ impl TaskBoard {
             context,
             legacy_key,
             updated_at_ms: now_ms,
+            started_at_ms: (state == TaskState::Running).then_some(now_ms),
+            finished_at_ms: (state == TaskState::Completed).then_some(now_ms),
             reconnect_until_ms: None,
         })
     }
@@ -361,7 +368,15 @@ impl TaskBoard {
             self.tasks.remove(&id);
             self.assignments.remove(&id);
         }
-        for task in replacement {
+        for mut task in replacement {
+            if let Some(previous) = self.tasks.get(&task.task_id) {
+                task.started_at_ms = previous.started_at_ms.or((task.state == TaskState::Running).then_some(now_ms));
+                task.finished_at_ms = if task.state == TaskState::Completed {
+                    previous.finished_at_ms.or(Some(now_ms))
+                } else {
+                    None
+                };
+            }
             self.tasks.insert(task.task_id.clone(), task);
         }
         let _ = now_ms;
@@ -381,6 +396,31 @@ impl TaskBoard {
         // Keep current assignments during the grace period so a transient MCP
         // reconnect does not blank the physical controls. Once the lease
         // expires, expire removes these tasks and reallocates their slots.
+    }
+
+    /// Immediately removes every task owned by `session` and reallocates the
+    /// freed slots.  Unlike [`disconnect_session`], there is no grace lease:
+    /// this is for synthetic owners (e.g. the Codex HID cards published from
+    /// `v.oai.thstatus`) whose backing source has gone away permanently.
+    pub fn clear_session(&mut self, session: usize) {
+        let removed: Vec<String> = self
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| (task.owner_session == session).then_some(id.clone()))
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        for id in &removed {
+            self.tasks.remove(id);
+            self.assignments.remove(id);
+        }
+        self.reallocate();
+    }
+
+    /// Returns true when the board currently holds any task owned by `session`.
+    pub fn has_session_tasks(&self, session: usize) -> bool {
+        self.tasks.values().any(|task| task.owner_session == session)
     }
 
     pub fn expire(&mut self, now_ms: u128) {
@@ -553,7 +593,9 @@ impl TaskBoard {
                     "b": f64::from(task.brightness) / 100.0,
                     "progress": task.progress,
                     "task_id": task.task_id,
-                    "agent": task.owner_agent.as_str()
+                    "agent": task.owner_agent.as_str(),
+                    "started_at_ms": task.started_at_ms,
+                    "finished_at_ms": task.finished_at_ms
                 })
             })
             .collect()
@@ -801,6 +843,39 @@ mod tests {
         assert_eq!(board.rendered_slots("plus", 1)[0]["e"], 1);
         board.expire(2 + RECONNECT_GRACE.as_millis());
         assert_eq!(board.tasks().count(), 0);
+    }
+
+    #[test]
+    fn clear_session_frees_slots_for_another_owner() {
+        let mut board = TaskBoard::new();
+        board.set_device("plus", 6, true);
+        // Synthetic Codex HID cards (session 0) hog every slot, mirroring the
+        // stuck board seen when the RP2040 is offline.
+        board
+            .publish_tasks(
+                0,
+                AgentId::Codex,
+                &json!({"tasks": (0..6).map(|i| task(&format!("codex-hid:{i}"), "queued", 50)).collect::<Vec<_>>() }),
+                1,
+            )
+            .unwrap();
+        assert!(board.has_session_tasks(0));
+        assert_eq!(board.assignment("codex-hid:0").unwrap().slot.slot, 0);
+
+        // Clearing session 0 immediately releases the slots.
+        board.clear_session(0);
+        assert!(!board.has_session_tasks(0));
+
+        // A subsequent ZCode publish reclaims slot 0.
+        board
+            .publish_tasks(
+                7,
+                AgentId::ZCode,
+                &json!({"tasks":[task("zcode:sess_1", "running", 75)]}),
+                2,
+            )
+            .unwrap();
+        assert_eq!(board.assignment("zcode:sess_1").unwrap().slot.slot, 0);
     }
 }
 

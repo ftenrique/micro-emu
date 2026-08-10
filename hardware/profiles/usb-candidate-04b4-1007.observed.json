@@ -1,98 +1,97 @@
 {
-  "$schema": "../schema/device-profile.schema.json",
-  "profileVersion": 1,
-  "status": "observed",
-  "model": "Unverified USB HID candidate (generic SONiX identity)",
-  "revision": "VID_04B4&PID_1007, bcdDevice 1.00",
-  "vendorId": "0x04B4",
-  "productId": "0x1007",
-  "firmware": null,
-  "transport": "USB",
-  "interfaces": [
-    {
-      "product": "Game_Keyboard",
-      "usagePage": "0x0001",
-      "usage": "0x0006",
-      "inputReportBytes": 9,
-      "outputReportBytes": 2,
-      "readOpen": false,
-      "writeOpen": true
-    },
-    {
-      "product": "Function_Device",
-      "usagePage": "0x0001",
-      "usage": "0x0002",
-      "inputReportBytes": 6,
-      "outputReportBytes": 0,
-      "readOpen": false,
-      "writeOpen": true
-    },
-    {
-      "product": "Function_Device",
-      "usagePage": "0x0001",
-      "usage": "0x0080",
-      "inputReportBytes": 2,
-      "outputReportBytes": 0,
-      "readOpen": true,
-      "writeOpen": true
-    },
-    {
-      "product": "Function_Device",
-      "usagePage": "0x000C",
-      "usage": "0x0001",
-      "inputReportBytes": 3,
-      "outputReportBytes": 0,
-      "readOpen": true,
-      "writeOpen": true
-    },
-    {
-      "product": "Function_Device",
-      "usagePage": "0xFF1C",
-      "usage": "0x0092",
-      "inputReportBytes": 64,
-      "outputReportBytes": 64,
-      "readOpen": true,
-      "writeOpen": true,
-      "role": "unverified vendor channel"
-    },
-    {
-      "product": "Function_Device",
-      "usagePage": "0x0001",
-      "usage": "0x0006",
-      "inputReportBytes": 16,
-      "outputReportBytes": 0,
-      "readOpen": false,
-      "writeOpen": true
-    }
-  ],
-  "inputReportBytes": 64,
-  "outputReportBytes": 64,
-  "featureReportBytes": 0,
-  "lcd": {
-    "keyCount": null,
-    "width": null,
-    "height": null,
-    "pixelFormat": null,
-    "writeProtocolVerified": false
-  },
-  "controls": {
-    "lcdKeys": null,
-    "encoders": null,
-    "buttons": null
-  },
-  "oemSoftwareClosedDuringProbe": null,
-  "canOpenFromUserProcess": true,
-  "canReadInputs": null,
-  "canUpdateOneDisplay": null,
-  "evidence": [
-    "artifacts/ajazz-doctor-connected.json",
-    "artifacts/ajazz-input-capture.json",
-    "artifacts/hid-all-connected.json"
-  ],
-  "notes": [
-    "No public evidence currently ties this generic SONiX identity to an AJAZZ AKP03.",
-    "Known AKP03-family devices use other VID/PID and vendor-usage identities.",
-    "A 12-second passive capture completed with no reports.",
-    "No output report was sent because this device and its write protocol are unverified."
-  ]
+    "profileVersion":  1,
+    "status":  "observed",
+    "model":  "Unverified USB HID candidate (generic SONiX identity)",
+    "revision":  "VID_04B4\u0026PID_1007, bcdDevice 1.00",
+    "vendorId":  "0x04B4",
+    "productId":  "0x1007",
+    "firmware":  null,
+    "transport":  "USB",
+    "interfaces":  [
+                       {
+                           "product":  "Game_Keyboard",
+                           "usagePage":  "0x0001",
+                           "usage":  "0x0006",
+                           "inputReportBytes":  9,
+                           "outputReportBytes":  2,
+                           "readOpen":  false,
+                           "writeOpen":  true
+                       },
+                       {
+                           "product":  "Function_Device",
+                           "usagePage":  "0x0001",
+                           "usage":  "0x0002",
+                           "inputReportBytes":  6,
+                           "outputReportBytes":  0,
+                           "readOpen":  false,
+                           "writeOpen":  true
+                       },
+                       {
+                           "product":  "Function_Device",
+                           "usagePage":  "0x0001",
+                           "usage":  "0x0080",
+                           "inputReportBytes":  2,
+                           "outputReportBytes":  0,
+                           "readOpen":  true,
+                           "writeOpen":  true
+                       },
+                       {
+                           "product":  "Function_Device",
+                           "usagePage":  "0x000C",
+                           "usage":  "0x0001",
+                           "inputReportBytes":  3,
+                           "outputReportBytes":  0,
+                           "readOpen":  true,
+                           "writeOpen":  true
+                       },
+                       {
+                           "product":  "Function_Device",
+                           "usagePage":  "0xFF1C",
+                           "usage":  "0x0092",
+                           "inputReportBytes":  64,
+                           "outputReportBytes":  64,
+                           "readOpen":  true,
+                           "writeOpen":  true,
+                           "role":  "unverified vendor channel"
+                       },
+                       {
+                           "product":  "Function_Device",
+                           "usagePage":  "0x0001",
+                           "usage":  "0x0006",
+                           "inputReportBytes":  16,
+                           "outputReportBytes":  0,
+                           "readOpen":  false,
+                           "writeOpen":  true
+                       }
+                   ],
+    "inputReportBytes":  64,
+    "outputReportBytes":  64,
+    "featureReportBytes":  0,
+    "lcd":  {
+                "keyCount":  null,
+                "width":  null,
+                "height":  null,
+                "pixelFormat":  null,
+                "writeProtocolVerified":  false
+            },
+    "controls":  {
+                     "lcdKeys":  null,
+                     "encoders":  null,
+                     "buttons":  null
+                 },
+    "oemSoftwareClosedDuringProbe":  null,
+    "canOpenFromUserProcess":  true,
+    "canReadInputs":  null,
+    "canUpdateOneDisplay":  null,
+    "evidence":  [
+                     "artifacts/ajazz-doctor-connected.json",
+                     "artifacts/ajazz-input-capture.json",
+                     "artifacts/hid-all-connected.json"
+                 ],
+    "notes":  [
+                  "No public evidence currently ties this generic SONiX identity to an AJAZZ AKP03.",
+                  "Known AKP03-family devices use other VID/PID and vendor-usage identities.",
+                  "A 12-second passive capture completed with no reports.",
+                  "No output report was sent because this device and its write protocol are unverified."
+              ]
 }
