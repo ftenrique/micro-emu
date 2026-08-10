@@ -1,9 +1,11 @@
-use serde_json::{json, Value};
+use crate::routing::AgentId;
+use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+pub const DISPLAY_CONTEXT_INSTRUCTIONS: &str = "The RP2040 v.oai.thstatus path updates task cards only; it does not update the dashboard model, effort, weekly_remaining, or five_hour_remaining fields. Call set_display_context with the current live metadata at task start and again whenever any display-context value changes. Standby or test values on the display are not live context.";
 
 pub fn start_input_reader() -> Receiver<Result<Value, String>> {
     let (sender, receiver) = mpsc::channel();
@@ -88,11 +90,42 @@ pub fn tools() -> Value {
             },
             {
                 "name": "set_thread_status",
-                "description": "Update the six AJAZZ LCD status slots using v.oai.thstatus.",
+                "description": "Publish live Codex task/status state to the assigned LCD slots using v.oai.thstatus. The colored numbered cards shown before this call are standby indicators, not task data; call this whenever task status changes. This updates task cards only: call set_display_context separately for live model, effort, and usage metadata. Use bridge_status to see which slots you own.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"status": {"type": "array", "items": {"type": "object"}}},
                     "required": ["status"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "publish_tasks",
+                "description": "Publish the complete live task-card snapshot for this MCP session. This replaces the standby LCD indicators; call it at task start and whenever the task list or progress changes. Task-card updates do not change display-context model, effort, or usage fields; publish those separately with set_display_context.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tasks": {"type": "array", "items": {"type": "object"}}
+                    },
+                    "required": ["tasks"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "set_display_context",
+                "description": "Publish live project/task/model/effort/status/progress and remaining weekly/five-hour usage metadata to the connected device displays. Call this at task start and whenever any display-context value changes; v.oai.thstatus and task-card tools do not update model, effort, or usage. A horizontal Stream Deck + swipe alternates the context and usage screens.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": {"type": ["string", "null"]},
+                        "task": {"type": ["string", "null"]},
+                        "model": {"type": ["string", "null"]},
+                        "effort": {"type": ["string", "null"]},
+                        "status": {"type": ["string", "null"]},
+                        "progress": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+                        "task_id": {"type": ["string", "null"]},
+                        "weekly_remaining": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+                        "five_hour_remaining": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+                    },
                     "additionalProperties": false
                 }
             },
@@ -110,7 +143,8 @@ pub fn tools() -> Value {
                 "name": "device_status",
                 "description": "Request device.status from the RP2040 firmware; the response is consumed by the bridge.",
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-            }
+            },
+            poll_events_tool()
         ]
     })
 }
@@ -125,3 +159,86 @@ pub fn tool_error(message: impl Into<String>) -> Value {
     json!({"isError": true, "content": [{"type": "text", "text": message}]})
 }
 
+/// Returns the tool list filtered for the given agent. `None` means the
+/// agent has not been identified yet (e.g. direct `--mcp` STDIO mode) and
+/// all tools are exposed for backward compatibility.
+pub fn tools_for(agent: Option<AgentId>) -> Value {
+    let all = tools()["tools"].as_array().unwrap_or(&Vec::new()).clone();
+    let filtered: Vec<Value> = all
+        .into_iter()
+        .filter(|tool| {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            tool_available(name, agent)
+        })
+        .collect();
+    json!({"tools": filtered})
+}
+
+pub fn daemon_tools_for(agent: Option<AgentId>) -> Value {
+    let mut result = tools_for(agent);
+    if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.retain(|tool| tool.get("name").and_then(Value::as_str) != Some("set_rgb_config"));
+    }
+    result
+}
+/// Returns true if the given tool is available for the agent.
+pub fn tool_available(name: &str, agent: Option<AgentId>) -> bool {
+    match agent {
+        Some(AgentId::Hermes) => matches!(
+            name,
+            "bridge_status"
+                | "poll_events"
+                | "set_thread_status"
+                | "publish_tasks"
+                | "set_rgb_config"
+        ),
+        Some(AgentId::ZCode) => matches!(
+            name,
+            "bridge_status"
+                | "poll_events"
+                | "set_thread_status"
+                | "publish_tasks"
+                | "set_rgb_config"
+                | "set_display_context"
+        ),
+        // Codex or unknown (legacy --mcp): all tools.
+        _ => true,
+    }
+}
+
+/// The `poll_events` tool definition.
+pub fn poll_events_tool() -> Value {
+    json!({
+        "name": "poll_events",
+        "description": "Drain buffered physical controller events for the calling agent. With timeout_ms > 0, waits up to that many milliseconds for events to arrive (long-poll). Returns an array of events; key events have shape {type:\"key\", key, pressed, ts} and partition change events have shape {type:\"partition\", keys, slots, agents, ts}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "timeout_ms": {"type": "integer", "minimum": 0, "maximum": 25000, "default": 0}
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_guidance_requires_live_display_context_updates() {
+        assert!(DISPLAY_CONTEXT_INSTRUCTIONS.contains("Call set_display_context"));
+        assert!(
+            DISPLAY_CONTEXT_INSTRUCTIONS.contains("whenever any display-context value changes")
+        );
+
+        let tools = tools();
+        let definitions = tools["tools"].as_array().expect("tool definitions");
+        let context_tool = definitions
+            .iter()
+            .find(|tool| tool["name"] == "set_display_context")
+            .expect("set_display_context tool");
+        let description = context_tool["description"].as_str().expect("description");
+        assert!(description.contains("task-card tools do not update model, effort, or usage"));
+    }
+}

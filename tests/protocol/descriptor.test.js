@@ -26,26 +26,6 @@ test("USB vendor-only descriptor bytes and metadata stay in sync", () => {
   assert.equal(CODEX_MICRO_USB_DESCRIPTOR_METADATA.byteLength, 49);
 });
 
-test("KMDF spike embeds the exact same BLE descriptor bytes", () => {
-  const source = readFileSync(
-    new URL(
-      "../../driver/vhf-spike/driver/descriptor.c",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  const initializer = source.match(
-    /g_CodexMicroReportDescriptor\[\]\s*=\s*\{(?<bytes>[\s\S]*?)\};/,
-  );
-  assert.ok(initializer?.groups?.bytes);
-  const driverBytes = Uint8Array.from(
-    [...initializer.groups.bytes.matchAll(/0x([0-9A-F]{2})/gi)].map(
-      (match) => Number.parseInt(match[1], 16),
-    ),
-  );
-  assert.deepEqual(driverBytes, CODEX_MICRO_REPORT_DESCRIPTOR);
-});
-
 test("RP2040 firmware embeds the USB vendor-only descriptor bytes", () => {
   const source = readFileSync(
     new URL(

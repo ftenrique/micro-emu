@@ -1,0 +1,27 @@
+{
+    "name": "micro-emu-streamdeck-plugin",
+    "version": "0.1.0",
+    "description": "Codex Micro emulation controls for Stream Deck, backed by the rp2040-bridge daemon.",
+    "license": "MIT",
+    "type": "module",
+    "scripts": {
+        "build": "rollup -c rollup.config.mjs",
+        "watch": "rollup -c rollup.config.mjs -w",
+        "link": "streamdeck link com.micro-emu.codex.sdPlugin",
+        "pack": "streamdeck pack com.micro-emu.codex.sdPlugin -o ../../artifacts"
+    },
+    "devDependencies": {
+        "@elgato/cli": "^1.7.4",
+        "@elgato/streamdeck": "^2.1.0",
+        "@rollup/plugin-commonjs": "^25.0.8",
+        "@rollup/plugin-node-resolve": "^15.0.0",
+        "@rollup/plugin-typescript": "^11.0.0",
+        "@types/node": "^20.19.43",
+        "rollup": "^4.0.0",
+        "tslib": "^2.6.0",
+        "typescript": "^5.4.0"
+    },
+    "dependencies": {
+        "codex-micro-ajazz": "file:../.."
+    }
+}

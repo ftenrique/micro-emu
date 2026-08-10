@@ -30,8 +30,6 @@ static report_queue_t input_reports;
 static bridge_tx_queue_t bridge_tx;
 static uint16_t next_sequence = 1u;
 static bool boot_log_pending = true;
-static bool usb_reenumerate_pending = false;
-static uint32_t usb_reenumerate_at_ms = 0u;
 
 static bool report_queue_push(
     report_queue_t *queue,
@@ -188,19 +186,6 @@ int main(void)
 
     while (true) {
         tud_task();
-
-        /* Force a fresh PnP arrival after system resume. This clears stale
-         * HID handles in host applications that do not rescan on resume. */
-        if (usb_reenumerate_pending &&
-            (int32_t)(to_ms_since_boot(get_absolute_time()) -
-                usb_reenumerate_at_ms) >= 0) {
-            usb_reenumerate_pending = false;
-            input_reports.count = 0u;
-            tud_disconnect();
-            sleep_ms(100u);
-            tud_connect();
-            bridge_log("usb re-enumerated after resume");
-        }
 
         bridge_rx_poll();
         hid_input_flush();
@@ -452,9 +437,6 @@ void tud_suspend_cb(bool remote_wakeup_enabled)
 void tud_resume_cb(void)
 {
     bridge_log("usb resumed");
-    usb_reenumerate_pending = true;
-    usb_reenumerate_at_ms =
-        to_ms_since_boot(get_absolute_time()) + 250u;
 }
 
 void tud_hid_set_protocol_cb(uint8_t instance, uint8_t protocol)

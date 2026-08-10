@@ -130,6 +130,79 @@ For a firmware-only smoke test without the AJAZZ connected:
 npm run bridge:run -- -- --port COM7 --no-ajazz --listen 120 --emit AG00 --emit-after 10
 ```
 
+## Stream Deck controllers
+
+The bridge can use a Stream Deck directly through its Windows HID interface. Keep the official Stream Deck application closed while the bridge owns the device. AJAZZ remains the default controller, so existing commands do not change.
+
+```powershell
+npm run bridge:run -- -- --port COM7 --controller streamdeck-plus
+npm run bridge:run -- -- --port COM7 --controller streamdeck-plus-xl
+npm run bridge:run -- -- --port COM7 --controller streamdeck-xl
+```
+
+Supported models are Stream Deck + (`0FD9:0084`, 8 keys and 4 dials), Stream Deck + XL (`0FD9:00C6`, 36 keys, 6 dials and a 1200x100 display window), and the original Stream Deck XL (`0FD9:006C`, 32 keys). The first six keys map to `AG00`-`AG05`; auxiliary keys map to `ACT06`-`ACT08`. On Stream Deck + and + XL, dials 0-2 map to the existing radial/encoder events; the remaining dials and touch surfaces are reserved. The + XL display is rotated according to the HID profile and shows the same project/task/model/effort context as the Plus.
+
+On the original XL, keys after index 8 are deliberately reserved except for a fixed virtual layout. Row-major key indices 11/18/19/20/27 form an arrow cross (up/left/send/right/down), while 29/30/31 form a simulated rotor (counter-clockwise/click/clockwise). Key 14 is the microphone/`ACT10` button. These keys reuse the existing Codex `v.oai.rad`/`v.oai.hid` mappings; no new Codex Micro messages are introduced. Reserved keys remain black and emit no events. The bridge draws the Mic and Send-to-Codex icons on these controls and keeps status slots 0-5 driven by `v.oai.thstatus`. On Stream Deck +, the 800x100 touch window renders the optional MCP display context. It is independent from Codex Micro messages and is restored after HID reconnects.
+
+Use the existing MCP server (no second MCP server is needed):
+
+~~~json
+{
+  "project": "micro-emu",
+  "task": "Stream Deck dashboard",
+  "model": "gpt-5",
+  "effort": "high",
+  "status": "working",
+  "progress": 65,
+  "weekly_remaining": 73,
+  "five_hour_remaining": 28
+}
+~~~
+
+Call the set_display_context tool with that object. Omitted or null fields are shown as neutral placeholders; text is truncated to the available window and task bodies/prompts are never inferred or logged.
+On Stream Deck + and + XL, swipe left on the touch strip for resource usage and right for project context. Repeating the same direction is safe. The usage screen shows weekly and five-hour percentages when supplied by the host; otherwise it keeps the active task, status, and progress visible instead of showing empty values.
+Use `--controller none` or the existing `--no-ajazz` alias to run without a physical controller. If more than one matching Stream Deck is connected, select one with `--controller-serial SERIAL`.
+
+### Stream Deck plugin (co-exists with other profiles)
+
+The bridge also ships a standard Elgato Stream Deck plugin that lets Codex Micro controls co-exist with other Stream Deck profiles and plugins. The official Stream Deck application keeps HID ownership; the plugin connects to the bridge daemon over TCP loopback and sends events as a virtual controller. This is the recommended mode when you want to use the Stream Deck app alongside Codex Micro.
+
+The plugin and the direct-HID `--controller streamdeck-*` mode are mutually exclusive per device: the direct-HID mode requires the official app to be closed, while the plugin mode requires it to be running.
+
+**Build and install the plugin:**
+
+```powershell
+npm run plugin:install
+npm run plugin:build
+npm run plugin:link
+```
+
+`plugin:link` symlinks the plugin into the Stream Deck plugins directory for development. For distribution, use `npm run plugin:pack` to produce a `.streamDeckPlugin` package in `artifacts/`.
+
+**Run the daemon:**
+
+```powershell
+npm run bridge:daemon -- --port auto
+```
+
+Or let the plugin autostart the daemon by setting the `MICRO_EMU_BRIDGE_EXE` environment variable to the bridge executable path before launching Stream Deck.
+
+**Available actions:**
+
+| Action | Description |
+|--------|-------------|
+| Agent Button | AG00â€“AG05 â€” select the agent index in settings |
+| Action Button | ACT06â€“ACT08 â€” select the action index and an icon in settings |
+| Task Card | Renders a task-board slot with title and status |
+| Knob | SD+ dial â€” emulates the Codex Micro rotor (`ENC_CW`/`ENC_CC`, press = `ENC_CLK`); touch strip shows task number, project, and shortened name |
+| Crux Horizontal | SD+ dial â€” emulates the crux left/right axis (radial X); press is assignable (default `ACT12` Send); touch strip shows model / effort |
+| Crux Vertical | SD+ dial â€” emulates the crux up/down axis (radial Y); press is assignable (default `ACT10` Mic); touch strip shows 5-hour and weekly usage limits as bars with exact percentages |
+| Mic | ACT10 microphone toggle |
+| Send | ACT12 send-to-Codex |
+| Arrow Key | Virtual arrow/rotor key for keypad-only decks |
+
+All actions reuse the existing Codex Micro `v.oai.hid`/`v.oai.rad` mappings â€” no new protocol messages are introduced.
+
 ## Integrate with Codex through MCP
 
 The bridge includes a local Model Context Protocol (MCP) server over STDIO.
@@ -161,7 +234,9 @@ Use port auto for MCP. The bridge resolves the present VID_303A&PID_8360 CDC
 interface through the existing PnP detector, so a COM-number change after
 reconnecting the RP2040 does not require editing Codex configuration. If the
 CDC session drops, the MCP process keeps its STDIO session open and retries
-discovery and the firmware ping with backoff. After system resume, the firmware briefly re-enumerates the USB device so Codex receives a fresh HID arrival event.
+discovery and the firmware ping with backoff. After system resume, the bridge keeps
+the process alive and retries the CDC and HID handles while Windows restores the
+device.
 The same server can be configured directly in `%USERPROFILE%\.codex\config.toml`
 or in a trusted project-scoped `.codex/config.toml`:
 
@@ -196,16 +271,116 @@ CLI, and IDE extension share the same MCP configuration on the host. Once
 connected, ask Codex to call `bridge_status` first. The bridge exposes these
 tools:
 
-- `bridge_status` — report firmware, serial port, and AJAZZ connection state.
-- `emit_key` — emit a synthetic Codex Micro key press/release.
-- `send_codex_message` — send one Codex Micro JSON message.
-- `set_thread_status` — update the six AJAZZ LCD status slots.
-- `set_rgb_config` — send `v.oai.rgbcfg` configuration.
-- `device_status` — request `device.status` from the RP2040 firmware.
+- `bridge_status` Ã¢â‚¬â€ report firmware, serial port, and AJAZZ connection state.
+- `emit_key` Ã¢â‚¬â€ emit a synthetic Codex Micro key press/release.
+- `send_codex_message` Ã¢â‚¬â€ send one Codex Micro JSON message.
+- `set_thread_status` Ã¢â‚¬â€ update the six AJAZZ LCD status slots.
+- set_display_context â€” update the optional Stream Deck + project/task dashboard.
+- `set_rgb_config` Ã¢â‚¬â€ send `v.oai.rgbcfg` configuration.
+- `device_status` Ã¢â‚¬â€ request `device.status` from the RP2040 firmware.
 
 When Codex owns the MCP process, do not start a second bridge process against
 the same COM port. Close any manually started `bridge:run` process before
 using the MCP configuration.
+
+## Multi-agent daemon (Codex + ZCode + Hermes)
+
+The bridge can run as a **daemon** that owns the hardware once and serves up
+to three agents simultaneously over TCP loopback. Each agent (Codex CLI,
+ZCode ADE, Hermes Desktop Agent) launches a lightweight **STDIO proxy** that
+connects to the daemon. This replaces the single-owner `--mcp` STDIO mode
+when you need multiple agents at the same time.
+
+```text
+AJAZZ / Stream Deck â”€â”€HIDâ”€â”€ bridge daemon â”€â”€CDCâ”€â”€ RP2040 â”€â”€HIDâ”€â”€ ChatGPT
+                                â”‚ (127.0.0.1:48360)
+              â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+      proxy (codex)     proxy (zcode)     proxy (hermes)
+              â”‚                â”‚                  â”‚
+          Codex CLI        ZCode ADE      Hermes Desktop Agent
+```
+
+### Dynamic key partition
+
+The six LCD keys are partitioned **dynamically** based on which agents are
+active. Priority order is **Codex > ZCode > Hermes**.
+
+- **1 agent active**: owns all 6 keys and slots.
+- **2 agents active**: higher-priority agent gets `AG00`-`AG02` / slots 1-3,
+  lower gets `AG03`-`AG05` / slots 4-6.
+- **3 agents active**: column split â€” Codex `AG00`+`AG03`, ZCode `AG01`+`AG04`,
+  Hermes `AG02`+`AG05`.
+
+When the active set changes, the daemon debounces for 750 ms and repartitions.
+Each active agent receives a partition change event via `poll_events`. LCD
+state is retained through repartitions. See the
+[ZCode integration guide](docs/ZCode_integration.md) for the full partition
+matrix and setup instructions.
+
+### Start the daemon
+
+```powershell
+npm run bridge:daemon -- -- --port auto
+```
+
+For standalone mode without the RP2040 (controller only, no ChatGPT HID):
+
+```powershell
+npm run bridge:daemon:standalone
+```
+
+### Register the proxies
+
+**Hermes** (`~/.hermes/config.yaml`):
+
+```yaml
+mcp_servers:
+  micro_emu_bridge:
+    command: "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe"
+    args: ["--mcp-proxy", "--agent", "hermes", "--autostart"]
+```
+
+**ZCode** (Settings â†’ MCP Servers, or `~/.zcode/config.json`):
+
+```json
+{
+  "mcpServers": {
+    "micro_emu_bridge": {
+      "command": "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe",
+      "args": ["--mcp-proxy", "--agent", "zcode", "--autostart"]
+    }
+  }
+}
+```
+
+**Codex** (`.codex/config.toml`):
+
+```toml
+[mcp_servers.micro_emu_bridge]
+command = "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe"
+args = ["--mcp-proxy", "--agent", "codex", "--autostart"]
+cwd = "D:\\Programming\\micro-emu"
+```
+
+The `--autostart` flag makes the proxy spawn the daemon automatically if it
+is not already running. A lockfile in `%LOCALAPPDATA%\micro-emu\bridge-daemon.lock`
+prevents race conditions when multiple proxies start simultaneously. The
+daemon binds only to `127.0.0.1:48360` (configurable with `--bind`).
+
+### Hermes and ZCode tools
+
+Hermes and ZCode see a filtered tool set:
+
+- `bridge_status` â€” report daemon, firmware, controller, and agent state.
+- `poll_events` â€” drain buffered physical key presses for your assigned keys.
+  With `timeout_ms > 0`, waits up to that many milliseconds for events. Also
+  delivers partition change notifications.
+- `set_thread_status` â€” update the LCD slots currently assigned to your agent.
+- `set_rgb_config` â€” send `v.oai.rgbcfg` configuration.
+
+ZCode additionally has access to `set_display_context` (Stream Deck + dashboard
+metadata). Codex retains all existing tools plus `poll_events`.
+
 ## Implemented functionality
 
 - Codex Micro HID reports with Report ID 6 and 63-byte input, output, and
@@ -259,12 +434,14 @@ const press = keyEvent("AG00", 1, 0);
 
 ## Documentation
 
-- [Deployment](DEPLOYMENT.md) — build, flash, run, validate, and publish.
-- [RP2040 bridge details](docs/rp2040-bridge.md) — firmware and transport
+- [RP2040 bridge details](docs/rp2040-bridge.md) Ã¢â‚¬â€ firmware and transport
   architecture.
-- [Hardware profile](docs/hardware-profile.md) — verified AJAZZ interface and
+- [Hermes integration](docs/Hermes_integration.md) - deploy the bridge with
+  the Hermes Desktop Agent (standalone or alongside Codex).
+- [ZCode integration](docs/ZCode_integration.md) - deploy the bridge with
+  ZCode (Z.ai ADE), including the dynamic three-agent partition.
+- [Hardware profile](docs/hardware-profile.md) - verified AJAZZ interface and
   controls.
-- [Windows environment](docs/windows-environment.md) — inventory and system
   diagnostics.
 
 ## Security model
@@ -285,3 +462,16 @@ interoperability information adapted from FreeMicro is attributed in
 Codex, Codex Micro, ChatGPT, AJAZZ, and AKP03 may be trademarks of their
 respective owners. This project is independent and is not endorsed by OpenAI,
 AJAZZ, or the FreeMicro authors.
+
+### Task board and combined controllers
+
+Daemon mode schedules published task instances across every configured controller. Stream Deck+ contributes eight task slots; AJAZZ contributes six; XL devices default to eight and can be overridden. Configure multiple devices with repeatable specs:
+
+```text
+rp2040-bridge.exe --daemon --port auto --device ajazz,serial=AJ-1 --device streamdeck-plus,serial=SD-1
+```
+
+Agents publish a complete snapshot with `publish_tasks` (`task_id`, `title`, `state`, `priority`, `color`, `progress`, and optional `context`). The response includes each task's `{device_id, slot}` assignment or `null` when it overflows. `set_thread_status` remains a six-entry legacy adapter. In daemon mode all eight Stream Deck+ LCD keys select assigned cards; legacy Codex cards still emit their logical `AG00`-`AG05` event after physical reflow.
+
+`bridge_status` version 2 reports sessions, devices, task assignments/overflow, per-device selection, queue depth, and reconnect leases. A proxy hello carries a unique instance id and focus capability. RGB is daemon-managed; `set_rgb_config` is retained for direct/legacy mode only. Disconnected sessions keep task cards in a 30-second reconnect lease so republishing the same stable ids restores them.
+LCD task tiles now show a compact owning-agent label (`codex`, `zcode`, or `hermes`) above a smaller slot number. The color tile and task assignment behavior are unchanged; blank/unassigned tiles remain black.
