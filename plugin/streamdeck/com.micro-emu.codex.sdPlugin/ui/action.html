@@ -2,33 +2,136 @@
 <html lang="en">
 <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="button-config.css" />
     <script src="sdpi-components.js"></script>
 </head>
-<body>
-    <sdpi-item label="Action Index">
-        <sdpi-select setting="index">
-            <option value="6">ACT06</option>
-            <option value="7">ACT07</option>
-            <option value="8">ACT08</option>
+<body data-default-action="micro.act06">
+    <sdpi-item label="Action">
+        <sdpi-select setting="actionId" default="micro.act06">
+            <optgroup label="Codex Micro">
+                <option value="micro.act06" data-icon="action" data-executor="Micro" data-map="act06" data-description="Press the physical ACT06 command. Its meaning remains configurable in Codex Micro.">ACT06</option>
+                <option value="micro.act07" data-icon="action" data-executor="Micro" data-map="act07" data-description="Press the physical ACT07 command. Its meaning remains configurable in Codex Micro.">ACT07</option>
+                <option value="micro.act08" data-icon="action" data-executor="Micro" data-map="act08" data-description="Press the physical ACT08 command. Its meaning remains configurable in Codex Micro.">ACT08</option>
+                <option value="micro.mic" data-icon="mic" data-executor="Micro" data-map="mic" data-description="Press the Codex Micro microphone control (ACT10).">Microphone (ACT10)</option>
+                <option value="micro.send" data-icon="send" data-executor="Micro" data-map="send" data-description="Press the Codex Micro send control (ACT12).">Send (ACT12)</option>
+                <option value="micro.rotor-click" data-icon="rotor" data-executor="Micro" data-map="rotor" data-description="Press the Codex Micro rotor.">Rotor click (ENC_CLK)</option>
+                <option value="micro.rotor-cw" data-icon="clockwise" data-executor="Micro" data-map="rotor" data-description="Turn the Codex Micro rotor one step clockwise.">Rotor clockwise (ENC_CW)</option>
+                <option value="micro.rotor-ccw" data-icon="counter-clockwise" data-executor="Micro" data-map="rotor" data-description="Turn the Codex Micro rotor one step counter-clockwise.">Rotor counter-clockwise (ENC_CC)</option>
+                <option value="micro.up" data-icon="up" data-executor="Micro" data-map="crux" data-description="Move the Codex Micro radial control upward one step.">Navigate up</option>
+                <option value="micro.down" data-icon="down" data-executor="Micro" data-map="crux" data-description="Move the Codex Micro radial control downward one step.">Navigate down</option>
+                <option value="micro.left" data-icon="left" data-executor="Micro" data-map="crux" data-description="Move the Codex Micro radial control left one step.">Navigate left</option>
+                <option value="micro.right" data-icon="right" data-executor="Micro" data-map="crux" data-description="Move the Codex Micro radial control right one step.">Navigate right</option>
+            </optgroup>
+            <optgroup label="Task navigation">
+                <option value="task.previous" data-icon="previous" data-executor="Bridge" data-description="Select the previous occupied Task Card, wrapping at the beginning.">Previous task</option>
+                <option value="task.next" data-icon="next" data-executor="Bridge" data-description="Select the next occupied Task Card, wrapping at the end.">Next task</option>
+                <option value="task.first" data-icon="first" data-executor="Bridge" data-description="Select the first occupied Task Card.">First task</option>
+                <option value="task.last" data-icon="last" data-executor="Bridge" data-description="Select the last occupied Task Card.">Last task</option>
+            </optgroup>
+            <optgroup label="Task lifecycle">
+                <option value="task.open" data-icon="open" data-executor="Codex" data-description="Open and focus the selected Codex task.">Open selected task</option>
+                <option value="task.retry" data-icon="retry" data-executor="Codex" data-description="Replay the selected task's latest prompt as a new Codex turn.">Retry task</option>
+                <option value="task.fork" data-icon="fork" data-executor="Codex" data-description="Fork the selected Codex task and open the new task.">Fork task</option>
+                <option value="task.archive" data-icon="archive" data-executor="Codex" data-description="Archive the selected Codex task.">Archive task</option>
+            </optgroup>
+            <optgroup label="Task interaction">
+                <option value="task.copy-prompt" data-icon="copy-prompt" data-executor="Codex" data-description="Copy the selected Codex task's latest user prompt.">Copy prompt</option>
+                <option value="task.copy-response" data-icon="copy" data-executor="Codex" data-description="Copy the selected Codex task's latest agent response.">Copy last response</option>
+                <option value="task.copy-path" data-icon="clipboard" data-executor="Codex" data-description="Copy the selected Codex task's workspace path.">Copy workspace path</option>
+            </optgroup>
+            <optgroup label="Codex workflow">
+                <option value="agent.new-task" data-icon="new-chat" data-executor="Codex" data-description="Open the Codex new-task screen.">New task</option>
+                <option value="agent.search" data-icon="search" data-executor="Bridge" data-description="Focus Codex and open task search.">Search tasks</option>
+                <option value="agent.review-changes" data-icon="review" data-executor="Codex" data-description="Start a Codex review of uncommitted workspace changes.">Review changes</option>
+                <option value="agent.run-tests" data-icon="tests" data-executor="Codex" data-description="Start a Codex turn that runs and diagnoses the relevant tests.">Run tests</option>
+                <option value="agent.open-terminal" data-icon="terminal" data-executor="Bridge" data-description="Focus Codex and toggle its bottom terminal.">Open terminal</option>
+                <option value="agent.compact-context" data-icon="compact" data-executor="Codex" data-description="Start Codex context compaction for the selected task.">Compact context</option>
+                <option value="agent.settings" data-icon="settings" data-executor="Codex" data-description="Open Codex settings.">Codex settings</option>
+            </optgroup>
         </sdpi-select>
     </sdpi-item>
+
+    <section class="action-summary" aria-live="polite">
+        <div class="summary-heading">
+            <span class="summary-name">ACT06</span>
+            <span class="executor-badge" data-executor="Micro">Micro</span>
+        </div>
+        <p class="summary-description">Press the physical ACT06 command. Its meaning remains configurable in Codex Micro.</p>
+        <p class="summary-route">Automatic icon: <strong class="automatic-icon">Action</strong></p>
+        <p class="legacy-warning" hidden>This profile still uses a legacy AG button. It will keep working, but choose a catalog action to separate it from Task Cards.</p>
+    </section>
+
     <sdpi-item label="Icon">
         <sdpi-select setting="icon">
-            <option value="">Default for index</option>
-            <option value="action">Action (bolt)</option>
-            <option value="send">Send</option>
-            <option value="mic">Mic</option>
-            <option value="stop">Stop</option>
-            <option value="new-chat">New chat</option>
-            <option value="retry">Retry / regenerate</option>
-            <option value="copy">Copy</option>
-            <option value="up">Arrow up</option>
-            <option value="down">Arrow down</option>
-            <option value="left">Arrow left</option>
-            <option value="right">Arrow right</option>
-            <option value="rotor">Rotor</option>
-            <option value="task">Task list</option>
+            <option value="">Automatic for selected action</option>
+            <optgroup label="Codex and tasks">
+                <option value="action">Action / bolt</option><option value="agent">Agent</option>
+                <option value="new-chat">New task</option><option value="task">Task list</option>
+                <option value="open">Open task</option><option value="retry">Retry</option>
+                <option value="stop">Stop</option><option value="fork">Fork</option>
+                <option value="archive">Archive</option><option value="pin">Pin</option>
+                <option value="unpin">Unpin</option><option value="approve">Approve</option>
+                <option value="reject">Reject</option><option value="review">Review</option>
+                <option value="tests">Tests</option><option value="compact">Compact</option>
+                <option value="model">Model</option><option value="sparkles">Sparkles</option>
+                <option value="history">History</option><option value="refresh">Refresh</option>
+            </optgroup>
+            <optgroup label="Navigation and controls">
+                <option value="previous">Previous</option><option value="next">Next</option>
+                <option value="first">First</option><option value="last">Last</option>
+                <option value="up">Arrow up</option><option value="down">Arrow down</option>
+                <option value="left">Arrow left</option><option value="right">Arrow right</option>
+                <option value="clockwise">Clockwise</option><option value="counter-clockwise">Counter-clockwise</option>
+                <option value="rotor">Rotor</option><option value="play">Play</option>
+                <option value="pause">Pause</option><option value="fast">Fast forward</option>
+                <option value="send">Send</option><option value="mic">Microphone</option>
+            </optgroup>
+            <optgroup label="Tools and content">
+                <option value="copy">Copy</option><option value="copy-prompt">Copy prompt</option>
+                <option value="clipboard">Clipboard</option><option value="edit">Edit</option>
+                <option value="search">Search</option><option value="code">Code</option>
+                <option value="terminal">Terminal</option><option value="browser">Browser</option>
+                <option value="settings">Settings</option><option value="home">Home</option>
+                <option value="grid">Grid</option><option value="info">Info</option>
+                <option value="warning">Warning</option><option value="lock">Lock</option>
+                <option value="unlock">Unlock</option><option value="trash">Trash</option>
+            </optgroup>
         </sdpi-select>
     </sdpi-item>
+    <sdpi-item label="Title">
+        <sdpi-textfield setting="title" placeholder="Automatic for selected action" maxlength="24"></sdpi-textfield>
+    </sdpi-item>
+
+    <section class="micro-map" aria-labelledby="map-title">
+        <h2 id="map-title">Codex Micro map</h2>
+        <p>Task Cards own the six task positions. Only direct Micro actions highlight a physical control below.</p>
+        <svg viewBox="0 0 320 318" role="img" aria-labelledby="svg-title svg-desc">
+            <title id="svg-title">Codex Micro task and action map</title>
+            <desc id="svg-desc">Six task cards occupy the top rows. ACT06 through ACT08 and the other physical controls remain available as direct Micro actions.</desc>
+            <rect class="device-shell" x="8" y="6" width="304" height="306" rx="18" />
+            <g class="mapped-key physical" data-map="rotor"><circle cx="50" cy="52" r="31"/><text x="50" y="52">ROTOR</text></g>
+            <g class="task-position"><rect x="88" y="21" width="62" height="62" rx="14"/><text x="119" y="47">TASK</text><text x="119" y="61">1</text></g>
+            <g class="task-position"><rect x="158" y="21" width="62" height="62" rx="14"/><text x="189" y="47">TASK</text><text x="189" y="61">2</text></g>
+            <g class="context-key"><rect x="228" y="21" width="62" height="62" rx="14"/><text x="259" y="52">AUX</text></g>
+
+            <g class="task-position"><rect x="18" y="91" width="62" height="62" rx="14"/><text x="49" y="117">TASK</text><text x="49" y="131">3</text></g>
+            <g class="task-position"><rect x="88" y="91" width="62" height="62" rx="14"/><text x="119" y="117">TASK</text><text x="119" y="131">4</text></g>
+            <g class="task-position"><rect x="158" y="91" width="62" height="62" rx="14"/><text x="189" y="117">TASK</text><text x="189" y="131">5</text></g>
+            <g class="task-position"><rect x="228" y="91" width="62" height="62" rx="14"/><text x="259" y="117">TASK</text><text x="259" y="131">6</text></g>
+
+            <g class="mapped-key physical" data-map="act06"><rect x="18" y="161" width="62" height="62" rx="14"/><text x="49" y="192">ACT06</text></g>
+            <g class="mapped-key physical" data-map="act07"><rect x="88" y="161" width="62" height="62" rx="14"/><text x="119" y="192">ACT07</text></g>
+            <g class="mapped-key physical" data-map="act08"><rect x="158" y="161" width="62" height="62" rx="14"/><text x="189" y="192">ACT08</text></g>
+            <g class="mapped-key physical" data-map="crux"><rect x="228" y="161" width="62" height="62" rx="14"/><text x="259" y="192">CRUX</text></g>
+
+            <g class="context-key"><circle cx="50" cy="266" r="24"/><text x="50" y="266">STATUS</text></g>
+            <g class="mapped-key physical" data-map="mic"><rect x="88" y="235" width="132" height="62" rx="14"/><text x="154" y="266">MIC · ACT10</text></g>
+            <g class="mapped-key physical" data-map="send"><rect x="228" y="235" width="62" height="62" rx="14"/><text x="259" y="266">SEND</text></g>
+        </svg>
+        <p class="map-status" aria-live="polite">ACT06 maps to a physical Micro control.</p>
+    </section>
+    <p class="config-note">Automatic icons and titles follow the selected action. Codex actions execute locally; a key flashes an alert if Codex rejects the request.</p>
+    <script src="action-config.js"></script>
 </body>
 </html>

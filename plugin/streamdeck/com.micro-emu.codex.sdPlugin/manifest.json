@@ -3,16 +3,19 @@
     "Actions": [
         {
             "Icon": "imgs/actions/agent",
-            "Name": "Agent Button",
+            "Name": "Agent Button (Legacy)",
+            "VisibleInActionsList": false,
             "States": [
                 {
                     "Image": "imgs/actions/agent"
                 }
             ],
-            "Tooltip": "Codex Micro agent button (AG00-AG05). Select the agent index in settings.",
+            "Tooltip": "Legacy Agent Button kept for existing profiles. New profiles should use Task Cards for tasks and Action Button for commands.",
             "UUID": "com.micro-emu.codex.agent",
             "PropertyInspectorPath": "ui/agent.html",
-            "Controllers": ["Keypad"]
+            "Controllers": [
+                "Keypad"
+            ]
         },
         {
             "Icon": "imgs/actions/action",
@@ -22,10 +25,12 @@
                     "Image": "imgs/actions/action"
                 }
             ],
-            "Tooltip": "Codex Micro action button (ACT06-ACT08). Select the action index in settings.",
+            "Tooltip": "Catalog-driven Micro, task-navigation, and agent workflow action with automatic icon and title.",
             "UUID": "com.micro-emu.codex.action",
             "PropertyInspectorPath": "ui/action.html",
-            "Controllers": ["Keypad"]
+            "Controllers": [
+                "Keypad"
+            ]
         },
         {
             "Icon": "imgs/actions/task",
@@ -35,15 +40,19 @@
                     "Image": "imgs/actions/task"
                 }
             ],
-            "Tooltip": "Codex Micro task card slot. Renders task title and status from the bridge daemon.",
+            "Tooltip": "Codex task card. Tap to select; hold to show the selected task or minimize Codex.",
             "UUID": "com.micro-emu.codex.task",
             "PropertyInspectorPath": "ui/task.html",
-            "Controllers": ["Keypad"]
+            "Controllers": [
+                "Keypad"
+            ]
         },
         {
             "Icon": "imgs/actions/knob",
             "Name": "Knob",
-            "Controllers": ["Encoder"],
+            "Controllers": [
+                "Encoder"
+            ],
             "Encoder": {
                 "layout": "layouts/canvas.json",
                 "TriggerDescription": {
@@ -63,13 +72,15 @@
         {
             "Icon": "imgs/actions/crux-h",
             "Name": "Crux Horizontal",
-            "Controllers": ["Encoder"],
+            "Controllers": [
+                "Encoder"
+            ],
             "Encoder": {
                 "layout": "layouts/canvas.json",
                 "TriggerDescription": {
                     "Push": "Assignable action (default Send)",
                     "Rotate": "Left / Right",
-                    "Touch": "Assignable action (default Send)"
+                    "Touch": "Cycle model (Sol / Terra / Luna)"
                 }
             },
             "States": [
@@ -77,14 +88,16 @@
                     "Image": "imgs/actions/crux-h"
                 }
             ],
-            "Tooltip": "Codex Micro crux left/right axis. Rotate for radial X; press for an assignable action (default ACT12 Send). Shows model and effort on the touch strip.",
+            "Tooltip": "Codex Micro crux left/right axis. Rotate for radial X; press for an assignable action (default ACT12 Send); tap the strip to cycle Sol, Terra, and Luna. Shows model and effort on the touch strip.",
             "UUID": "com.micro-emu.codex.crux-h",
             "PropertyInspectorPath": "ui/crux-h.html"
         },
         {
             "Icon": "imgs/actions/crux-v",
             "Name": "Crux Vertical",
-            "Controllers": ["Encoder"],
+            "Controllers": [
+                "Encoder"
+            ],
             "Encoder": {
                 "layout": "layouts/canvas.json",
                 "TriggerDescription": {
@@ -112,7 +125,9 @@
             ],
             "Tooltip": "Codex Micro microphone toggle (ACT10).",
             "UUID": "com.micro-emu.codex.mic",
-            "Controllers": ["Keypad"]
+            "Controllers": [
+                "Keypad"
+            ]
         },
         {
             "Icon": "imgs/actions/send",
@@ -124,7 +139,9 @@
             ],
             "Tooltip": "Codex Micro send-to-Codex button (ACT12).",
             "UUID": "com.micro-emu.codex.send",
-            "Controllers": ["Keypad"]
+            "Controllers": [
+                "Keypad"
+            ]
         },
         {
             "Icon": "imgs/actions/arrow",
@@ -137,7 +154,9 @@
             "Tooltip": "Codex Micro virtual arrow key. Select direction in settings; emits encoder turn events like the XL virtual layout.",
             "UUID": "com.micro-emu.codex.arrow",
             "PropertyInspectorPath": "ui/arrow.html",
-            "Controllers": ["Keypad"]
+            "Controllers": [
+                "Keypad"
+            ]
         }
     ],
     "Author": "micro-emu",
@@ -158,7 +177,7 @@
         }
     ],
     "UUID": "com.micro-emu.codex",
-    "Version": "0.1.0.0",
+    "Version": "1.0.0.0",
     "SDKVersion": 3,
     "Software": {
         "MinimumVersion": "6.9"

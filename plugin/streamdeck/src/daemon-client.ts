@@ -109,9 +109,29 @@ export class DaemonClient extends EventEmitter {
         this.connecting = false;
     }
 
-    /** Sends a button event to the daemon. */
+    /** Sends a legacy physical button event to the daemon. */
     sendButton(index: number, pressed: boolean): void {
         this.send({ type: "event", kind: "button", index, pressed });
+    }
+
+    /** Selects a task-board slot without reinterpreting it as a Micro key. */
+    sendTaskButton(index: number, pressed: boolean): void {
+        this.send({ type: "event", kind: "task-button", index, pressed });
+    }
+
+    /** Requests the native Codex window toggle for an occupied task slot. */
+    sendTaskToggle(index: number): void {
+        this.send({ type: "event", kind: "task-toggle", index });
+    }
+
+    /** Sends an explicit Codex Micro key, bypassing task-card routing. */
+    sendMicroKey(key: string, pressed: boolean): void {
+        this.send({ type: "event", kind: "micro-key", key, pressed });
+    }
+
+    /** Sends a stable logical action from the extended action catalog. */
+    sendCatalogAction(action: string): void {
+        this.send({ type: "event", kind: "catalog-action", action });
     }
 
     /** Sends an encoder turn event to the daemon. */
@@ -122,6 +142,11 @@ export class DaemonClient extends EventEmitter {
     /** Sends an encoder button event to the daemon. */
     sendEncoderButton(index: number, pressed: boolean): void {
         this.send({ type: "event", kind: "encoder-button", index, pressed });
+    }
+
+    /** Asks the daemon to advance the selected Codex task to the next featured model. */
+    sendModelCycle(): void {
+        this.send({ type: "event", kind: "model-cycle" });
     }
 
     /** Sends a raw JSON line to the daemon. */

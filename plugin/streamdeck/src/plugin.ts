@@ -10,6 +10,7 @@ import { CruxVerticalAction } from "./actions/crux-vertical";
 import { MicAction } from "./actions/mic";
 import { SendAction } from "./actions/send";
 import { ArrowKeyAction } from "./actions/arrow-key";
+import { CodexActionExecutor } from "./codex-action-executor";
 
 // --- Daemon client setup ---
 // The bridge exe path can be configured via the MICRO_EMU_BRIDGE_EXE
@@ -35,7 +36,8 @@ daemon.on("error", (error: Error) => {
 daemon.on("log", (message: string) => {
     streamDeck.logger.info(message);
 });
-const ctx = new PluginContext(daemon);
+const codex = new CodexActionExecutor((message) => streamDeck.logger.info(message));
+const ctx = new PluginContext(daemon, codex);
 
 // --- Action registration ---
 streamDeck.actions.registerAction(new AgentButtonAction(ctx));

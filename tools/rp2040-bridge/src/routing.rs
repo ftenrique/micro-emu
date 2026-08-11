@@ -124,43 +124,24 @@ impl Partition {
 
     /// Computes the partition for the given active set.
     ///
-    /// - 0 active → no owners (events dropped, LCD state retained).
-    /// - 1 active → that agent owns all 6 keys/slots.
-    /// - 2 active → higher-priority agent gets keys 0-2 / slots 1-3,
-    ///   lower-priority gets keys 3-5 / slots 4-6.
-    /// - 3 active → column split: `owners[i] = AGENTS[i % 3]`, so
-    ///   Codex gets {0, 3}, ZCode gets {1, 4}, Hermes gets {2, 5}.
+    /// Codex always owns the fixed first half (keys 0-2 / slots 1-3).
+    /// ZCode has priority for the fixed second half (keys 3-5 / slots 4-6);
+    /// Hermes uses that same second half only while ZCode is absent. Unused
+    /// halves remain unowned so presses are dropped and cards render off.
     pub fn compute(active: ActiveSet) -> Self {
-        let active_agents = active.iter();
         let mut owners = [None; LCD_SLOTS];
-        match active_agents.len() {
-            0 => {}
-            1 => {
-                let agent = active_agents[0];
-                for owner in owners.iter_mut() {
-                    *owner = Some(agent);
-                }
-            }
-            2 => {
-                let high = active_agents[0];
-                let low = active_agents[1];
-                for i in 0..3 {
-                    owners[i] = Some(high);
-                }
-                for i in 3..6 {
-                    owners[i] = Some(low);
-                }
-            }
-            3 => {
-                for i in 0..6 {
-                    owners[i] = Some(AGENTS[i % 3]);
-                }
-            }
-            _ => unreachable!("at most 3 agents can be active"),
+
+        if active.contains(AgentId::Codex) {
+            owners[..3].fill(Some(AgentId::Codex));
         }
+        if active.contains(AgentId::ZCode) {
+            owners[3..].fill(Some(AgentId::ZCode));
+        } else if active.contains(AgentId::Hermes) {
+            owners[3..].fill(Some(AgentId::Hermes));
+        }
+
         Self { owners }
     }
-
     /// Returns the agent that owns the given key/slot index, if any.
     pub fn owner_of(&self, index: u8) -> Option<AgentId> {
         self.owners.get(index as usize).copied().flatten()
@@ -474,16 +455,17 @@ mod tests {
     }
 
     #[test]
-    fn partition_single_agent_owns_all() {
-        for &agent in &AGENTS {
+    fn single_agents_keep_their_fixed_half() {
+        let codex = Partition::compute(ActiveSet::from_single(AgentId::Codex));
+        assert_eq!(codex.slots_for(AgentId::Codex), vec![0, 1, 2]);
+        assert_eq!(codex.owner_of(3), None);
+
+        for agent in [AgentId::ZCode, AgentId::Hermes] {
             let partition = Partition::compute(ActiveSet::from_single(agent));
-            for i in 0..6 {
-                assert_eq!(partition.owner_of(i), Some(agent));
-            }
-            assert_eq!(partition.slots_for(agent), vec![0, 1, 2, 3, 4, 5]);
+            assert_eq!(partition.slots_for(agent), vec![3, 4, 5]);
+            assert_eq!(partition.owner_of(0), None);
         }
     }
-
     #[test]
     fn partition_two_agents_split_in_half() {
         let mut set = ActiveSet::new();
@@ -499,46 +481,38 @@ mod tests {
     }
 
     #[test]
-    fn partition_two_agents_zcode_hermes() {
+    fn partition_zcode_is_fixed_to_second_half() {
         let mut set = ActiveSet::new();
         set.insert(AgentId::ZCode);
         set.insert(AgentId::Hermes);
         let partition = Partition::compute(set);
-        // ZCode has higher priority, gets 0-2.
-        assert_eq!(partition.slots_for(AgentId::ZCode), vec![0, 1, 2]);
-        assert_eq!(partition.slots_for(AgentId::Hermes), vec![3, 4, 5]);
+        assert_eq!(partition.slots_for(AgentId::ZCode), vec![3, 4, 5]);
+        assert!(partition.slots_for(AgentId::Hermes).is_empty());
+        assert_eq!(partition.owner_of(0), None);
     }
 
     #[test]
-    fn partition_three_agents_column_split() {
+    fn partition_codex_and_zcode_use_fixed_halves() {
         let mut set = ActiveSet::new();
         set.insert(AgentId::Codex);
         set.insert(AgentId::ZCode);
         set.insert(AgentId::Hermes);
         let partition = Partition::compute(set);
-        // Column split: Codex {0,3}, ZCode {1,4}, Hermes {2,5}.
-        assert_eq!(partition.owner_of(0), Some(AgentId::Codex));
-        assert_eq!(partition.owner_of(3), Some(AgentId::Codex));
-        assert_eq!(partition.owner_of(1), Some(AgentId::ZCode));
-        assert_eq!(partition.owner_of(4), Some(AgentId::ZCode));
-        assert_eq!(partition.owner_of(2), Some(AgentId::Hermes));
-        assert_eq!(partition.owner_of(5), Some(AgentId::Hermes));
-        assert_eq!(partition.slots_for(AgentId::Codex), vec![0, 3]);
-        assert_eq!(partition.slots_for(AgentId::ZCode), vec![1, 4]);
-        assert_eq!(partition.slots_for(AgentId::Hermes), vec![2, 5]);
+        assert_eq!(partition.slots_for(AgentId::Codex), vec![0, 1, 2]);
+        assert_eq!(partition.slots_for(AgentId::ZCode), vec![3, 4, 5]);
+        assert!(partition.slots_for(AgentId::Hermes).is_empty());
         assert_eq!(
-            partition.keys_for(AgentId::Codex),
-            vec!["AG00".to_owned(), "AG03".to_owned()]
+            partition.keys_for(AgentId::ZCode),
+            vec!["AG03".to_owned(), "AG04".to_owned(), "AG05".to_owned()]
         );
     }
-
     #[test]
     fn routes_buttons_to_the_right_queue() {
         let partition = Partition::compute(ActiveSet::from_single(AgentId::Codex));
         let mut routing = EventRouting::new();
         routing.route_button(1, true, 100, &partition);
-        routing.route_button(4, true, 200, &partition);
-        assert_eq!(routing.queue(AgentId::Codex).len(), 2);
+        routing.route_button(4, true, 200, &partition); // Reserved for the second half.
+        assert_eq!(routing.queue(AgentId::Codex).len(), 1);
         let events = routing.queue_mut(AgentId::Codex).drain();
         assert_eq!(
             events[0],
@@ -617,43 +591,28 @@ mod tests {
     }
 
     #[test]
-    fn fused_lcd_retains_entries_through_repartition() {
-        // Codex alone paints 6 entries, then ZCode joins and Codex shrinks
-        // to 3 slots. Codex's entries 3-5 are hidden but retained. When
-        // ZCode leaves, Codex's full 6 entries reappear.
-        let codex_alone = Partition::compute(ActiveSet::from_single(AgentId::Codex));
+    fn fused_lcd_keeps_codex_first_half_when_zcode_joins() {
+        let codex_only = Partition::compute(ActiveSet::from_single(AgentId::Codex));
         let mut lcd = FusedLcdState::new();
         let status = json!([
             {"i": 0, "e": 1, "t": "c0"},
             {"i": 1, "e": 1, "t": "c1"},
-            {"i": 2, "e": 1, "t": "c2"},
-            {"i": 3, "e": 1, "t": "c3"},
-            {"i": 4, "e": 1, "t": "c4"},
-            {"i": 5, "e": 1, "t": "c5"}
+            {"i": 2, "e": 1, "t": "c2"}
         ]);
-        lcd.merge_from_agent(AgentId::Codex, &status, &codex_alone)
+        lcd.merge_from_agent(AgentId::Codex, &status, &codex_only)
             .unwrap();
-        let fused = lcd.fused_array(&codex_alone);
-        assert_eq!(fused[5]["t"], "c5");
 
-        // ZCode joins → Codex shrinks to 0-2.
         let mut set = ActiveSet::new();
         set.insert(AgentId::Codex);
         set.insert(AgentId::ZCode);
-        let two = Partition::compute(set);
-        let fused = lcd.fused_array(&two);
+        let fixed = Partition::compute(set);
+        let fused = lcd.fused_array(&fixed);
         assert_eq!(fused[0]["t"], "c0");
-        assert_eq!(fused[3], json!({"e": 0})); // ZCode hasn't painted yet.
-
-        // ZCode leaves → Codex's entries 3-5 reappear.
-        let fused = lcd.fused_array(&codex_alone);
-        assert_eq!(fused[3]["t"], "c3");
-        assert_eq!(fused[4]["t"], "c4");
-        assert_eq!(fused[5]["t"], "c5");
+        assert_eq!(fused[2]["t"], "c2");
+        assert_eq!(fused[3], json!({"e": 0})); // ZCode has not painted.
     }
-
     #[test]
-    fn fused_lcd_column_split_local_indexing() {
+    fn fused_lcd_fixed_codex_zcode_halves_use_local_indexing() {
         let mut set = ActiveSet::new();
         set.insert(AgentId::Codex);
         set.insert(AgentId::ZCode);
@@ -670,8 +629,8 @@ mod tests {
             .unwrap();
         let fused = lcd.fused_array(&partition);
         assert_eq!(fused[0]["t"], "c-a");
-        assert_eq!(fused[3]["t"], "c-b");
-        assert_eq!(fused[1], json!({"e": 0})); // ZCode hasn't painted.
+        assert_eq!(fused[1]["t"], "c-b");
+        assert_eq!(fused[3], json!({"e": 0})); // ZCode has not painted.
     }
 
     #[test]
@@ -720,8 +679,11 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             BufferedEvent::Partition { keys, slots, .. } => {
-                assert_eq!(*keys, vec!["AG01".to_owned(), "AG04".to_owned()]);
-                assert_eq!(*slots, vec![1, 4]);
+                assert_eq!(
+                    *keys,
+                    vec!["AG03".to_owned(), "AG04".to_owned(), "AG05".to_owned()]
+                );
+                assert_eq!(*slots, vec![3, 4, 5]);
             }
             _ => panic!("expected partition event"),
         }

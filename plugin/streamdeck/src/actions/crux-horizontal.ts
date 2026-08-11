@@ -6,6 +6,7 @@
     type DialRotateEvent,
     type DialDownEvent,
     type DialUpEvent,
+    type TouchTapEvent,
     type DialAction,
 } from "@elgato/streamdeck";
 import { PluginContext } from "../context";
@@ -60,6 +61,14 @@ export class CruxHorizontalAction extends SingletonAction<CruxDialSettings> {
 
     onDialUp(ev: DialUpEvent<CruxDialSettings>): void {
         sendClick(this.ctx, ev.payload.settings.click, 0, false);
+    }
+
+    onTouchTap(ev: TouchTapEvent<CruxDialSettings>): void {
+        if (!this.ctx.isConnected()) {
+            ev.action.showAlert();
+            return;
+        }
+        this.ctx.daemon.sendModelCycle();
     }
 
     private refreshAll(): void {

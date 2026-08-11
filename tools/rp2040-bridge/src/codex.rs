@@ -110,11 +110,133 @@ pub fn frame_json(message: &Value) -> Result<Vec<[u8; REPORT_BYTES]>, String> {
     Ok(reports)
 }
 
+/// Stable logical commands exposed by the Stream Deck Action Button catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogAction {
+    TaskPrevious,
+    TaskNext,
+    TaskFirst,
+    TaskLast,
+    TaskOpen,
+    TaskRetry,
+    TaskInterrupt,
+    TaskFork,
+    TaskArchive,
+    TaskPin,
+    TaskUnpin,
+    TaskApprove,
+    TaskReject,
+    TaskCopyPrompt,
+    TaskCopyResponse,
+    TaskCopyPath,
+    AgentNewTask,
+    AgentSearch,
+    AgentReviewChanges,
+    AgentRunTests,
+    AgentOpenTerminal,
+    AgentOpenBrowser,
+    AgentOpenEditor,
+    AgentCompactContext,
+    AgentSettings,
+}
+
+impl CatalogAction {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "task.previous" => Self::TaskPrevious,
+            "task.next" => Self::TaskNext,
+            "task.first" => Self::TaskFirst,
+            "task.last" => Self::TaskLast,
+            "task.open" => Self::TaskOpen,
+            "task.retry" => Self::TaskRetry,
+            "task.interrupt" => Self::TaskInterrupt,
+            "task.fork" => Self::TaskFork,
+            "task.archive" => Self::TaskArchive,
+            "task.pin" => Self::TaskPin,
+            "task.unpin" => Self::TaskUnpin,
+            "task.approve" => Self::TaskApprove,
+            "task.reject" => Self::TaskReject,
+            "task.copy-prompt" => Self::TaskCopyPrompt,
+            "task.copy-response" => Self::TaskCopyResponse,
+            "task.copy-path" => Self::TaskCopyPath,
+            "agent.new-task" => Self::AgentNewTask,
+            "agent.search" => Self::AgentSearch,
+            "agent.review-changes" => Self::AgentReviewChanges,
+            "agent.run-tests" => Self::AgentRunTests,
+            "agent.open-terminal" => Self::AgentOpenTerminal,
+            "agent.open-browser" => Self::AgentOpenBrowser,
+            "agent.open-editor" => Self::AgentOpenEditor,
+            "agent.compact-context" => Self::AgentCompactContext,
+            "agent.settings" => Self::AgentSettings,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskPrevious => "task.previous",
+            Self::TaskNext => "task.next",
+            Self::TaskFirst => "task.first",
+            Self::TaskLast => "task.last",
+            Self::TaskOpen => "task.open",
+            Self::TaskRetry => "task.retry",
+            Self::TaskInterrupt => "task.interrupt",
+            Self::TaskFork => "task.fork",
+            Self::TaskArchive => "task.archive",
+            Self::TaskPin => "task.pin",
+            Self::TaskUnpin => "task.unpin",
+            Self::TaskApprove => "task.approve",
+            Self::TaskReject => "task.reject",
+            Self::TaskCopyPrompt => "task.copy-prompt",
+            Self::TaskCopyResponse => "task.copy-response",
+            Self::TaskCopyPath => "task.copy-path",
+            Self::AgentNewTask => "agent.new-task",
+            Self::AgentSearch => "agent.search",
+            Self::AgentReviewChanges => "agent.review-changes",
+            Self::AgentRunTests => "agent.run-tests",
+            Self::AgentOpenTerminal => "agent.open-terminal",
+            Self::AgentOpenBrowser => "agent.open-browser",
+            Self::AgentOpenEditor => "agent.open-editor",
+            Self::AgentCompactContext => "agent.compact-context",
+            Self::AgentSettings => "agent.settings",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PhysicalEvent {
-    Button { index: u8, pressed: bool },
-    EncoderTurn { index: u8, delta: i8 },
-    EncoderButton { index: u8, pressed: bool },
+    Button {
+        index: u8,
+        pressed: bool,
+    },
+    /// Explicit task-card control from a virtual controller.
+    TaskButton {
+        index: u8,
+        pressed: bool,
+    },
+    /// Long-press request to select/show or minimize the Codex desktop app.
+    TaskToggle {
+        index: u8,
+    },
+    /// Explicit physical Micro command that bypasses task-card routing.
+    MicroButton {
+        index: u8,
+        pressed: bool,
+    },
+    /// Extended logical action that has no physical Micro position.
+    CatalogAction {
+        action: CatalogAction,
+    },
+    /// Advance the selected Codex task through the featured model list.
+    ModelCycle,
+    EncoderTurn {
+        index: u8,
+        delta: i8,
+    },
+    EncoderButton {
+        index: u8,
+        pressed: bool,
+    },
 }
 
 #[derive(Default)]
@@ -126,10 +248,16 @@ pub struct RadialState {
 impl RadialState {
     pub fn event(&mut self, event: PhysicalEvent) -> Option<Value> {
         let (key, action, agent) = match event {
-            PhysicalEvent::Button { index, pressed } if index <= 5 => {
+            PhysicalEvent::Button { index, pressed }
+            | PhysicalEvent::MicroButton { index, pressed }
+                if index <= 5 =>
+            {
                 (format!("AG0{index}"), i32::from(pressed), Some(index))
             }
-            PhysicalEvent::Button { index, pressed } if index <= 8 => {
+            PhysicalEvent::Button { index, pressed }
+            | PhysicalEvent::MicroButton { index, pressed }
+                if index <= 8 =>
+            {
                 (format!("ACT{:02}", index), i32::from(pressed), None)
             }
             PhysicalEvent::EncoderTurn { index: 0, delta } if delta != 0 => {

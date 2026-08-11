@@ -1,0 +1,63 @@
+/** White icon glyphs drawn in a 40x40 coordinate box. */
+const BUTTON_GLYPHS: Record<string, string> = {
+    action: `<path d="M22 4 10 24h8l-4 12 14-18h-8z" fill="#fff"/>`,
+    agent: `<circle cx="20" cy="13" r="7" fill="none" stroke="#fff" stroke-width="3"/><path d="M7 34c1-8 6-12 13-12s12 4 13 12" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>`,
+    send: `<path d="M4 20 34 6 24 36l-6-12z" fill="#fff"/>`,
+    mic: `<rect x="14" y="4" width="12" height="20" rx="6" fill="#fff"/><path d="M8 20a12 12 0 0 0 24 0M20 32v6m-8 0h16" stroke="#fff" stroke-width="3" fill="none"/>`,
+    stop: `<rect x="8" y="8" width="24" height="24" rx="4" fill="#fff"/>`,
+    "new-chat": `<path d="M20 6v28M6 20h28" stroke="#fff" stroke-width="5" stroke-linecap="round"/>`,
+    retry: `<path d="M32 20a12 12 0 1 1-4-9" stroke="#fff" stroke-width="4" fill="none"/><path d="M30 4v8h-8z" fill="#fff"/>`,
+    copy: `<rect x="6" y="6" width="20" height="24" rx="3" fill="none" stroke="#fff" stroke-width="3"/><rect x="14" y="12" width="20" height="24" rx="3" fill="#000" stroke="#fff" stroke-width="3"/>`,
+    up: `<path d="M20 6 34 26h-9v8H15v-8H6z" fill="#fff"/>`,
+    down: `<path d="m20 34-14-20h9V6h10v8h9z" fill="#fff"/>`,
+    left: `<path d="M6 20 26 6v9h8v10h-8v9z" fill="#fff"/>`,
+    right: `<path d="m34 20-20 14v-9H6V15h8V6z" fill="#fff"/>`,
+    rotor: `<circle cx="20" cy="20" r="12" stroke="#fff" stroke-width="4" fill="none" stroke-dasharray="50 12"/><path d="M32 8v8h-8z" fill="#fff"/>`,
+    clockwise: `<path d="M8 17a13 13 0 1 1 2 13" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/><path d="M4 8v11h11z" fill="#fff"/>`,
+    "counter-clockwise": `<path d="M32 17a13 13 0 1 0-2 13" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/><path d="M36 8v11H25z" fill="#fff"/>`,
+    previous: `<path d="M8 7v26M32 8 13 20l19 12z" fill="none" stroke="#fff" stroke-width="4" stroke-linejoin="round"/>`,
+    next: `<path d="M32 7v26M8 8l19 12L8 32z" fill="none" stroke="#fff" stroke-width="4" stroke-linejoin="round"/>`,
+    first: `<path d="M7 7v26m26-25L13 20l20 12z" fill="#fff"/>`,
+    last: `<path d="M33 7v26M7 8l20 12L7 32z" fill="#fff"/>`,
+    task: `<path d="M8 10h6m-6 10h6M8 30h6m4-20h14M18 20h14M18 30h14" stroke="#fff" stroke-width="4" stroke-linecap="round"/>`,
+    approve: `<circle cx="20" cy="20" r="15" fill="none" stroke="#fff" stroke-width="3"/><path d="m12 20 6 6 11-13" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>`,
+    reject: `<circle cx="20" cy="20" r="15" fill="none" stroke="#fff" stroke-width="3"/><path d="m14 14 12 12m0-12L14 26" stroke="#fff" stroke-width="4" stroke-linecap="round"/>`,
+    fork: `<path d="M12 7v16c0 5 4 9 9 9h7M12 14h10c4 0 7-3 7-7" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/><circle cx="12" cy="7" r="4" fill="#fff"/><circle cx="29" cy="7" r="4" fill="#fff"/><circle cx="29" cy="32" r="4" fill="#fff"/>`,
+    fast: `<path d="m5 8 13 12L5 32zm15 0 13 12-13 12z" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/>`,
+    play: `<path d="m11 7 22 13-22 13z" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/>`,
+    pause: `<path d="M11 8h7v24h-7zm12 0h7v24h-7z" fill="#fff"/>`,
+    edit: `<path d="m8 29-1 5 5-1 19-19-4-4zM24 7l4-4 7 7-4 4" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/>`,
+    search: `<circle cx="18" cy="18" r="11" fill="none" stroke="#fff" stroke-width="3"/><path d="m26 26 9 9" stroke="#fff" stroke-width="4" stroke-linecap="round"/>`,
+    browser: `<rect x="5" y="7" width="30" height="26" rx="3" fill="none" stroke="#fff" stroke-width="3"/><path d="M5 14h30M10 10h1m5 0h1" stroke="#fff" stroke-width="3" stroke-linecap="round"/>`,
+    terminal: `<rect x="4" y="6" width="32" height="28" rx="3" fill="none" stroke="#fff" stroke-width="3"/><path d="m10 14 6 6-6 6m10 1h10" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`,
+    code: `<path d="M15 9 6 20l9 11m10-22 9 11-9 11M22 5l-5 30" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`,
+    settings: `<path d="M20 5v5m0 20v5M5 20h5m20 0h5M9 9l4 4m14 14 4 4M31 9l-4 4M13 27l-4 4" stroke="#fff" stroke-width="3" stroke-linecap="round"/><circle cx="20" cy="20" r="7" fill="none" stroke="#fff" stroke-width="3"/>`,
+    home: `<path d="m5 19 15-13 15 13v15H24v-9h-8v9H5z" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/>`,
+    grid: `<rect x="6" y="6" width="10" height="10" rx="2" fill="none" stroke="#fff" stroke-width="3"/><rect x="24" y="6" width="10" height="10" rx="2" fill="none" stroke="#fff" stroke-width="3"/><rect x="6" y="24" width="10" height="10" rx="2" fill="none" stroke="#fff" stroke-width="3"/><rect x="24" y="24" width="10" height="10" rx="2" fill="none" stroke="#fff" stroke-width="3"/>`,
+    info: `<circle cx="20" cy="20" r="15" fill="none" stroke="#fff" stroke-width="3"/><path d="M20 18v10m0-17v1" stroke="#fff" stroke-width="4" stroke-linecap="round"/>`,
+    warning: `<path d="M20 5 36 34H4z" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/><path d="M20 15v9m0 5v1" stroke="#fff" stroke-width="4" stroke-linecap="round"/>`,
+    lock: `<rect x="7" y="18" width="26" height="18" rx="3" fill="none" stroke="#fff" stroke-width="3"/><path d="M13 18v-5a7 7 0 0 1 14 0v5" fill="none" stroke="#fff" stroke-width="3"/>`,
+    unlock: `<rect x="7" y="18" width="26" height="18" rx="3" fill="none" stroke="#fff" stroke-width="3"/><path d="M13 18v-5a7 7 0 0 1 13-4" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>`,
+    archive: `<path d="M6 9h28v8H6zM9 17h22v18H9z" fill="none" stroke="#fff" stroke-width="3"/><path d="M16 23h8" stroke="#fff" stroke-width="3" stroke-linecap="round"/>`,
+    pin: `<path d="m13 6 14 8-4 5 7 7-4 4-7-7-5 4-8-14zM20 28 9 39" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/>`,
+    unpin: `<path d="m13 6 14 8-4 5 7 7-4 4-7-7-5 4-8-14zM20 28 9 39M5 5l30 30" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`,
+    open: `<path d="M6 12h12l4 5h12v18H6z" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/><path d="m19 28 6-6m0 0h-5m5 0v5" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`,
+    "copy-prompt": `<path d="M7 8h20v24H7z" fill="none" stroke="#fff" stroke-width="3"/><path d="M13 14h8m-8 6h8m6-6h6v22H15v-4" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>`,
+    clipboard: `<path d="M12 8h16v28H7V8h5m4-3h8v7h-8z" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/>`,
+    review: `<path d="M6 7h28v21H17l-7 7v-7H6z" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/><path d="m13 18 4 4 9-9" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>`,
+    tests: `<path d="M14 5h12m-9 0v10L8 32c-1 2 0 4 3 4h18c3 0 4-2 3-4l-9-17V5" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/><path d="M12 28h16" stroke="#fff" stroke-width="3"/>`,
+    compact: `<path d="M7 11h26M7 20h20M7 29h14" stroke="#fff" stroke-width="4" stroke-linecap="round"/><path d="m29 25 5 5-5 5" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`,
+    history: `<path d="M8 10v9h9M9 19a12 12 0 1 0 3-8" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 13v8l6 4" stroke="#fff" stroke-width="3" stroke-linecap="round"/>`,
+    refresh: `<path d="M32 18A12 12 0 1 0 29 29M32 8v10H22" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>`,
+    sparkles: `<path d="m20 4 3 10 10 3-10 3-3 10-3-10-10-3 10-3zM31 27l2 5 5 2-5 2-2 5-2-5-5-2 5-2z" fill="#fff"/>`,
+    model: `<path d="m20 5 14 8-14 8-14-8zM6 20l14 8 14-8M6 27l14 8 14-8" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/>`,
+    trash: `<path d="M8 11h24M15 6h10l2 5M12 11l2 25h12l2-25M17 17v13m6-13v13" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`,
+};
+
+/** Renders a black key face with one large icon; Stream Deck supplies the title. */
+export function renderControlKeyImage(icon: string, connected = true): string {
+    const glyph = BUTTON_GLYPHS[icon] ?? BUTTON_GLYPHS.action;
+    const opacity = connected ? 1 : 0.35;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144"><rect width="144" height="144" fill="#000"/><g transform="translate(32 20) scale(2)" opacity="${opacity}">${glyph}</g></svg>`;
+    return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+}

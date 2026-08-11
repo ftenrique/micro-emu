@@ -2,18 +2,75 @@
 <html lang="en">
 <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="button-config.css" />
     <script src="sdpi-components.js"></script>
 </head>
-<body>
-    <sdpi-item label="Agent Index">
-        <sdpi-select setting="index">
-            <option value="0">AG00</option>
-            <option value="1">AG01</option>
-            <option value="2">AG02</option>
-            <option value="3">AG03</option>
-            <option value="4">AG04</option>
-            <option value="5">AG05</option>
+<body data-default-index="0">
+    <sdpi-item label="Micro button">
+        <sdpi-select setting="index" default="0" value-type="number">
+            <optgroup label="Agent buttons">
+                <option value="0">AG00</option><option value="1">AG01</option>
+                <option value="2">AG02</option><option value="3">AG03</option>
+                <option value="4">AG04</option><option value="5">AG05</option>
+            </optgroup>
+            <optgroup label="Action buttons">
+                <option value="6">ACT06</option><option value="7">ACT07</option><option value="8">ACT08</option>
+            </optgroup>
         </sdpi-select>
     </sdpi-item>
+    <sdpi-item label="Icon">
+        <sdpi-select setting="icon">
+            <option value="">Default for button</option>
+            <optgroup label="Codex">
+                <option value="agent">Agent</option><option value="action">Action / bolt</option>
+                <option value="new-chat">New chat</option><option value="task">Task list</option>
+                <option value="fork">Fork</option><option value="retry">Retry / regenerate</option>
+                <option value="approve">Approve</option><option value="reject">Reject</option>
+                <option value="edit">Edit</option><option value="copy">Copy</option>
+                <option value="search">Search</option><option value="code">Code</option>
+                <option value="terminal">Terminal</option><option value="browser">Browser</option>
+            </optgroup>
+            <optgroup label="Controls">
+                <option value="send">Send</option><option value="mic">Microphone</option>
+                <option value="play">Play</option><option value="pause">Pause</option>
+                <option value="stop">Stop</option><option value="fast">Fast forward</option>
+                <option value="up">Arrow up</option><option value="down">Arrow down</option>
+                <option value="left">Arrow left</option><option value="right">Arrow right</option>
+                <option value="rotor">Rotor</option><option value="grid">Grid</option>
+                <option value="home">Home</option><option value="settings">Settings</option>
+                <option value="info">Info</option><option value="warning">Warning</option>
+                <option value="lock">Lock</option><option value="unlock">Unlock</option>
+            </optgroup>
+        </sdpi-select>
+    </sdpi-item>
+
+    <section class="micro-map" aria-labelledby="map-title">
+        <h2 id="map-title">Codex Micro button map</h2>
+        <p>Each code maps to this position on the Micro device.</p>
+        <svg viewBox="0 0 320 318" role="img" aria-labelledby="svg-title svg-desc">
+            <title id="svg-title">Codex Micro physical button map</title>
+            <desc id="svg-desc">Agent buttons occupy the top two rows. Action buttons occupy the left three positions of row three.</desc>
+            <rect class="device-shell" x="8" y="6" width="304" height="306" rx="18" />
+            <g class="context-key"><circle cx="50" cy="52" r="31"/><text x="50" y="52">DIAL</text></g>
+            <g class="mapped-key agent" data-index="0"><rect x="88" y="21" width="62" height="62" rx="14"/><text x="119" y="52">AG00</text></g>
+            <g class="mapped-key agent" data-index="1"><rect x="158" y="21" width="62" height="62" rx="14"/><text x="189" y="52">AG01</text></g>
+            <g class="context-key"><rect x="228" y="21" width="62" height="62" rx="14"/><text x="259" y="52">AUX</text></g>
+            <g class="mapped-key agent" data-index="2"><rect x="18" y="91" width="62" height="62" rx="14"/><text x="49" y="122">AG02</text></g>
+            <g class="mapped-key agent" data-index="3"><rect x="88" y="91" width="62" height="62" rx="14"/><text x="119" y="122">AG03</text></g>
+            <g class="mapped-key agent" data-index="4"><rect x="158" y="91" width="62" height="62" rx="14"/><text x="189" y="122">AG04</text></g>
+            <g class="mapped-key agent" data-index="5"><rect x="228" y="91" width="62" height="62" rx="14"/><text x="259" y="122">AG05</text></g>
+            <g class="mapped-key action" data-index="6"><rect x="18" y="161" width="62" height="62" rx="14"/><text x="49" y="192">ACT06</text></g>
+            <g class="mapped-key action" data-index="7"><rect x="88" y="161" width="62" height="62" rx="14"/><text x="119" y="192">ACT07</text></g>
+            <g class="mapped-key action" data-index="8"><rect x="158" y="161" width="62" height="62" rx="14"/><text x="189" y="192">ACT08</text></g>
+            <g class="context-key"><rect x="228" y="161" width="62" height="62" rx="14"/><text x="259" y="192">CRUX</text></g>
+            <g class="context-key"><circle cx="50" cy="266" r="24"/><text x="50" y="266">STATUS</text></g>
+            <g class="context-key"><rect x="88" y="235" width="132" height="62" rx="14"/><text x="154" y="266">MIC</text></g>
+            <g class="context-key"><rect x="228" y="235" width="62" height="62" rx="14"/><text x="259" y="266">SEND</text></g>
+        </svg>
+        <p class="map-status" aria-live="polite">AG00 selected</p>
+    </section>
+    <p class="config-note">Legacy profile instance. The icon is visual only; assign behavior in Codex and use Stream Deck's Title field for the label.</p>
+    <script src="button-config.js"></script>
 </body>
 </html>

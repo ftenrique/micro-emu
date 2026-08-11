@@ -1,5 +1,7 @@
 mod ajazz;
 mod codex;
+mod codex_state;
+mod codex_window;
 mod controller;
 mod daemon;
 mod mcp;
@@ -12,7 +14,9 @@ mod tasks;
 mod wire;
 mod zcode_state;
 
-use crate::codex::{CodexDecoder, RadialState, frame_json, messages_for_synthetic_key};
+use crate::codex::{
+    CatalogAction, CodexDecoder, RadialState, frame_json, messages_for_synthetic_key,
+};
 use crate::controller::{ControllerKind, DeviceSpec, DisplayContext, PhysicalController};
 use crate::serial::SerialEvent;
 use crate::streamdeck::connect as connect_streamdeck;
@@ -473,7 +477,10 @@ impl BridgeRuntime {
     }
 }
 
-fn connection_default_cards(slot_count: usize) -> Vec<Value> {
+fn connection_default_cards(
+    slot_count: usize,
+    partition: Option<&crate::routing::Partition>,
+) -> Vec<Value> {
     const COLORS: [u32; 8] = [
         0x1565c0, 0x00897b, 0x6a1b9a, 0xef6c00, 0x2e7d32, 0xad1457, 0x0277bd, 0x5d4037,
     ];
@@ -483,14 +490,23 @@ fn connection_default_cards(slot_count: usize) -> Vec<Value> {
     // when Codex is assigned only six logical slots.
     (0..8)
         .map(|id| {
-            let enabled = id < active_slots;
-            json!({
+            let owner = partition.and_then(|partition| partition.owner_of(id as u8));
+            let enabled = if partition.is_some() {
+                owner.is_some()
+            } else {
+                id < active_slots
+            };
+            let mut card = json!({
                 "id": id,
                 "e": u8::from(enabled),
                 "c": COLORS[id],
-                "b": if enabled { 0.70 } else { 0.0 },
-                "agent": "codex"
-            })
+                "status": "idle",
+                "b": if enabled { 0.70 } else { 0.0 }
+            });
+            if let Some(owner) = owner {
+                card["agent"] = json!(owner.as_str());
+            }
+            card
         })
         .collect()
 }
@@ -499,7 +515,8 @@ fn connection_default_context() -> DisplayContext {
     DisplayContext {
         project: Some("MICRO-EMU".to_owned()),
         task: Some("BRIDGE".to_owned()),
-        model: Some("CODEX".to_owned()),
+        // Standby state belongs to the bridge, not any particular agent.
+        model: None,
         effort: Some("LIVE".to_owned()),
         status: Some("READY".to_owned()),
         progress: Some(0),
@@ -522,17 +539,12 @@ fn desired_primary_cards(bridge: &BridgeRuntime) -> Vec<Value> {
                 bridge.fused_lcd.fused_array(&bridge.partition)
             }
         } else {
-            connection_default_cards(
-                bridge
-                    .partition
-                    .slots_for(crate::routing::AgentId::Codex)
-                    .len(),
-            )
+            connection_default_cards(bridge.task_slot_count, Some(&bridge.partition))
         }
     } else if bridge.has_explicit_task_state || bridge.last_thread_status.is_some() {
         bridge.fused_lcd.fused_array(&bridge.partition)
     } else {
-        connection_default_cards(bridge.task_slot_count)
+        connection_default_cards(bridge.task_slot_count, None)
     }
 }
 
@@ -541,15 +553,12 @@ fn display_context_for_controller(
     context: &DisplayContext,
     device_id: &str,
 ) -> DisplayContext {
-    let Some(slot) = bridge.task_board.selected_slot(device_id) else {
-        return context.clone();
-    };
-    let Some(task) = context.task.as_deref() else {
-        return context.clone();
-    };
-    let mut rendered = context.clone();
-    rendered.task = Some(crate::tasks::display_task_title(slot, task));
-    rendered
+    bridge
+        .task_board
+        .selected_display_context(device_id)
+        .and_then(|value| DisplayContext::from_value(&value).ok())
+        .map(|selected| overlay_display_context(context, selected))
+        .unwrap_or_else(|| context.clone())
 }
 
 fn desired_context(bridge: &BridgeRuntime) -> Option<DisplayContext> {
@@ -563,82 +572,48 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
     if bridge.has_explicit_display_context {
         return;
     }
-    // Read model and effort from the Codex CLI config.
-    let (model, effort) = read_codex_config();
-    // Read project (cwd) from the most recent Codex session file.
-    let project = read_latest_codex_session_cwd();
-    // Fetch live usage (5-hour and weekly remaining) from the ChatGPT API.
+    let (fallback_model, fallback_effort) = read_codex_config();
+    let fallback_project = read_latest_codex_session_cwd();
     let (five_hour_remaining, weekly_remaining) = fetch_codex_usage();
 
-    // Find the first enabled task across all devices for status.
-    // Find the first enabled task across all devices for status.  Prefer the
-    // currently selected task (the one the user last pressed), falling back to
-    // the lowest-slot non-completed task.
-    let mut best: Option<(&str, usize, u32)> = None;
-    for task in bridge.task_board.tasks() {
-        if task.state == crate::tasks::TaskState::Completed {
-            continue;
-        }
-        let Some(ref assignment) = bridge.task_board.assignment(&task.task_id) else {
-            continue;
-        };
-        let color = task.color.unwrap_or_else(|| task.state.display_color());
-        let slot = assignment.slot.slot;
-        if best.is_none() || slot < best.as_ref().unwrap().1 {
-            best = Some((task.task_id.as_str(), slot, color));
-        }
-    }
+    let selected = bridge.task_board.selected_task().or_else(|| {
+        bridge
+            .task_board
+            .tasks()
+            .filter(|task| task.state != crate::tasks::TaskState::Completed)
+            .min_by_key(|task| {
+                bridge
+                    .task_board
+                    .assignment(&task.task_id)
+                    .map(|assignment| assignment.slot.slot)
+                    .unwrap_or(usize::MAX)
+            })
+    });
 
-    let (status, task_id, task_label, progress, context_model, context_effort) =
-        if let Some((task_id, slot, color)) = best {
-            // Extract everything we need from the task while holding only an
-            // immutable borrow, before the mutable `select()` below.
-            let task = bridge.task_board.tasks().find(|t| t.task_id == task_id);
-            let title = task
-                .map(|t| t.title.clone())
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| format!("Task {}", slot + 1));
-            let progress = task.and_then(|t| t.progress);
-            let context = task.map(|t| t.context.clone()).unwrap_or(Value::Null);
-            let ctx_model = context
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or(model);
-            let ctx_effort = context
-                .get("effort")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or(effort);
-            let task_id_owned = task_id.to_owned();
-            let device_id = bridge
-                .task_board
-                .assignment(task_id)
-                .map(|a| a.slot.device_id.clone())
-                .unwrap_or_default();
-            let _ = bridge.task_board.select(&device_id, slot, now_ms());
-            (
-                color_to_status(color).to_owned(),
-                Some(task_id_owned),
-                Some(title),
-                progress,
-                ctx_model,
-                ctx_effort,
-            )
-        } else {
-            ("idle".to_owned(), None, None, None, model, effort)
-        };
-
-    let context = DisplayContext {
-        project,
-        task: task_label,
-        model: context_model,
-        effort: context_effort,
-        status: Some(status),
-        progress,
-        task_id,
-        weekly_remaining,
-        five_hour_remaining,
+    let context = if let Some(task) = selected {
+        DisplayContext {
+            project: task.project.clone().or(fallback_project),
+            task: (!task.title.is_empty()).then(|| task.title.clone()),
+            model: task.model.clone().or(fallback_model),
+            effort: task.effort.clone().or(fallback_effort),
+            status: Some(task.state.as_str().to_owned()),
+            progress: task.progress,
+            task_id: Some(task.task_id.clone()),
+            weekly_remaining,
+            five_hour_remaining,
+        }
+    } else {
+        DisplayContext {
+            project: fallback_project,
+            task: None,
+            model: fallback_model,
+            effort: fallback_effort,
+            status: Some("idle".to_owned()),
+            progress: None,
+            task_id: None,
+            weekly_remaining,
+            five_hour_remaining,
+        }
     };
     bridge.last_display_context = Some(context);
 }
@@ -649,7 +624,9 @@ fn read_codex_config() -> (Option<String>, Option<String>) {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_default();
-    let config_path = std::path::Path::new(&home).join(".codex").join("config.toml");
+    let config_path = std::path::Path::new(&home)
+        .join(".codex")
+        .join("config.toml");
     let Ok(content) = std::fs::read_to_string(&config_path) else {
         return (None, None);
     };
@@ -658,7 +635,7 @@ fn read_codex_config() -> (Option<String>, Option<String>) {
     let mut in_section = false;
     for line in content.lines() {
         let trimmed = line.trim();
-        // Track whether we're inside a [section] — only parse top-level keys.
+        // Track whether we are inside a [section]; only parse top-level keys.
         if trimmed.starts_with('[') {
             in_section = true;
             continue;
@@ -696,9 +673,7 @@ fn read_latest_codex_session_cwd() -> Option<String> {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_default();
-    let sessions_dir = std::path::Path::new(&home)
-        .join(".codex")
-        .join("sessions");
+    let sessions_dir = std::path::Path::new(&home).join(".codex").join("sessions");
     // Find the most recently modified .jsonl file recursively.
     let latest = find_latest_session_file(&sessions_dir)?;
     let Ok(content) = std::fs::read_to_string(&latest) else {
@@ -802,10 +777,18 @@ fn fetch_codex_usage() -> (Option<u8>, Option<u8>) {
     let mut five_hour: Option<u8> = None;
     let mut weekly: Option<u8> = None;
     for key in &["primary_window", "secondary_window"] {
-        let Some(window) = rate_limit.get(key) else { continue };
-        let Some(seconds) = window.get("limit_window_seconds").and_then(Value::as_u64) else { continue };
-        if seconds == 0 { continue; }
-        let Some(used_percent) = window.get("used_percent").and_then(Value::as_f64) else { continue };
+        let Some(window) = rate_limit.get(key) else {
+            continue;
+        };
+        let Some(seconds) = window.get("limit_window_seconds").and_then(Value::as_u64) else {
+            continue;
+        };
+        if seconds == 0 {
+            continue;
+        }
+        let Some(used_percent) = window.get("used_percent").and_then(Value::as_f64) else {
+            continue;
+        };
         let remaining = (100.0 - used_percent).round().clamp(0.0, 100.0) as u8;
         // <= 24 hours = 5-hour window; >= 3 days = weekly window.
         if seconds <= 24 * 60 * 60 && five_hour.is_none() {
@@ -817,40 +800,28 @@ fn fetch_codex_usage() -> (Option<u8>, Option<u8>) {
     (five_hour, weekly)
 }
 
-fn now_ms() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
-}
-
-/// Maps a thstatus color to a status string, matching the HID palette.
-fn color_to_status(color: u32) -> &'static str {
-    match color {
-        0x1565c0 => "working",
-        0x6a1b9a => "thinking",
-        0xef6c00 => "waiting",
-        0xb71c1c => "error",
-        0x2e7d32 => "done",
-        0x0277bd => "ready",
-        _ => "idle",
-    }
-}
-
 /// Computes the display context for a specific controller device, looking
 /// up the selected task on that device rather than the primary controller.
 fn desired_context_for_device(bridge: &BridgeRuntime, device_id: &str) -> Option<DisplayContext> {
-    bridge
+    let base = bridge
         .last_display_context
         .clone()
-        .or_else(|| {
-            bridge
-                .task_board
-                .selected_display_context(device_id)
-                .and_then(|value| DisplayContext::from_value(&value).ok())
-        })
-        .or_else(|| Some(connection_default_context()))
-        .map(|context| display_context_for_controller(bridge, &context, device_id))
+        .unwrap_or_else(connection_default_context);
+    Some(display_context_for_controller(bridge, &base, device_id))
+}
+
+fn overlay_display_context(base: &DisplayContext, selected: DisplayContext) -> DisplayContext {
+    DisplayContext {
+        project: selected.project.or_else(|| base.project.clone()),
+        task: selected.task.or_else(|| base.task.clone()),
+        model: selected.model.or_else(|| base.model.clone()),
+        effort: selected.effort.or_else(|| base.effort.clone()),
+        status: selected.status.or_else(|| base.status.clone()),
+        progress: selected.progress.or(base.progress),
+        task_id: selected.task_id.or_else(|| base.task_id.clone()),
+        weekly_remaining: selected.weekly_remaining.or(base.weekly_remaining),
+        five_hour_remaining: selected.five_hour_remaining.or(base.five_hour_remaining),
+    }
 }
 
 fn apply_controller_state(
@@ -910,7 +881,7 @@ pub(crate) fn refresh_task_board(bridge: &mut BridgeRuntime) -> Result<(), Strin
                 bridge.fused_lcd.fused_array(&bridge.partition)
             }
         } else {
-            connection_default_cards(slots)
+            connection_default_cards(slots, None)
         };
         let context = desired_context_for_device(bridge, &device_id);
         let result = apply_controller_state(
@@ -1019,7 +990,12 @@ pub(crate) fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
             Ok((serial, firmware, port, sequence)) => (Some(serial), firmware, port, sequence),
             Err(error) if options.port == "auto" => {
                 eprintln!("RP2040 unavailable at startup; continuing without serial: {error}");
-                (None, String::from("disconnected"), String::from("auto"), 1_u16)
+                (
+                    None,
+                    String::from("disconnected"),
+                    String::from("auto"),
+                    1_u16,
+                )
             }
             Err(error) => return Err(error),
         }
@@ -1091,7 +1067,7 @@ pub(crate) fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
     let context = desired_context(&bridge);
     let rgb_config = bridge.last_rgb_config.clone();
     for (_, device, slots) in bridge.aux_controllers.iter_mut() {
-        let cards = connection_default_cards(*slots);
+        let cards = connection_default_cards(*slots, None);
         apply_controller_state(
             device.as_mut(),
             &cards,
@@ -1205,6 +1181,9 @@ pub(crate) fn bridge_status(bridge: &BridgeRuntime, mode: &str) -> Value {
             "serial": controller.and_then(|device| device.serial())
         },
         "displayContext": bridge.last_display_context.as_ref().map(DisplayContext::to_value),
+        // Keep the raw six-slot Codex presentation visible for diagnostics.
+        // Task lifecycle remains sourced from rollout events, never colors.
+        "codexPresentation": bridge.last_thread_status,
         "agents": {
             "codex": {
                 "events": bridge.routing.queue(crate::routing::AgentId::Codex).len(),
@@ -1244,6 +1223,234 @@ pub(crate) fn detach_controller_for(bridge: &mut BridgeRuntime, error: &str) {
     detach_controller(bridge, error);
 }
 
+fn route_task_button(
+    bridge: &mut BridgeRuntime,
+    device_id: &str,
+    slot_count: usize,
+    index: u8,
+    pressed: bool,
+    now_ms: u128,
+) -> bool {
+    if !bridge.task_mode || usize::from(index) >= slot_count {
+        return false;
+    }
+    let Some(task) = bridge
+        .task_board
+        .task_at(device_id, usize::from(index))
+        .cloned()
+    else {
+        return false;
+    };
+
+    // Selection is an edge-triggered action. The release belongs only to the
+    // legacy key pair; emitting task_selected twice makes one click execute
+    // twice in agents that act on selection events.
+    if pressed {
+        if let Some(selection) = bridge
+            .task_board
+            .select(device_id, usize::from(index), now_ms)
+        {
+            bridge
+                .pending_task_events
+                .push((task.owner_session, selection));
+        }
+    }
+
+    if let Some(legacy_key) = task.legacy_key.as_deref() {
+        if pressed && task.owner_session == 0 {
+            bridge
+                .task_board
+                .guard_selection_activation(&task.task_id, now_ms);
+        }
+        bridge.pending_task_events.push((
+            task.owner_session,
+            json!({"type":"key","key":legacy_key,"pressed":pressed,"ts":now_ms}),
+        ));
+        if task.owner_session == 0 && bridge.has_serial() {
+            if let Ok(messages) = messages_for_synthetic_key(legacy_key) {
+                let message = if pressed {
+                    messages.first()
+                } else {
+                    messages.last()
+                };
+                if let Some(message) = message {
+                    let _ = bridge.send_codex(message);
+                }
+            }
+        }
+    }
+    true
+}
+fn route_task_toggle(
+    bridge: &mut BridgeRuntime,
+    device_id: &str,
+    slot_count: usize,
+    index: u8,
+    now_ms: u128,
+) -> bool {
+    if !bridge.task_mode || usize::from(index) >= slot_count {
+        return false;
+    }
+    let Some(task) = bridge
+        .task_board
+        .task_at(device_id, usize::from(index))
+        .cloned()
+    else {
+        return false;
+    };
+
+    // Long-press window control is specific to Codex. Other agents retain a
+    // useful long press by treating it as one ordinary task selection.
+    if task.owner_agent != crate::routing::AgentId::Codex {
+        route_task_button(bridge, device_id, slot_count, index, true, now_ms);
+        route_task_button(bridge, device_id, slot_count, index, false, now_ms);
+        return true;
+    }
+
+    match crate::codex_window::is_foreground() {
+        Ok(true) => {
+            if let Err(error) = crate::codex_window::minimize() {
+                eprintln!("Codex window minimize failed: {error}");
+            }
+        }
+        Ok(false) | Err(_) => {
+            // Select before raising the app so the requested task is already
+            // active when the Codex window reaches the foreground.
+            route_task_button(bridge, device_id, slot_count, index, true, now_ms);
+            route_task_button(bridge, device_id, slot_count, index, false, now_ms);
+            if let Err(error) = crate::codex_window::show_and_focus() {
+                eprintln!("Codex window focus failed: {error}");
+            }
+        }
+    }
+    true
+}
+
+fn catalog_target_session(
+    task: Option<&crate::tasks::TaskCard>,
+) -> (usize, crate::routing::AgentId) {
+    let agent = task
+        .map(|task| task.owner_agent)
+        .unwrap_or(crate::routing::AgentId::Codex);
+    let session = match task.map(|task| task.owner_session) {
+        Some(session) if session != 0 && session != crate::daemon::ZCODE_POLL_SESSION => session,
+        _ => crate::daemon::catalog_action_session(agent),
+    };
+    (session, agent)
+}
+
+fn route_catalog_task_navigation(
+    bridge: &mut BridgeRuntime,
+    device_id: &str,
+    action: CatalogAction,
+    now_ms: u128,
+) {
+    let mut slots: Vec<usize> = bridge
+        .task_board
+        .tasks()
+        .filter_map(|task| bridge.task_board.assignment(&task.task_id))
+        .filter(|assignment| assignment.slot.device_id == device_id)
+        .map(|assignment| assignment.slot.slot)
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    if slots.is_empty() {
+        return;
+    }
+
+    let current = bridge.task_board.selected_slot(device_id);
+    let target = match action {
+        CatalogAction::TaskFirst => slots[0],
+        CatalogAction::TaskLast => *slots.last().expect("non-empty slots"),
+        CatalogAction::TaskNext => current
+            .and_then(|slot| slots.iter().copied().find(|candidate| *candidate > slot))
+            .unwrap_or(slots[0]),
+        CatalogAction::TaskPrevious => current
+            .and_then(|slot| {
+                slots
+                    .iter()
+                    .copied()
+                    .rev()
+                    .find(|candidate| *candidate < slot)
+            })
+            .unwrap_or_else(|| *slots.last().expect("non-empty slots")),
+        _ => return,
+    };
+
+    let Some(task) = bridge.task_board.task_at(device_id, target).cloned() else {
+        return;
+    };
+    if let Some(selection) = bridge.task_board.select(device_id, target, now_ms) {
+        let (session, _) = catalog_target_session(Some(&task));
+        bridge.pending_task_events.push((session, selection));
+    }
+}
+
+fn route_catalog_action(
+    bridge: &mut BridgeRuntime,
+    device_id: &str,
+    action: CatalogAction,
+    now_ms: u128,
+) {
+    if matches!(
+        action,
+        CatalogAction::TaskPrevious
+            | CatalogAction::TaskNext
+            | CatalogAction::TaskFirst
+            | CatalogAction::TaskLast
+    ) {
+        route_catalog_task_navigation(bridge, device_id, action, now_ms);
+        return;
+    }
+
+    match action {
+        CatalogAction::AgentSearch => {
+            if let Err(error) = crate::codex_window::search_tasks() {
+                eprintln!("Codex task search failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::AgentOpenTerminal => {
+            if let Err(error) = crate::codex_window::toggle_terminal() {
+                eprintln!("Codex terminal toggle failed: {error}");
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    let task = bridge.task_board.selected_task().cloned();
+    let (session, agent) = catalog_target_session(task.as_ref());
+    bridge.pending_task_events.push((
+        session,
+        json!({
+            "type": "catalog_action",
+            "action": action.as_str(),
+            "agent": agent.as_str(),
+            "task_id": task.as_ref().map(|task| task.task_id.as_str()),
+            "device_id": device_id,
+            "ts": now_ms,
+        }),
+    ));
+}
+
+fn route_model_cycle(bridge: &BridgeRuntime) {
+    let current_model = bridge
+        .task_board
+        .selected_task()
+        .and_then(|task| task.model.as_deref())
+        .or_else(|| {
+            bridge
+                .last_display_context
+                .as_ref()
+                .and_then(|context| context.model.as_deref())
+        });
+    match crate::codex_window::cycle_model(current_model) {
+        Ok(model) => eprintln!("Codex model selected: {model}"),
+        Err(error) => eprintln!("Codex model cycle failed: {error}"),
+    }
+}
+
 pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result<(), String> {
     let result = bridge.controller.as_mut().map(|device| device.poll(25));
     match result {
@@ -1253,47 +1460,60 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
             for event in events {
-                if bridge.task_mode {
-                    if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
-                        if usize::from(index) < bridge.task_slot_count {
-                            if let Some(selection) = bridge.task_board.select(
-                                &bridge.task_device_id,
-                                usize::from(index),
-                                now_ms,
-                            ) {
-                                let owner = selection
-                                    .get("owner_session")
-                                    .and_then(Value::as_u64)
-                                    .unwrap_or(0)
-                                    as usize;
-                                bridge.pending_task_events.push((owner, selection.clone()));
-                                if let Some(legacy_key) =
-                                    selection.get("legacy_key").and_then(Value::as_str)
-                                {
-                                    bridge.pending_task_events.push((owner, json!({"type":"key","key":legacy_key,"pressed":pressed,"ts":now_ms})));
-                                    if owner == 0 && bridge.has_serial() {
-                                        if let Ok(messages) = messages_for_synthetic_key(legacy_key)
-                                        {
-                                            if pressed {
-                                                if let Some(message) = messages.first() {
-                                                    let _ = bridge.send_codex(message);
-                                                }
-                                            } else if let Some(message) = messages.last() {
-                                                let _ = bridge.send_codex(message);
-                                            }
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-                        }
+                if matches!(event, crate::codex::PhysicalEvent::ModelCycle) {
+                    route_model_cycle(bridge);
+                    continue;
+                }
+                if let crate::codex::PhysicalEvent::TaskButton { index, pressed } = event {
+                    let task_device_id = bridge.task_device_id.clone();
+                    let task_slot_count = bridge.task_slot_count;
+                    route_task_button(
+                        bridge,
+                        &task_device_id,
+                        task_slot_count,
+                        index,
+                        pressed,
+                        now_ms,
+                    );
+                    continue;
+                }
+                if let crate::codex::PhysicalEvent::CatalogAction { action } = event {
+                    let task_device_id = bridge.task_device_id.clone();
+                    route_catalog_action(bridge, &task_device_id, action, now_ms);
+                    continue;
+                }
+                if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
+                    let task_device_id = bridge.task_device_id.clone();
+                    let task_slot_count = bridge.task_slot_count;
+                    if route_task_button(
+                        bridge,
+                        &task_device_id,
+                        task_slot_count,
+                        index,
+                        pressed,
+                        now_ms,
+                    ) {
+                        continue;
+                    }
+                    // Empty task cards are inert while task mode is active;
+                    // see route_task_device_events for the rationale.
+                    if bridge.task_mode
+                        && bridge
+                            .controller
+                            .as_ref()
+                            .is_some_and(|device| device.device_id() == task_device_id)
+                        && usize::from(index) < task_slot_count
+                    {
+                        continue;
                     }
                 }
                 // Partition button events by agent based on the current
                 // partition. Codex-owned buttons go to HID when the RP2040
                 // is present, otherwise are buffered for the Codex MCP
                 // session. Non-Codex buttons are always buffered for polling.
-                if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
+                if let crate::codex::PhysicalEvent::Button { index, pressed }
+                | crate::codex::PhysicalEvent::MicroButton { index, pressed } = event
+                {
                     if let Some(owner) = bridge.partition.owner_of(index) {
                         if owner != crate::routing::AgentId::Codex {
                             bridge
@@ -1339,6 +1559,12 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
             Err(error) => {
                 eprintln!("device {device_id} poll failed: {error}");
                 device.shutdown();
+                bridge.task_board.set_device(&device_id, 0, false);
+                if bridge.controller.is_none() && bridge.task_device_id == device_id {
+                    bridge.task_device_id = "none".to_owned();
+                    bridge.task_slot_count = 0;
+                    bridge.task_board.set_slot_owners("none", Vec::new());
+                }
                 continue;
             }
         }
@@ -1359,54 +1585,44 @@ fn route_task_device_events(
         .map(|d| d.as_millis())
         .unwrap_or(0);
     for event in events {
+        if matches!(event, crate::codex::PhysicalEvent::ModelCycle) {
+            route_model_cycle(bridge);
+            continue;
+        }
+        if let crate::codex::PhysicalEvent::TaskToggle { index } = event {
+            route_task_toggle(bridge, device_id, slot_count, index, now_ms);
+            continue;
+        }
+        if let crate::codex::PhysicalEvent::TaskButton { index, pressed } = event {
+            route_task_button(bridge, device_id, slot_count, index, pressed, now_ms);
+            // An explicit Task Card is always inert when no task occupies its
+            // slot. It must never fall through into Micro key routing.
+            continue;
+        }
+        if let crate::codex::PhysicalEvent::CatalogAction { action } = event {
+            route_catalog_action(bridge, device_id, action, now_ms);
+            continue;
+        }
         // A task card gets first refusal while task mode is active. If the
         // slot has no task (or task mode is off), fall through to the normal
         // physical-event mapping so Agent/Action/Mic/Send/Dial keys work too.
-        if bridge.task_mode {
-            if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
-                if usize::from(index) < slot_count {
-                    if let Some(selection) = bridge.task_board.select(
-                        device_id,
-                        usize::from(index),
-                        now_ms,
-                    ) {
-                        let owner = selection
-                            .get("owner_session")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0)
-                            as usize;
-                        bridge.pending_task_events.push((owner, selection));
-                        if let Some(legacy_key) = bridge
-                            .task_board
-                            .task_at(device_id, usize::from(index))
-                            .and_then(|task| task.legacy_key.as_deref())
-                        {
-                            bridge.pending_task_events.push((
-                                owner,
-                                json!({"type":"key","key":legacy_key,"pressed":pressed,"ts":now_ms}),
-                            ));
-                            if owner == 0 && bridge.has_serial() {
-                                if let Ok(messages) = messages_for_synthetic_key(legacy_key) {
-                                    let message = if pressed {
-                                        messages.first()
-                                    } else {
-                                        messages.last()
-                                    };
-                                    if let Some(message) = message {
-                                        let _ = bridge.send_codex(message);
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                }
+        if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
+            if route_task_button(bridge, device_id, slot_count, index, pressed, now_ms) {
+                continue;
+            }
+            // While task mode is on, a button within the task-slot range is a
+            // task card by definition. Pressing an empty card must be inert:
+            // letting it fall through would reinterpret the slot index as a
+            // raw hardware key and emit phantom nav/key events.
+            if bridge.task_mode && usize::from(index) < slot_count {
+                continue;
             }
         }
-
         // Plugin-backed controllers are auxiliary physical controllers. They
         // must share the same partition and HID routing as the primary device.
-        if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
+        if let crate::codex::PhysicalEvent::Button { index, pressed }
+        | crate::codex::PhysicalEvent::MicroButton { index, pressed } = event
+        {
             if let Some(owner) = bridge.partition.owner_of(index) {
                 if owner != crate::routing::AgentId::Codex {
                     bridge
@@ -1715,7 +1931,8 @@ fn call_tool(request: &Value, bridge: &mut BridgeRuntime) -> Value {
             };
             bridge.last_display_context = Some(context.clone());
             bridge.has_explicit_display_context = true;
-            let render_context = display_context_for_controller(bridge, &context, &bridge.task_device_id);
+            let render_context =
+                display_context_for_controller(bridge, &context, &bridge.task_device_id);
             let apply_result = bridge
                 .controller
                 .as_mut()
@@ -1820,7 +2037,7 @@ fn handle_mcp_request(request: Value, bridge: &mut BridgeRuntime) -> Result<(), 
         "initialize" => json!({
             "protocolVersion": mcp::PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": "micro-emu-rp2040-bridge", "version": "0.1.0"},
+            "serverInfo": {"name": "micro-emu-rp2040-bridge", "version": env!("CARGO_PKG_VERSION")},
             "instructions": format!(
                 "Use bridge_status first. The colored numbered LCD cards and READY dashboard are standby indicators until you publish live state. Publish task cards with set_thread_status or publish_tasks. {} Hardware actions target the RP2040 on the configured serial port.",
                 mcp::DISPLAY_CONTEXT_INSTRUCTIONS
@@ -2130,11 +2347,112 @@ mod tests {
     }
 
     #[test]
+    fn task_button_selects_once_per_press_release_pair() {
+        let rendered = Arc::new(Mutex::new(None));
+        let mut bridge = test_bridge(rendered);
+        bridge.task_mode = true;
+        let device_id = bridge.task_device_id.clone();
+        bridge
+            .task_board
+            .set_device(device_id.clone(), bridge.task_slot_count, true);
+        bridge
+            .task_board
+            .publish_legacy_status(
+                9,
+                crate::routing::AgentId::Hermes,
+                &json!([{"i": 0, "e": 1, "t": "Run"}]),
+                1,
+            )
+            .unwrap();
+
+        assert!(route_task_button(&mut bridge, &device_id, 8, 0, true, 2));
+        assert!(route_task_button(&mut bridge, &device_id, 8, 0, false, 3));
+
+        assert_eq!(
+            bridge
+                .pending_task_events
+                .iter()
+                .filter(|(_, event)| event["type"] == "task_selected")
+                .count(),
+            1
+        );
+        assert_eq!(
+            bridge
+                .pending_task_events
+                .iter()
+                .filter(|(_, event)| event["type"] == "key")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn catalog_action_targets_selected_task_owner() {
+        let rendered = Arc::new(Mutex::new(None));
+        let mut bridge = test_bridge(rendered);
+        bridge.task_mode = true;
+        let device_id = bridge.task_device_id.clone();
+        bridge.task_board.set_device(device_id.clone(), 8, true);
+        bridge
+            .task_board
+            .publish_legacy_status(
+                9,
+                crate::routing::AgentId::Hermes,
+                &json!([{"i": 0, "e": 1, "t": "Review"}]),
+                1,
+            )
+            .unwrap();
+        bridge.task_board.select(&device_id, 0, 2).unwrap();
+        bridge.pending_task_events.clear();
+
+        route_catalog_action(&mut bridge, &device_id, CatalogAction::TaskRetry, 3);
+
+        assert_eq!(bridge.pending_task_events.len(), 1);
+        assert_eq!(bridge.pending_task_events[0].0, 9);
+        assert_eq!(bridge.pending_task_events[0].1["type"], "catalog_action");
+        assert_eq!(bridge.pending_task_events[0].1["action"], "task.retry");
+    }
+
+    #[test]
+    fn catalog_task_navigation_wraps_without_emitting_micro_key() {
+        let rendered = Arc::new(Mutex::new(None));
+        let mut bridge = test_bridge(rendered);
+        bridge.task_mode = true;
+        let device_id = bridge.task_device_id.clone();
+        bridge.task_board.set_device(device_id.clone(), 8, true);
+        bridge
+            .task_board
+            .publish_legacy_status(
+                9,
+                crate::routing::AgentId::Hermes,
+                &json!([
+                    {"i": 0, "e": 1, "t": "One"},
+                    {"i": 1, "e": 1, "t": "Two"}
+                ]),
+                1,
+            )
+            .unwrap();
+
+        route_catalog_action(&mut bridge, &device_id, CatalogAction::TaskNext, 2);
+        let first = bridge.task_board.selected_slot(&device_id).unwrap();
+        route_catalog_action(&mut bridge, &device_id, CatalogAction::TaskNext, 3);
+        let second = bridge.task_board.selected_slot(&device_id).unwrap();
+        route_catalog_action(&mut bridge, &device_id, CatalogAction::TaskNext, 4);
+        assert_ne!(first, second);
+        assert_eq!(bridge.task_board.selected_slot(&device_id), Some(first));
+        assert!(
+            bridge
+                .pending_task_events
+                .iter()
+                .all(|(_, event)| event["type"] == "task_selected")
+        );
+    }
+    #[test]
     fn connection_defaults_are_visible_cards() {
-        let cards = connection_default_cards(8);
+        let cards = connection_default_cards(8, None);
         assert_eq!(cards.len(), 8);
         assert!(cards.iter().all(|card| card["e"] == 1));
-        assert!(cards.iter().all(|card| card["agent"] == "codex"));
+        assert!(cards.iter().all(|card| card.get("agent").is_none()));
         assert!(cards.iter().all(|card| card["b"] == 0.70));
     }
 
@@ -2162,7 +2480,7 @@ mod tests {
             .expect("render lock")
             .clone()
             .expect("payload");
-        assert_eq!(payload[0]["agent"], "codex");
+        assert!(payload[0].get("agent").is_none());
         assert_eq!(payload[7]["e"], 1);
     }
 
@@ -2177,9 +2495,13 @@ mod tests {
             ..DisplayContext::default()
         };
         assert_eq!(
-            display_context_for_controller(&no_selection, &raw_context, &no_selection.task_device_id)
-                .task
-                .as_deref(),
+            display_context_for_controller(
+                &no_selection,
+                &raw_context,
+                &no_selection.task_device_id
+            )
+            .task
+            .as_deref(),
             Some("Raw task")
         );
         bridge.task_mode = true;
@@ -2187,19 +2509,12 @@ mod tests {
         bridge
             .task_board
             .set_device(bridge.task_device_id.clone(), 6, true);
-        bridge
-            .task_board
-            .publish_tasks(
-                1,
-                crate::routing::AgentId::Codex,
-                &json!({"tasks": [{
-                    "task_id": "build",
-                    "title": "Build bridge",
-                    "state": "running"
-                }]}),
-                1,
-            )
-            .expect("publish task");
+        bridge.task_board.publish_tasks(
+            1,
+            crate::routing::AgentId::Codex,
+            &json!({"tasks": [{"task_id": "build", "title": "Build bridge", "state": "running"}]}),
+            1,
+        ).expect("publish task");
         bridge
             .task_board
             .select(&bridge.task_device_id, 0, 2)
@@ -2212,7 +2527,7 @@ mod tests {
                 .expect("context lock")
                 .as_ref()
                 .and_then(|context| context.task.as_deref()),
-            Some("1 — Build bridge")
+            Some("1 \u{2014} Build bridge")
         );
 
         let reconnected_context = Arc::new(Mutex::new(None));
@@ -2227,7 +2542,7 @@ mod tests {
                 .expect("context lock")
                 .as_ref()
                 .and_then(|context| context.task.as_deref()),
-            Some("1 — Build bridge")
+            Some("1 \u{2014} Build bridge")
         );
 
         call_set_display_context(&mut bridge, &json!({"task": "Codex refresh"}));
@@ -2237,7 +2552,7 @@ mod tests {
                 .expect("context lock")
                 .as_ref()
                 .and_then(|context| context.task.as_deref()),
-            Some("1 — Codex refresh")
+            Some("1 \u{2014} Build bridge")
         );
         assert_eq!(
             bridge
@@ -2247,9 +2562,8 @@ mod tests {
             Some("Codex refresh")
         );
     }
-
     #[test]
-    fn task_refresh_does_not_replace_mcp_display_context() {
+    fn selected_task_metadata_overrides_global_identity_but_preserves_usage() {
         let rendered = Arc::new(Mutex::new(None));
         let contexts = Arc::new(Mutex::new(None));
         let mut bridge = test_bridge_with_context(rendered, Arc::clone(&contexts));
@@ -2299,8 +2613,8 @@ mod tests {
             .expect("context lock")
             .clone()
             .expect("context");
-        assert_eq!(context.model.as_deref(), Some("gpt-live"));
-        assert_eq!(context.effort.as_deref(), Some("medium"));
+        assert_eq!(context.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(context.effort.as_deref(), Some("high"));
         assert_eq!(context.weekly_remaining, Some(41));
         assert_eq!(context.five_hour_remaining, Some(87));
     }
@@ -2383,8 +2697,8 @@ mod tests {
             .clone()
             .expect("payload");
         let cards = payload.as_array().expect("cards");
-        assert!(cards[..6].iter().all(|card| card["e"] == 1));
-        assert!(cards[6..].iter().all(|card| card["e"] == 0));
+        assert!(cards[..3].iter().all(|card| card["e"] == 1));
+        assert!(cards[3..].iter().all(|card| card["e"] == 0));
     }
     #[test]
     fn standalone_status_render_updates_local_controller() {

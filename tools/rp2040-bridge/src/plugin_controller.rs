@@ -6,7 +6,7 @@
 //! RGB config) is forwarded to the plugin as JSON lines so it can update the
 //! Stream Deck keys/dials.
 
-use crate::codex::PhysicalEvent;
+use crate::codex::{CatalogAction, PhysicalEvent};
 use crate::controller::{ControllerKind, DisplayContext, PhysicalController};
 use serde_json::{Value, json};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -36,6 +36,13 @@ pub struct PluginController {
     task_slots: usize,
     /// Set true when the session socket has closed.
     disconnected: bool,
+    /// Last successfully transmitted state for each render channel. The daemon
+    /// refresh loop is intentionally frequent, so suppressing identical
+    /// payloads here prevents socket and Stream Deck image-update floods.
+    last_task_cards: Option<Value>,
+    last_thread_status: Option<Value>,
+    last_display_context: Option<Value>,
+    last_rgb_config: Option<Value>,
 }
 
 impl PluginController {
@@ -54,6 +61,10 @@ impl PluginController {
             writer,
             task_slots: task_slots.min(MAX_PLUGIN_TASK_SLOTS),
             disconnected: false,
+            last_task_cards: None,
+            last_thread_status: None,
+            last_display_context: None,
+            last_rgb_config: None,
         }
     }
 
@@ -96,6 +107,36 @@ fn parse_event(message: &Value) -> Option<PhysicalEvent> {
                 .unwrap_or(true);
             Some(PhysicalEvent::Button { index, pressed })
         }
+        "task-button" => {
+            let index = message.get("index").and_then(Value::as_u64)? as u8;
+            let pressed = message
+                .get("pressed")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            Some(PhysicalEvent::TaskButton { index, pressed })
+        }
+        "task-toggle" => {
+            let index = message.get("index").and_then(Value::as_u64)? as u8;
+            Some(PhysicalEvent::TaskToggle { index })
+        }
+        "micro-key" => {
+            let key = message.get("key").and_then(Value::as_str)?;
+            let index = match key {
+                "AG00" | "AG01" | "AG02" | "AG03" | "AG04" | "AG05" => key.as_bytes()[3] - b'0',
+                "ACT06" | "ACT07" | "ACT08" => key.as_bytes()[4] - b'0',
+                _ => return None,
+            };
+            let pressed = message
+                .get("pressed")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            Some(PhysicalEvent::MicroButton { index, pressed })
+        }
+        "catalog-action" => {
+            let action = CatalogAction::parse(message.get("action").and_then(Value::as_str)?)?;
+            Some(PhysicalEvent::CatalogAction { action })
+        }
+        "model-cycle" => Some(PhysicalEvent::ModelCycle),
         "encoder-turn" => {
             let index = message.get("index").and_then(Value::as_u64)? as u8;
             let delta = message
@@ -150,36 +191,58 @@ impl PhysicalController for PluginController {
     }
 
     fn apply_task_cards(&mut self, cards: &[Value]) -> Result<(), String> {
+        let cards = Value::Array(cards.to_vec());
+        if self.last_task_cards.as_ref() == Some(&cards) {
+            return Ok(());
+        }
         self.send(json!({
             "type": "render",
             "render": "taskCards",
-            "taskCards": cards,
-        }))
+            "taskCards": &cards,
+        }))?;
+        self.last_task_cards = Some(cards);
+        Ok(())
     }
 
     fn apply_thread_status(&mut self, parameters: &Value) -> Result<(), String> {
+        if self.last_thread_status.as_ref() == Some(parameters) {
+            return Ok(());
+        }
         self.send(json!({
             "type": "render",
             "render": "threadStatus",
             "threadStatus": parameters,
-        }))
+        }))?;
+        self.last_thread_status = Some(parameters.clone());
+        Ok(())
     }
+
     fn apply_rgb_config(&mut self, parameters: &Value) -> Result<(), String> {
+        if self.last_rgb_config.as_ref() == Some(parameters) {
+            return Ok(());
+        }
         self.send(json!({
             "type": "render",
             "render": "rgbConfig",
             "rgbConfig": parameters,
-        }))
+        }))?;
+        self.last_rgb_config = Some(parameters.clone());
+        Ok(())
     }
 
     fn apply_display_context(&mut self, context: &DisplayContext) -> Result<(), String> {
+        let context = context.to_value();
+        if self.last_display_context.as_ref() == Some(&context) {
+            return Ok(());
+        }
         self.send(json!({
             "type": "render",
             "render": "displayContext",
-            "displayContext": context.to_value(),
-        }))
+            "displayContext": &context,
+        }))?;
+        self.last_display_context = Some(context);
+        Ok(())
     }
-
     fn task_slot_count(&self) -> usize {
         self.task_slots
     }
@@ -279,6 +342,61 @@ mod tests {
     }
 
     #[test]
+    fn poll_keeps_task_micro_and_catalog_events_distinct() {
+        let (mut controller, events_tx, _writer_rx) = make_controller(8);
+        events_tx
+            .send(json!({"type":"event","kind":"task-button","index":0,"pressed":true}))
+            .unwrap();
+        events_tx
+            .send(json!({"type":"event","kind":"task-toggle","index":1}))
+            .unwrap();
+        events_tx
+            .send(json!({"type":"event","kind":"micro-key","key":"AG00","pressed":true}))
+            .unwrap();
+        events_tx
+            .send(json!({"type":"event","kind":"catalog-action","action":"task.retry"}))
+            .unwrap();
+        events_tx
+            .send(json!({"type":"event","kind":"model-cycle"}))
+            .unwrap();
+
+        assert_eq!(
+            controller.poll(0).expect("poll"),
+            vec![
+                PhysicalEvent::TaskButton {
+                    index: 0,
+                    pressed: true,
+                },
+                PhysicalEvent::TaskToggle { index: 1 },
+                PhysicalEvent::MicroButton {
+                    index: 0,
+                    pressed: true,
+                },
+                PhysicalEvent::CatalogAction {
+                    action: CatalogAction::TaskRetry,
+                },
+                PhysicalEvent::ModelCycle,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_micro_keys_and_catalog_actions() {
+        assert!(
+            parse_event(&json!({
+                "type":"event", "kind":"micro-key", "key":"AG99", "pressed":true
+            }))
+            .is_none()
+        );
+        assert!(
+            parse_event(&json!({
+                "type":"event", "kind":"catalog-action", "action":"task.delete-forever"
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
     fn poll_translates_encoder_events() {
         let (mut controller, events_tx, _writer_rx) = make_controller(4);
         events_tx
@@ -351,6 +469,40 @@ mod tests {
         assert_eq!(line["displayContext"]["progress"], 50);
     }
 
+    #[test]
+    fn duplicate_render_payloads_are_suppressed() {
+        let (mut controller, _events_tx, writer_rx) = make_controller(4);
+        let cards = vec![json!({"id": 0, "e": 1, "status": "running"})];
+        let status = json!([{"id": 0, "e": 1, "c": 65280}]);
+        let config = json!({"brightness": 80});
+        let context = DisplayContext {
+            project: Some("micro-emu".to_owned()),
+            task: Some("dedupe".to_owned()),
+            model: None,
+            effort: None,
+            status: Some("working".to_owned()),
+            progress: None,
+            task_id: None,
+            weekly_remaining: None,
+            five_hour_remaining: None,
+        };
+
+        controller.apply_task_cards(&cards).unwrap();
+        controller.apply_task_cards(&cards).unwrap();
+        controller.apply_thread_status(&status).unwrap();
+        controller.apply_thread_status(&status).unwrap();
+        controller.apply_rgb_config(&config).unwrap();
+        controller.apply_rgb_config(&config).unwrap();
+        controller.apply_display_context(&context).unwrap();
+        controller.apply_display_context(&context).unwrap();
+
+        let rendered: Vec<Value> = writer_rx.try_iter().collect();
+        assert_eq!(rendered.len(), 4);
+        assert_eq!(rendered[0]["render"], "taskCards");
+        assert_eq!(rendered[1]["render"], "threadStatus");
+        assert_eq!(rendered[2]["render"], "rgbConfig");
+        assert_eq!(rendered[3]["render"], "displayContext");
+    }
     #[test]
     fn poll_returns_error_when_session_closes() {
         let (mut controller, events_tx, _writer_rx) = make_controller(4);

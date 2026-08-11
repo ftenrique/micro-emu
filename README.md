@@ -1,175 +1,33 @@
-# Codex Micro for AJAZZ AKP03
+# Codex Micro Emulator for Stream Deck and AJAZZ AKP03
 
-A working Windows integration that connects an AJAZZ AKP03E to Codex Micro
-through a low-cost RP2040 USB bridge. The project includes the portable
-protocol implementation, the Windows user-space bridge, the RP2040 HID+CDC
-firmware, hardware validation tools, and reproducible build scripts.
+`micro-emu` turns a Stream Deck or an AJAZZ AKP03E into a controller for Codex Micro. It provides a standard Stream Deck plugin for everyday use and an RP2040-backed hardware emulator for the AJAZZ device.
 
-The supported path is:
+The project is aimed at a Windows workstation running Codex/ChatGPT. Its local bridge translates controller input into the existing Codex Micro HID protocol; it does not introduce a new Codex protocol.
 
-```text
-AJAZZ AKP03E  <->  Rust user-space bridge  <->  USB CDC  <->  RP2040
-                                                        <->  USB HID
-                                                        <->  Windows / ChatGPT
-```
+## What it includes
 
-The implementation is operational with an AJAZZ AKP03E revision 2
-(`0300:3002`) and an RP2040 Zero-class board.
-
-## Why a low-cost RP2040 board is required
-
-The RP2040 is the USB adapter between the AJAZZ device and Windows. Its
-firmware presents the Codex Micro HID interface and a CDC channel for the
-user-space bridge, while the bridge handles the AJAZZ vendor HID interface.
-
-This inexpensive board is deliberate:
-
-- Windows uses its built-in HID and USB CDC class drivers.
-- The project does not require a custom kernel-mode driver or a signed driver
-  package.
-- Secure Boot remains enabled and Windows test-signing mode is not required.
-- Firmware updates are reversible through the board's `BOOTSEL` mass-storage
-  mode and affect only the RP2040.
-- The hardware cost is kept low because no dedicated USB controller or custom
-  Windows hardware is needed.
-
-The repository contains an optional driver implementation for compatibility
-research, but it is not required for the working RP2040 path.
-
-## Requirements
-
-- Windows with PowerShell 5.1 or later.
-- Node.js 20 or later.
-- Rust 1.85 or later with Cargo.
-- A low-cost RP2040 Zero or compatible RP2040 board.
-- An AJAZZ AKP03E revision 2 (`0300:3002`) for the physical integration.
-- A USB data cable and approximately 1.3 GiB available on `D:` for the pinned
-  RP2040 toolchain.
-
-No npm dependencies are required.
-
-## Quick start
-
-From a clean checkout:
-
-```powershell
-git clone https://github.com/ftenrique/micro-emu.git
-Set-Location .\micro-emu
-
-npm test
-npm run verify:descriptor
-npm run bridge:test
-npm run bridge:build
-npm run firmware:host-test
-npm run rp2040:setup
-npm run rp2040:check
-npm run rp2040:build
-npm run rp2040:verify
-```
-
-The RP2040 firmware artifact is generated at:
+- **Stream Deck plugin** â€” use Codex Micro controls alongside normal Stream Deck profiles and plugins. The official Stream Deck app keeps ownership of the device while the plugin talks to the local bridge daemon over loopback.
+- **AJAZZ AKP03E emulator** â€” maps the AKP03E's six LCD keys, lower keys, and three encoders to Codex Micro events. An RP2040 Zero presents the required USB HID device to Windows/ChatGPT and connects to the bridge over USB CDC.
+- **Local bridge and MCP server** â€” exposes status, controller input, task cards, and display context to Codex. Daemon mode can coordinate Codex, ZCode, and Hermes simultaneously.
 
 ```text
-firmware\rp2040-zero\build\codex_micro_rp2040_bridge.uf2
+Stream Deck plugin -- TCP loopback --+
+                                     +-- bridge daemon -- USB CDC -- RP2040 -- USB HID -- Codex Micro
+AJAZZ AKP03E ------ vendor HID ------+
 ```
 
-For a single firmware update command, run:
+The Stream Deck plugin is the recommended Stream Deck integration. Direct HID support for Stream Deck hardware also exists, but it requires closing the official Stream Deck app.
 
-```powershell
-npm run firmware:flash
-```
+## Install the Windows release
 
-This runs the host test, builds and verifies the UF2, then flashes it to the
-single connected `RPI-RP2` BOOTSEL volume. Use
-`powershell -File tools/flash-firmware.ps1 -WhatIf` to validate without copying.
+Download `micro-emu-v1.0.0-windows-x64.zip` from the GitHub release, extract it, and double-click `Install.cmd`. The installer does not need administrator access. It installs the bridge under `%LOCALAPPDATA%\micro-emu`, starts it automatically when you sign in, and opens the bundled Stream Deck plugin for confirmation in the Stream Deck app.
 
-To test and build the release bridge, run:
+To remove it, double-click `Uninstall.cmd` from the same extracted folder. The standalone `.streamDeckPlugin` release asset is also available for users who only want to install or update the plugin.
 
-```powershell
-npm run bridge:release
-```
 
-## Flash the RP2040
+## Stream Deck plugin
 
-1. Disconnect the RP2040 board.
-2. Hold `BOOTSEL` while connecting the USB cable.
-3. Wait for the `RPI-RP2` drive to appear.
-4. Run:
-
-   ```powershell
-   npm run rp2040:flash
-   ```
-
-5. Disconnect and reconnect the board normally.
-6. Find the CDC port:
-
-   ```powershell
-   npm run rp2040:port
-   ```
-
-The flash script validates the UF2 image and requires exactly one `RPI-RP2`
-drive before copying. It changes only the firmware on the RP2040 and does not
-modify Windows boot configuration, drivers, or Secure Boot.
-
-## Run the bridge
-
-Close the official AJAZZ software before starting the bridge. Replace `COM7`
-with the port reported by `npm run rp2040:port`:
-
-```powershell
-npm run bridge:run -- -- --port COM7
-```
-
-The bridge opens the AJAZZ vendor collection `MI_00 / FFA0:0001`, translates
-its controls into Codex Micro events, and forwards the protocol through the
-RP2040 HID interface.
-
-For a firmware-only smoke test without the AJAZZ connected:
-
-```powershell
-npm run bridge:run -- -- --port COM7 --no-ajazz --listen 120 --emit AG00 --emit-after 10
-```
-
-## Stream Deck controllers
-
-The bridge can use a Stream Deck directly through its Windows HID interface. Keep the official Stream Deck application closed while the bridge owns the device. AJAZZ remains the default controller, so existing commands do not change.
-
-```powershell
-npm run bridge:run -- -- --port COM7 --controller streamdeck-plus
-npm run bridge:run -- -- --port COM7 --controller streamdeck-plus-xl
-npm run bridge:run -- -- --port COM7 --controller streamdeck-xl
-```
-
-Supported models are Stream Deck + (`0FD9:0084`, 8 keys and 4 dials), Stream Deck + XL (`0FD9:00C6`, 36 keys, 6 dials and a 1200x100 display window), and the original Stream Deck XL (`0FD9:006C`, 32 keys). The first six keys map to `AG00`-`AG05`; auxiliary keys map to `ACT06`-`ACT08`. On Stream Deck + and + XL, dials 0-2 map to the existing radial/encoder events; the remaining dials and touch surfaces are reserved. The + XL display is rotated according to the HID profile and shows the same project/task/model/effort context as the Plus.
-
-On the original XL, keys after index 8 are deliberately reserved except for a fixed virtual layout. Row-major key indices 11/18/19/20/27 form an arrow cross (up/left/send/right/down), while 29/30/31 form a simulated rotor (counter-clockwise/click/clockwise). Key 14 is the microphone/`ACT10` button. These keys reuse the existing Codex `v.oai.rad`/`v.oai.hid` mappings; no new Codex Micro messages are introduced. Reserved keys remain black and emit no events. The bridge draws the Mic and Send-to-Codex icons on these controls and keeps status slots 0-5 driven by `v.oai.thstatus`. On Stream Deck +, the 800x100 touch window renders the optional MCP display context. It is independent from Codex Micro messages and is restored after HID reconnects.
-
-Use the existing MCP server (no second MCP server is needed):
-
-~~~json
-{
-  "project": "micro-emu",
-  "task": "Stream Deck dashboard",
-  "model": "gpt-5",
-  "effort": "high",
-  "status": "working",
-  "progress": 65,
-  "weekly_remaining": 73,
-  "five_hour_remaining": 28
-}
-~~~
-
-Call the set_display_context tool with that object. Omitted or null fields are shown as neutral placeholders; text is truncated to the available window and task bodies/prompts are never inferred or logged.
-On Stream Deck + and + XL, swipe left on the touch strip for resource usage and right for project context. Repeating the same direction is safe. The usage screen shows weekly and five-hour percentages when supplied by the host; otherwise it keeps the active task, status, and progress visible instead of showing empty values.
-Use `--controller none` or the existing `--no-ajazz` alias to run without a physical controller. If more than one matching Stream Deck is connected, select one with `--controller-serial SERIAL`.
-
-### Stream Deck plugin (co-exists with other profiles)
-
-The bridge also ships a standard Elgato Stream Deck plugin that lets Codex Micro controls co-exist with other Stream Deck profiles and plugins. The official Stream Deck application keeps HID ownership; the plugin connects to the bridge daemon over TCP loopback and sends events as a virtual controller. This is the recommended mode when you want to use the Stream Deck app alongside Codex Micro.
-
-The plugin and the direct-HID `--controller streamdeck-*` mode are mutually exclusive per device: the direct-HID mode requires the official app to be closed, while the plugin mode requires it to be running.
-
-**Build and install the plugin:**
+The plugin coexists with other Stream Deck plugins and profiles. Build and link it for development:
 
 ```powershell
 npm run plugin:install
@@ -177,183 +35,73 @@ npm run plugin:build
 npm run plugin:link
 ```
 
-`plugin:link` symlinks the plugin into the Stream Deck plugins directory for development. For distribution, use `npm run plugin:pack` to produce a `.streamDeckPlugin` package in `artifacts/`.
-
-**Run the daemon:**
+Start the bridge daemon:
 
 ```powershell
 npm run bridge:daemon -- --port auto
 ```
 
-Or let the plugin autostart the daemon by setting the `MICRO_EMU_BRIDGE_EXE` environment variable to the bridge executable path before launching Stream Deck.
+For a distributable plugin package, run `npm run plugin:pack`; it writes a `.streamDeckPlugin` file to `artifacts/`.
 
-**Available actions:**
+### Available actions
 
-| Action | Description |
-|--------|-------------|
-| Agent Button | AG00â€“AG05 â€” select the agent index in settings |
-| Action Button | ACT06â€“ACT08 â€” select the action index and an icon in settings |
-| Task Card | Renders a task-board slot with title and status |
-| Knob | SD+ dial â€” emulates the Codex Micro rotor (`ENC_CW`/`ENC_CC`, press = `ENC_CLK`); touch strip shows task number, project, and shortened name |
-| Crux Horizontal | SD+ dial â€” emulates the crux left/right axis (radial X); press is assignable (default `ACT12` Send); touch strip shows model / effort |
-| Crux Vertical | SD+ dial â€” emulates the crux up/down axis (radial Y); press is assignable (default `ACT10` Mic); touch strip shows 5-hour and weekly usage limits as bars with exact percentages |
-| Mic | ACT10 microphone toggle |
-| Send | ACT12 send-to-Codex |
-| Arrow Key | Virtual arrow/rotor key for keypad-only decks |
+| Action | Purpose |
+|---|---|
+| Action Button | Choose a direct Micro control, daemon task-navigation command, or extended agent workflow action |
+| Task Card | Render an assigned task; tap to select, or hold to show/minimize Codex |
+| Knob | Codex Micro encoder turn and press |
+| Crux Horizontal / Vertical | Radial controls with assignable dial presses; tap the horizontal strip to cycle Sol, Terra, and Luna |
+| Mic / Send | `ACT10` microphone and `ACT12` send controls |
+| Arrow Key | Keypad-only directional or virtual-rotor control |
 
-All actions reuse the existing Codex Micro `v.oai.hid`/`v.oai.rad` mappings â€” no new protocol messages are introduced.
+The Action Button property inspector includes a physical Codex Micro map, automatic action-specific icons and titles, and manual overrides. Task Cards, Micro commands, and extended catalog actions use distinct daemon events, so a task slot can never swallow a catalog action. Existing profiles that use the former Agent Button keep working through a hidden compatibility action.
 
-## Integrate with Codex through MCP
+The complete catalog and the adapter event contract are documented in [docs/streamdeck-action-catalog.md](docs/streamdeck-action-catalog.md).
 
-The bridge includes a local Model Context Protocol (MCP) server over STDIO.
-Codex starts the bridge as a child process, sends JSON-RPC messages through
-standard input, and receives tool results through standard output. No HTTP
-server or additional network port is required.
+The daemon renders task status, RGB configuration, and optional display context back to the plugin. On Stream Deck + hardware, the touch strip can show task, project, model, effort, progress, and resource-usage information.
 
-Build the bridge first and identify the RP2040 CDC port:
+## AJAZZ AKP03E hardware emulator
+
+The verified hardware path uses an **AJAZZ AKP03E revision 2** (`0300:3002`) and an RP2040 Zero-class board. The bridge opens the AJAZZ vendor HID collection (`MI_00`, Usage Page `FFA0`, Usage `0001`) and the RP2040 firmware exposes the Codex Micro HID interface plus a CDC channel.
+
+```text
+AJAZZ AKP03E -- vendor HID -- Rust bridge -- USB CDC -- RP2040 -- Codex Micro HID -- Windows / ChatGPT
+```
+
+The RP2040 approach uses Windows' built-in USB class drivers: it requires no kernel driver, driver signing, Secure Boot change, or test-signing mode.
+
+### Build and flash
+
+Requirements: Windows, Node.js 20+, Rust/Cargo, an RP2040 Zero-class board, and an AKP03E for the physical controller path.
 
 ```powershell
+npm test
 npm run bridge:build
+npm run rp2040:setup
+npm run rp2040:build
+npm run rp2040:verify
+```
+
+Put the RP2040 into BOOTSEL mode, then flash it:
+
+```powershell
+npm run rp2040:flash
 npm run rp2040:port
 ```
 
-Register the bridge with Codex CLI. Replace `COM7` and the project path when
-necessary:
+Close the AJAZZ OEM software before running the bridge, then use the detected port (or let the daemon discover it):
 
 ```powershell
-codex mcp add micro-emu-rp2040 `
-  -- npm.cmd --silent --prefix D:\Programming\micro-emu `
-  run bridge:run -- -- --port auto --mcp
+npm run bridge:run -- -- --port COM7
+# or
+npm run bridge:daemon -- --port auto
 ```
 
-The two `--` separators after `bridge:run` are intentional: one is consumed by
-npm and the other is forwarded to the bridge script. The explicit `--mcp` flag
-starts the STDIO MCP transport.
+The AJAZZ LCD keys map to agent buttons, its lower keys map to actions, and its encoders emit the existing radial and encoder events. The bridge can also render six task/status tiles on the AJAZZ displays.
 
-Use port auto for MCP. The bridge resolves the present VID_303A&PID_8360 CDC
-interface through the existing PnP detector, so a COM-number change after
-reconnecting the RP2040 does not require editing Codex configuration. If the
-CDC session drops, the MCP process keeps its STDIO session open and retries
-discovery and the firmware ping with backoff. After system resume, the bridge keeps
-the process alive and retries the CDC and HID handles while Windows restores the
-device.
-The same server can be configured directly in `%USERPROFILE%\.codex\config.toml`
-or in a trusted project-scoped `.codex/config.toml`:
+## Codex MCP setup
 
-```toml
-[mcp_servers.micro_emu_rp2040]
-command = "npm.cmd"
-args = ["--silent", "run", "bridge:run", "--", "--", "--port", "auto", "--mcp"]
-cwd = "D:\\Programming\\micro-emu"
-startup_timeout_sec = 20
-tool_timeout_sec = 60
-enabled = true
-```
-
-If `npm.cmd` is not available in Codex's `PATH`, use the absolute path returned
-by `Get-Command npm.cmd`, or run the compiled bridge directly:
-
-```toml
-[mcp_servers.micro_emu_rp2040]
-command = "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe"
-args = ["--port", "auto", "--mcp"]
-cwd = "D:\\Programming\\micro-emu"
-```
-
-Verify the registration with:
-
-```powershell
-codex mcp list
-```
-
-In the Codex TUI, use `/mcp` to inspect the connected server. The Codex app,
-CLI, and IDE extension share the same MCP configuration on the host. Once
-connected, ask Codex to call `bridge_status` first. The bridge exposes these
-tools:
-
-- `bridge_status` Ã¢â‚¬â€ report firmware, serial port, and AJAZZ connection state.
-- `emit_key` Ã¢â‚¬â€ emit a synthetic Codex Micro key press/release.
-- `send_codex_message` Ã¢â‚¬â€ send one Codex Micro JSON message.
-- `set_thread_status` Ã¢â‚¬â€ update the six AJAZZ LCD status slots.
-- set_display_context â€” update the optional Stream Deck + project/task dashboard.
-- `set_rgb_config` Ã¢â‚¬â€ send `v.oai.rgbcfg` configuration.
-- `device_status` Ã¢â‚¬â€ request `device.status` from the RP2040 firmware.
-
-When Codex owns the MCP process, do not start a second bridge process against
-the same COM port. Close any manually started `bridge:run` process before
-using the MCP configuration.
-
-## Multi-agent daemon (Codex + ZCode + Hermes)
-
-The bridge can run as a **daemon** that owns the hardware once and serves up
-to three agents simultaneously over TCP loopback. Each agent (Codex CLI,
-ZCode ADE, Hermes Desktop Agent) launches a lightweight **STDIO proxy** that
-connects to the daemon. This replaces the single-owner `--mcp` STDIO mode
-when you need multiple agents at the same time.
-
-```text
-AJAZZ / Stream Deck â”€â”€HIDâ”€â”€ bridge daemon â”€â”€CDCâ”€â”€ RP2040 â”€â”€HIDâ”€â”€ ChatGPT
-                                â”‚ (127.0.0.1:48360)
-              â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-      proxy (codex)     proxy (zcode)     proxy (hermes)
-              â”‚                â”‚                  â”‚
-          Codex CLI        ZCode ADE      Hermes Desktop Agent
-```
-
-### Dynamic key partition
-
-The six LCD keys are partitioned **dynamically** based on which agents are
-active. Priority order is **Codex > ZCode > Hermes**.
-
-- **1 agent active**: owns all 6 keys and slots.
-- **2 agents active**: higher-priority agent gets `AG00`-`AG02` / slots 1-3,
-  lower gets `AG03`-`AG05` / slots 4-6.
-- **3 agents active**: column split â€” Codex `AG00`+`AG03`, ZCode `AG01`+`AG04`,
-  Hermes `AG02`+`AG05`.
-
-When the active set changes, the daemon debounces for 750 ms and repartitions.
-Each active agent receives a partition change event via `poll_events`. LCD
-state is retained through repartitions. See the
-[ZCode integration guide](docs/ZCode_integration.md) for the full partition
-matrix and setup instructions.
-
-### Start the daemon
-
-```powershell
-npm run bridge:daemon -- -- --port auto
-```
-
-For standalone mode without the RP2040 (controller only, no ChatGPT HID):
-
-```powershell
-npm run bridge:daemon:standalone
-```
-
-### Register the proxies
-
-**Hermes** (`~/.hermes/config.yaml`):
-
-```yaml
-mcp_servers:
-  micro_emu_bridge:
-    command: "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe"
-    args: ["--mcp-proxy", "--agent", "hermes", "--autostart"]
-```
-
-**ZCode** (Settings â†’ MCP Servers, or `~/.zcode/config.json`):
-
-```json
-{
-  "mcpServers": {
-    "micro_emu_bridge": {
-      "command": "D:\\Programming\\micro-emu\\tools\\rp2040-bridge\\target\\release\\rp2040-bridge.exe",
-      "args": ["--mcp-proxy", "--agent", "zcode", "--autostart"]
-    }
-  }
-}
-```
-
-**Codex** (`.codex/config.toml`):
+Build the bridge and register its proxy in `.codex/config.toml`:
 
 ```toml
 [mcp_servers.micro_emu_bridge]
@@ -362,116 +110,32 @@ args = ["--mcp-proxy", "--agent", "codex", "--autostart"]
 cwd = "D:\\Programming\\micro-emu"
 ```
 
-The `--autostart` flag makes the proxy spawn the daemon automatically if it
-is not already running. A lockfile in `%LOCALAPPDATA%\micro-emu\bridge-daemon.lock`
-prevents race conditions when multiple proxies start simultaneously. The
-daemon binds only to `127.0.0.1:48360` (configurable with `--bind`).
+The proxy starts or attaches to the loopback-only daemon. Key tools include `bridge_status`, `poll_events`, `publish_tasks`, `set_thread_status`, `set_display_context`, and `set_rgb_config`. Hardware-specific commands are unavailable when the daemon runs in standalone mode (`--port none`).
 
-### Hermes and ZCode tools
+## Multi-controller task board
 
-Hermes and ZCode see a filtered tool set:
+The daemon combines task slots across active controllers and assigns published tasks using stable IDs. An AKP03E supplies six slots; Stream Deck + and XL controllers supply eight by default. It also supports dynamic key and LCD-slot partitioning for Codex, ZCode, and Hermes sessions.
 
-- `bridge_status` â€” report daemon, firmware, controller, and agent state.
-- `poll_events` â€” drain buffered physical key presses for your assigned keys.
-  With `timeout_ms > 0`, waits up to that many milliseconds for events. Also
-  delivers partition change notifications.
-- `set_thread_status` â€” update the LCD slots currently assigned to your agent.
-- `set_rgb_config` â€” send `v.oai.rgbcfg` configuration.
+See [the multi-agent guide](docs/multi-agent-coexistence.md) for the session and partitioning model.
 
-ZCode additionally has access to `set_display_context` (Stream Deck + dashboard
-metadata). Codex retains all existing tools plus `poll_events`.
-
-## Implemented functionality
-
-- Codex Micro HID reports with Report ID 6 and 63-byte input, output, and
-  feature reports.
-- USB CDC transport between the bridge and the RP2040, including framing,
-  sequence numbers, payload lengths, and CRC16-CCITT.
-- Portable JavaScript framing, message validation, fixtures, and safe handling
-  of unknown methods.
-- `device.status`, `v.oai.thstatus`, `v.oai.rgbcfg`, radial controls, and key
-  events.
-- Six LCD keys mapped to `AG00`-`AG05`.
-- Lower keys mapped to `ACT06`-`ACT08`.
-- Encoder rotation, direction, and click events.
-- AJAZZ LCD updates with color, brightness, and clearing behavior.
-- Correlated ACK responses for RPC calls and no responses for notifications.
-- Windows inventory, preflight, hardware diagnostics, firmware host tests, and
-  reproducible RP2040 artifact verification.
-
-## Hardware validation
-
-With the AJAZZ software closed, run the physical test utility:
+## Development commands
 
 ```powershell
+npm test
+npm run bridge:test
+npm run firmware:host-test
 npm run hardware:test -- --listen 45
-```
-
-The test writes six numbered tiles to the LCDs and reads the keys, encoders,
-and encoder clicks. The verified hardware profile is documented in
-[docs/hardware-profile.md](docs/hardware-profile.md).
-
-## Protocol API
-
-```js
-import {
-  FrameDecoder,
-  frameJson,
-  createRequest,
-  keyEvent,
-} from "./protocol/index.js";
-
-const reports = frameJson(createRequest("device.status", undefined, 1));
-
-const decoder = new FrameDecoder();
-for (const report of reports) {
-  const { messages, errors } = decoder.feed(report);
-  // Process messages and record errors without stopping the transport.
-}
-
-const press = keyEvent("AG00", 1, 0);
+npm run plugin:watch
 ```
 
 ## Documentation
 
-- [RP2040 bridge details](docs/rp2040-bridge.md) Ã¢â‚¬â€ firmware and transport
-  architecture.
-- [Hermes integration](docs/Hermes_integration.md) - deploy the bridge with
-  the Hermes Desktop Agent (standalone or alongside Codex).
-- [ZCode integration](docs/ZCode_integration.md) - deploy the bridge with
-  ZCode (Z.ai ADE), including the dynamic three-agent partition.
-- [Hardware profile](docs/hardware-profile.md) - verified AJAZZ interface and
-  controls.
-  diagnostics.
+- [RP2040 bridge architecture](docs/rp2040-bridge.md)
+- [First RP2040 connection](docs/rp2040-first-connection.md)
+- [Verified AJAZZ hardware profile](docs/hardware-profile.md)
+- [ZCode integration](docs/ZCode_integration.md)
+- [Hermes integration](docs/Hermes_integration.md)
 
-## Security model
+## License
 
-The portable protocol core does not access hardware, the network, or the
-filesystem. The recommended RP2040 path uses Windows inbox USB class drivers
-and does not install kernel code, alter Secure Boot, enable test signing, or
-modify the Windows driver store. Firmware flashing is isolated to the RP2040
-board.
-
-## License and attribution
-
-Project code is released under the [MIT License](LICENSE). Protocol and
-interoperability information adapted from FreeMicro is attributed in
-[NOTICE](NOTICE), with the original license reproduced at
-[docs/third-party/freemicro-LICENSE.txt](docs/third-party/freemicro-LICENSE.txt).
-
-Codex, Codex Micro, ChatGPT, AJAZZ, and AKP03 may be trademarks of their
-respective owners. This project is independent and is not endorsed by OpenAI,
-AJAZZ, or the FreeMicro authors.
-
-### Task board and combined controllers
-
-Daemon mode schedules published task instances across every configured controller. Stream Deck+ contributes eight task slots; AJAZZ contributes six; XL devices default to eight and can be overridden. Configure multiple devices with repeatable specs:
-
-```text
-rp2040-bridge.exe --daemon --port auto --device ajazz,serial=AJ-1 --device streamdeck-plus,serial=SD-1
-```
-
-Agents publish a complete snapshot with `publish_tasks` (`task_id`, `title`, `state`, `priority`, `color`, `progress`, and optional `context`). The response includes each task's `{device_id, slot}` assignment or `null` when it overflows. `set_thread_status` remains a six-entry legacy adapter. In daemon mode all eight Stream Deck+ LCD keys select assigned cards; legacy Codex cards still emit their logical `AG00`-`AG05` event after physical reflow.
-
-`bridge_status` version 2 reports sessions, devices, task assignments/overflow, per-device selection, queue depth, and reconnect leases. A proxy hello carries a unique instance id and focus capability. RGB is daemon-managed; `set_rgb_config` is retained for direct/legacy mode only. Disconnected sessions keep task cards in a 30-second reconnect lease so republishing the same stable ids restores them.
-LCD task tiles now show a compact owning-agent label (`codex`, `zcode`, or `hermes`) above a smaller slot number. The color tile and task assignment behavior are unchanged; blank/unassigned tiles remain black.
+Released under the [MIT License](LICENSE). Codex, ChatGPT, Stream Deck, AJAZZ, and AKP03 are trademarks of their respective owners. This is an independent, unendorsed project.

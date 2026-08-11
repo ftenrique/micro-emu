@@ -72,20 +72,41 @@ export class KnobDialAction extends SingletonAction {
         }
         const displayCtx = this.ctx.getDisplayContext();
         const stripCtx: StripContext = { ...(displayCtx ?? {}) };
-        // Enrich with task-card data: find the first assigned task card
-        // to show its task_id and title when display context lacks them.
-        for (let i = 0; i < 8; i++) {
-            const card = this.ctx.getTaskCard(i);
-            if (card && (card.e as number) !== 0) {
-                if (!stripCtx.task_id) {
-                    stripCtx.task_id = (card.task_id as string) ?? String(i);
-                }
-                if (!stripCtx.task || stripCtx.task === "BRIDGE") {
-                    stripCtx.task = (card.t as string) ?? stripCtx.task;
-                }
-                break;
+        const card = this.ctx.getSelectedTaskCard();
+        if (card) {
+            stripCtx.task_id = nonEmptyText(card.task_id) ?? stripCtx.task_id;
+            const sourceSlot = Number(card.source_slot ?? card.id ?? card.slot ?? card.i);
+            if (Number.isFinite(sourceSlot)) stripCtx.task_number = sourceSlot + 1;
+            stripCtx.task = descriptiveCardTitle(card) ?? stripCtx.task;
+            stripCtx.project = nonEmptyText(card.project) ?? stripCtx.project;
+            stripCtx.model = nonEmptyText(card.model) ?? stripCtx.model;
+            stripCtx.effort = nonEmptyText(card.effort) ?? stripCtx.effort;
+            stripCtx.status = nonEmptyText(card.status ?? card.state) ?? stripCtx.status;
+            if (card.progress != null) {
+                const progress = Number(card.progress);
+                if (Number.isFinite(progress)) stripCtx.progress = progress;
             }
         }
         action.setFeedback({ canvas: renderKnobStrip(stripCtx) });
     }
+}
+
+/**
+ * Returns only a real task title. The bridge's `t` field is also used for the
+ * legacy HID key fallback (AG00-AG05); that protocol label must never replace
+ * the descriptive title already supplied by the selected display context.
+ */
+function descriptiveCardTitle(card: Record<string, unknown>): string | undefined {
+    const title = nonEmptyText(card.title);
+    if (title) return title;
+
+    const fallback = nonEmptyText(card.t);
+    if (!fallback || /^AG0[0-5]$/i.test(fallback)) return undefined;
+    return fallback;
+}
+
+function nonEmptyText(value: unknown): string | undefined {
+    if (typeof value !== "string") return undefined;
+    const text = value.trim();
+    return text.length > 0 ? text : undefined;
 }

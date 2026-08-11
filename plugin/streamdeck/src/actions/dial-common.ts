@@ -61,7 +61,11 @@ export function sendClick(
         default: {
             const match = /^(?:ag|act)(\d+)$/.exec(click ?? "");
             if (match) {
-                ctx.daemon.sendButton(Number(match[1]), pressed);
+                const index = Number(match[1]);
+                const key = index <= 5
+                    ? `AG${String(index).padStart(2, "0")}`
+                    : `ACT${String(index).padStart(2, "0")}`;
+                ctx.daemon.sendMicroKey(key, pressed);
             } else {
                 ctx.daemon.sendEncoderButton(nativeEncoder, pressed);
             }

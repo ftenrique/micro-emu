@@ -1,11 +1,15 @@
-﻿/** Status colors matching the HID path's `v.oai.thstatus` palette. */
+/** Status colors matching the HID path's `v.oai.thstatus` palette. */
 const STATUS_COLORS: Record<string, string> = {
     idle: "#37474f",
+    running: "#1565c0",
     working: "#1565c0",
+    active: "#1565c0",
     thinking: "#6a1b9a",
     waiting: "#ef6c00",
     error: "#b71c1c",
-    done: "#2e7d32",
+    completed: "#1b5e20",
+    complete: "#1b5e20",
+    done: "#1b5e20",
     ready: "#0277bd",
 };
 
@@ -74,32 +78,45 @@ export function renderTaskCardImage(
     colorOverride?: unknown,
     startedAtMs?: number,
     finishedAtMs?: number,
+    selected = false,
+    recentlyFinished = false,
 ): string {
     const normalizedStatus = status.toLowerCase();
     // Codex can send a white legacy `c` value with an idle thstatus entry.
     // Idle task buttons retain their initial dark-grey state regardless of it.
+    const override = normalizeColor(colorOverride);
+    const isWorking = ["running", "working", "active", "thinking"].includes(normalizedStatus);
+    const isFinished = ["completed", "complete", "done"].includes(normalizedStatus);
+    const completionHighlighted = isFinished && selected && recentlyFinished;
     const color = normalizedStatus === "idle"
         ? STATUS_COLORS.idle
-        : normalizeColor(colorOverride) ?? (status ? (STATUS_COLORS[normalizedStatus] ?? DEFAULT_COLOR) : DEFAULT_COLOR);
+        : isFinished
+            ? (completionHighlighted ? STATUS_COLORS.completed : STATUS_COLORS.idle)
+        // Legacy status messages sometimes carry white as a placeholder `c`.
+        // It must not replace the semantic task-state background.
+        : override === "#ffffff"
+            ? (status ? (STATUS_COLORS[normalizedStatus] ?? DEFAULT_COLOR) : DEFAULT_COLOR)
+            : override ?? (status ? (STATUS_COLORS[normalizedStatus] ?? DEFAULT_COLOR) : DEFAULT_COLOR);
     const w = 144;
     const h = 144;
-    // Keep the task number compact and high enough to reserve a clear footer.
+    // Keep the task number compact and leave room for the enlarged timer.
     const cell = 12;
     const digitW = 3 * cell;
     const digitH = 5 * cell;
     const originX = Math.floor((w - digitW) / 2);
     const originY = 42;
     const agentLabel = agent ? agent.toUpperCase() : "";
-    const isFinished = normalizedStatus === "completed" || normalizedStatus === "done";
-    const elapsed = formatElapsed(startedAtMs, finishedAtMs, isFinished);
-    const timerColor = isFinished ? "#a5d6a7" : "#90caf9";
+    const elapsed = isWorking || completionHighlighted
+        ? formatElapsed(startedAtMs, finishedAtMs, isFinished)
+        : undefined;
+    const timerColor = completionHighlighted ? "#a5d6a7" : "#90caf9";
 
     return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
   <rect x="4" y="4" width="${w - 8}" height="${h - 8}" rx="12" fill="${color}" stroke="#000" stroke-opacity="0.2" stroke-width="1"/>
+  ${selected ? `<rect x="${w - 9}" y="12" width="5" height="${h - 24}" rx="2.5" fill="#fff"/>` : ""}
   <text x="${w / 2}" y="19" font-family="sans-serif" font-size="14" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(agentLabel)}</text>
   ${renderDigit(slot, originX, originY, cell, "#c4c2ff")}
-  ${status ? `<text x="${w / 2}" y="116" font-family="sans-serif" font-size="10" font-weight="bold" fill="#fff" fill-opacity="0.82" text-anchor="middle">${escapeXml(status.toUpperCase())}</text>` : ""}
-  ${elapsed ? `<text x="${w / 2}" y="135" font-family="monospace" font-size="13" font-weight="bold" fill="${timerColor}" text-anchor="middle">${elapsed}</text>` : ""}
+  ${elapsed ? `<text x="${w / 2}" y="135" font-family="monospace" font-size="26" font-weight="bold" fill="${timerColor}" text-anchor="middle">${elapsed}</text>` : ""}
 </svg>`);
 }
 
@@ -152,13 +169,14 @@ export interface StripContext {
     status?: string | null;
     progress?: number | null;
     task_id?: string | null;
+    task_number?: number | null;
     weekly_remaining?: number | null;
     five_hour_remaining?: number | null;
 }
 
 /** Knob strip: task number, project, shortened task name. */
 export function renderKnobStrip(ctx: StripContext): string {
-    const taskId = ctx.task_id ?? "—";
+    const taskId = ctx.task_number ?? ctx.task_id ?? "—";
     const project = truncate(ctx.project ?? "—", 18);
     const task = truncate(ctx.task ?? "—", 24);
     return stripSvg(`<text x="10" y="26" font-family="monospace" font-size="13" font-weight="bold" fill="#90caf9">#${escapeXml(String(taskId))}</text>
@@ -208,7 +226,8 @@ export function renderCruxVStrip(ctx: StripContext, clickLabel: string): string 
 /** Renders a labelled usage bar (remaining percentage) at the given y. */
 function usageBar(label: string, remaining: number | null | undefined, y: number): string {
     const barX = 34;
-    const barW = STRIP_W - barX - 48;
+    // Leave enough room for the enlarged percentage value, including "100%".
+    const barW = STRIP_W - barX - 72;
     const pct = remaining ?? null;
     const width = pct === null ? 0 : Math.round((barW * Math.max(0, Math.min(100, pct))) / 100);
     const color = pct === null ? "#333" : pct <= 10 ? "#b71c1c" : pct <= 25 ? "#ef6c00" : "#2e7d32";
@@ -216,7 +235,7 @@ function usageBar(label: string, remaining: number | null | undefined, y: number
     return `<text x="10" y="${y + 9}" font-family="monospace" font-size="11" font-weight="bold" fill="#90a4ae">${escapeXml(label)}</text>
   <rect x="${barX}" y="${y}" width="${barW}" height="12" rx="6" fill="#333"/>
   <rect x="${barX}" y="${y}" width="${width}" height="12" rx="6" fill="${color}"/>
-  <text x="${STRIP_W - 8}" y="${y + 10}" font-family="monospace" font-size="11" font-weight="bold" fill="#fff" text-anchor="end">${escapeXml(text)}</text>`;
+  <text x="${STRIP_W - 8}" y="${y + 10}" font-family="monospace" font-size="22" font-weight="bold" fill="#fff" text-anchor="end">${escapeXml(text)}</text>`;
 }
 
 // --- Action button icons ---

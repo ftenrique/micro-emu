@@ -844,10 +844,12 @@ fn draw_usage_meter(
     let value = remaining
         .map(|value| format!("{value}%"))
         .unwrap_or_else(|| "NOT SET".to_owned());
-    draw_text(image, &value, x + 78, y - 1, 2, [230, 235, 245]);
-    let bar_x = x + 150;
+    // Double the resource percentage size and leave a little less room for the bar.
+    let value_scale = if remaining.is_some() { 4 } else { 2 };
+    draw_text(image, &value, x + 78, y - 1, value_scale, [230, 235, 245]);
+    let bar_x = x + 180;
     let bar_y = y + 2;
-    let bar_width = width.saturating_sub(150);
+    let bar_width = width.saturating_sub(180);
     let bar_height = 14;
     for yy in bar_y..bar_y + bar_height {
         for xx in bar_x..bar_x + bar_width {

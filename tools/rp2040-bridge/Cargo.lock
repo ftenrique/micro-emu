@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "rp2040-bridge"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ajazz-sdk",
  "hidapi",

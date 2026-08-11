@@ -1,6 +1,6 @@
 {
   "name": "codex-micro-ajazz",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": false,
   "type": "module",
   "description": "Codex Micro protocol core, AJAZZ and Stream Deck adapters with an RP2040 USB bridge.",
@@ -38,7 +38,8 @@
     "plugin:build": "npm --prefix plugin/streamdeck run build",
     "plugin:watch": "npm --prefix plugin/streamdeck run watch",
     "plugin:link": "npm --prefix plugin/streamdeck run link",
-    "plugin:pack": "npm --prefix plugin/streamdeck run pack"
+    "plugin:pack": "npm --prefix plugin/streamdeck run pack",
+    "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-windows-release.ps1"
   },
   "engines": {
     "node": ">=20"

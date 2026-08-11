@@ -39,12 +39,39 @@ const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 /// activity on the task board. 3 seconds keeps the Stream Deck responsive
 /// without hammering the SQLite file.
 const ZCODE_POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// Codex desktop state is local and cheap to poll. A 250 ms interval keeps
+/// focus and lifecycle responsive without reading SQLite in the 10 ms loop.
+const CODEX_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Synthetic owner session for ZCode cards published by the daemon's DB poll.
 /// Real MCP sessions are numbered from 1 upward by the acceptor, so this high
 /// value never collides in practice.  Presses on these cards are fanned out to
 /// every live ZCode session rather than to this id (see `route_task_device_events`).
 pub const ZCODE_POLL_SESSION: usize = 999;
+
+// Catalog actions without a concrete owning MCP session are routed to the
+// newest live session for their intended agent. These sentinels cannot collide
+// with daemon connection ids, which increase from one.
+const CODEX_CATALOG_SESSION: usize = usize::MAX;
+const ZCODE_CATALOG_SESSION: usize = usize::MAX - 1;
+const HERMES_CATALOG_SESSION: usize = usize::MAX - 2;
+
+pub(crate) fn catalog_action_session(agent: AgentId) -> usize {
+    match agent {
+        AgentId::Codex => CODEX_CATALOG_SESSION,
+        AgentId::ZCode => ZCODE_CATALOG_SESSION,
+        AgentId::Hermes => HERMES_CATALOG_SESSION,
+    }
+}
+
+fn catalog_action_agent(session_id: usize) -> Option<AgentId> {
+    match session_id {
+        CODEX_CATALOG_SESSION => Some(AgentId::Codex),
+        ZCODE_CATALOG_SESSION => Some(AgentId::ZCode),
+        HERMES_CATALOG_SESSION => Some(AgentId::Hermes),
+        _ => None,
+    }
+}
 
 /// Owner session for the synthetic Codex HID cards published from `v.oai.thstatus`.
 /// Matches `publish_codex_hid_status`, which hardcodes session 0.
@@ -53,6 +80,10 @@ const CODEX_HID_SESSION: usize = 0;
 /// How long after the last `v.oai.thstatus` frame the Codex HID cards are kept
 /// before they are considered stale (the RP2040 link is gone) and cleared.
 const THSTATUS_GRACE: Duration = Duration::from_secs(5);
+
+/// A connected controller only represents active Codex work shortly after it
+/// has actually emitted a Codex status frame.
+const CODEX_HARDWARE_IDLE: Duration = Duration::from_secs(60);
 
 /// Internal greeting sent by a proxy as its first line to identify which
 /// agent it represents. The daemon consumes it and does not forward it to
@@ -150,14 +181,34 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
 
     let mut bridge = crate::open_runtime(&options.bridge_options)?;
     bridge.task_mode = true;
-    // Initialize the partition: Codex is active if the RP2040 is present.
+    let mut codex_snapshot_available = false;
+    if let Some(snapshot) = crate::codex_state::read_codex_snapshot() {
+        match bridge
+            .task_board
+            .publish_codex_snapshot(&snapshot, now_ms())
+        {
+            Ok(_) => {
+                bridge.has_explicit_task_state = true;
+                codex_snapshot_available = true;
+            }
+            Err(error) => eprintln!("Codex state snapshot rejected: {error}"),
+        }
+    }
+    let mut next_codex_poll_at = Instant::now() + CODEX_TASK_POLL_INTERVAL;
+    // A connected RP2040 alone does not claim a share of the deck.
     let mut session_agents = ActiveSet::new();
-    let mut codex_hardware_active = bridge.has_serial();
+    let mut codex_hardware_active = false;
     let mut pending_repartition_at: Option<Instant> = None;
     let mut next_usage_refresh_at: Option<Instant> = None;
     {
         let active = effective_active_set(session_agents, codex_hardware_active);
         bridge.partition = Partition::compute(active);
+        bridge.task_board.set_slot_owners(
+            bridge.task_device_id.clone(),
+            (0..bridge.task_slot_count)
+                .map(|slot| bridge.partition.owner_of(slot as u8))
+                .collect(),
+        );
     }
     eprintln!("{}", crate::bridge_status(&bridge, "daemon"));
 
@@ -169,8 +220,8 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     // the deadline until which the daemon should wait before responding with
     // an empty result.
     let mut pending_polls: Vec<PendingPoll> = Vec::new();
-    let mut serial_retry_at = (!bridge.has_serial() && options.bridge_options.port != "none")
-        .then(Instant::now);
+    let mut serial_retry_at =
+        (!bridge.has_serial() && options.bridge_options.port != "none").then(Instant::now);
     let mut serial_retry_delay = crate::SERIAL_RETRY_INITIAL_DELAY;
 
     // Plugin controller sessions: maps session_id to the device_id of the
@@ -221,10 +272,11 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     handle_hello(&mut sessions, session_id, info);
                     session_agents.insert(agent);
                     pending_repartition_at = Some(Instant::now() + REPARTITION_DEBOUNCE);
-                    // Auto-derive display context when a Codex session
-                    // connects — the config/session files may have changed.
-                    crate::auto_derive_display_context(&mut bridge);
-                    let _ = crate::refresh_task_board(&mut bridge);
+                    // Only Codex owns the local CLI/session-derived context.
+                    if agent == AgentId::Codex {
+                        crate::auto_derive_display_context(&mut bridge);
+                        let _ = crate::refresh_task_board(&mut bridge);
+                    }
                 }
                 SessionMessage::Request {
                     session_id,
@@ -272,8 +324,26 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     );
                     let device_id = controller.device_id();
                     let slots = controller.task_slot_count();
+                    // With --controller none, the first Stream Deck plugin is
+                    // the physical deck. Promote it to the partitioned primary
+                    // instead of letting task assignment drift between plugin
+                    // instances.
+                    let becomes_primary =
+                        bridge.controller.is_none() && bridge.task_device_id == "none";
+                    if becomes_primary {
+                        bridge.task_device_id = device_id.clone();
+                        bridge.task_slot_count = slots;
+                    }
                     if slots > 0 {
                         bridge.task_board.set_device(device_id.clone(), slots, true);
+                        if becomes_primary {
+                            bridge.task_board.set_slot_owners(
+                                device_id.clone(),
+                                (0..slots)
+                                    .map(|slot| bridge.partition.owner_of(slot as u8))
+                                    .collect(),
+                            );
+                        }
                     }
                     bridge
                         .aux_controllers
@@ -348,9 +418,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                             Ok(messages) => {
                                 for message in messages {
                                     let method = crate::codex::method(&message);
-                                    if bridge.task_mode
-                                        && method == Some("v.oai.thstatus")
-                                    {
+                                    if bridge.task_mode && method == Some("v.oai.thstatus") {
                                         if let Some(parameters) =
                                             message.get("p").or_else(|| message.get("params"))
                                         {
@@ -360,20 +428,22 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                                             // the fused status buffer rather than standby cards.
                                             bridge.has_explicit_task_state = true;
                                             last_thstatus_at = Some(Instant::now());
-                                            match bridge
-                                                .task_board
-                                                .publish_codex_hid_status(parameters, now_ms())
-                                            {
-                                                Ok(()) => eprintln!(
-                                                    "Codex HID status accepted entries={}",
-                                                    parameters
-                                                        .as_array()
-                                                        .map(Vec::len)
-                                                        .unwrap_or(0)
-                                                ),
-                                                Err(error) => eprintln!(
-                                                    "Codex task status adapter fallback: {error}"
-                                                ),
+                                            if !codex_snapshot_available {
+                                                match bridge
+                                                    .task_board
+                                                    .publish_codex_hid_status(parameters, now_ms())
+                                                {
+                                                    Ok(()) => eprintln!(
+                                                        "Codex HID fallback accepted entries={}",
+                                                        parameters
+                                                            .as_array()
+                                                            .map(Vec::len)
+                                                            .unwrap_or(0)
+                                                    ),
+                                                    Err(error) => eprintln!(
+                                                        "Codex HID fallback rejected: {error}"
+                                                    ),
+                                                }
                                             }
                                             crate::auto_derive_display_context(&mut bridge);
                                             let _ = crate::refresh_task_board(&mut bridge);
@@ -480,13 +550,43 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             }
         }
 
+        // Refresh authoritative Codex task identity, metadata, focus, lifecycle,
+        // and exact timer timestamps independently of LCD presentation frames.
+        if now >= next_codex_poll_at {
+            next_codex_poll_at = now + CODEX_TASK_POLL_INTERVAL;
+            if let Some(snapshot) = crate::codex_state::read_codex_snapshot() {
+                match bridge
+                    .task_board
+                    .publish_codex_snapshot(&snapshot, now_ms())
+                {
+                    Ok(_) => {
+                        bridge.has_explicit_task_state = true;
+                        codex_snapshot_available = true;
+                    }
+                    Err(error) => eprintln!("Codex state snapshot rejected: {error}"),
+                }
+            }
+        }
+
         // Controller reconnect + poll.
         crate::reconnect_controller_if_due(&mut bridge);
         bridge.task_board.expire(now_ms());
         let _ = crate::refresh_task_board(&mut bridge);
         crate::poll_controller(&mut bridge, false)?;
         for (session_id, event) in bridge.pending_task_events.drain(..) {
-            if session_id == ZCODE_POLL_SESSION {
+            if let Some(agent) = catalog_action_agent(session_id) {
+                // Multiple proxies for one agent can briefly overlap during a
+                // restart. Deliver one command to the newest session only so
+                // a single Stream Deck press never executes twice.
+                let target = sessions
+                    .iter()
+                    .filter(|session| session.agent == Some(agent))
+                    .max_by_key(|session| session.id)
+                    .map(|session| session.id);
+                if let Some(target) = target {
+                    push_session_event(&mut sessions, target, event);
+                }
+            } else if session_id == ZCODE_POLL_SESSION {
                 // The auto-fed ZCode cards have no owning MCP session of their
                 // own; fan a press out to every live ZCode session so the agent
                 // receives the `task_selected` (and legacy key) event.
@@ -496,9 +596,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     .map(|session| session.id)
                     .collect();
                 for id in targets {
-                    if let Some(session) =
-                        sessions.iter_mut().find(|session| session.id == id)
-                    {
+                    if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
                         session.events.push_back(event.clone());
                     }
                 }
@@ -517,10 +615,17 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         // synthetic session 0 cards published from `v.oai.thstatus` never
         // expire on their own; without this they keep hogging slots 0-5 and
         // starve the ZCode auto-feed below.
-        let thstatus_stale = last_thstatus_at
-            .map(|seen| now.duration_since(seen) > THSTATUS_GRACE)
-            .unwrap_or(true);
-        if thstatus_stale && bridge.task_board.has_session_tasks(CODEX_HID_SESSION) {
+        // Status is event-driven, not a heartbeat. Do not clear active task
+        // cards simply because no new status frame arrived while the serial
+        // link remains healthy.
+        let thstatus_stale = !bridge.has_serial()
+            && last_thstatus_at
+                .map(|seen| now.duration_since(seen) > THSTATUS_GRACE)
+                .unwrap_or(true);
+        if thstatus_stale
+            && !codex_snapshot_available
+            && bridge.task_board.has_session_tasks(CODEX_HID_SESSION)
+        {
             bridge.task_board.clear_session(CODEX_HID_SESSION);
             if !bridge.task_board.has_tasks() {
                 bridge.has_explicit_task_state = false;
@@ -563,19 +668,15 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                             }
                         }
                     }
-                    // Keep the touch-strip context fresh alongside the poll.
-                    if !bridge.has_explicit_display_context {
-                        crate::auto_derive_display_context(&mut bridge);
-                        let _ = crate::refresh_task_board(&mut bridge);
-                    }
                 }
             }
         }
 
-        // Track RP2040 attach/detach for Codex hardware activity.
-        let now_has_serial = bridge.has_serial();
-        if now_has_serial != codex_hardware_active {
-            codex_hardware_active = now_has_serial;
+        // A serial link reserves Codex slots only while recent status traffic is present.
+        let now_codex_hardware_active = bridge.has_serial()
+            && last_thstatus_at.is_some_and(|seen| now.duration_since(seen) < CODEX_HARDWARE_IDLE);
+        if now_codex_hardware_active != codex_hardware_active {
+            codex_hardware_active = now_codex_hardware_active;
             pending_repartition_at = Some(now + REPARTITION_DEBOUNCE);
         }
 
@@ -591,6 +692,12 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     new_partition.owners_json()
                 );
                 bridge.partition = new_partition.clone();
+                bridge.task_board.set_slot_owners(
+                    bridge.task_device_id.clone(),
+                    (0..bridge.task_slot_count)
+                        .map(|slot| new_partition.owner_of(slot as u8))
+                        .collect(),
+                );
                 // Re-render through the centralized desired-state path.  An
                 // empty fused buffer is not an explicit Codex update; sending
                 // it directly would clear the connection-default cards while
@@ -624,7 +731,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         if let Some(refresh_at) = next_usage_refresh_at {
             if now >= refresh_at {
                 next_usage_refresh_at = Some(now + USAGE_REFRESH_INTERVAL);
-                if !bridge.has_explicit_display_context {
+                if !bridge.has_explicit_display_context && session_agents.contains(AgentId::Codex) {
                     crate::auto_derive_display_context(&mut bridge);
                     let _ = crate::refresh_task_board(&mut bridge);
                 }
@@ -983,6 +1090,14 @@ fn detach_plugin_controller(bridge: &mut crate::BridgeRuntime, device_id: &str) 
     bridge.aux_controllers = survivors;
     if removed {
         bridge.task_board.set_device(device_id, 0, false);
+        // Plugin instance IDs include the Node process ID and change whenever
+        // Stream Deck restarts. Forget a disconnected primary so the next
+        // plugin hello can become the partitioned physical deck.
+        if bridge.task_device_id == device_id {
+            bridge.task_device_id = "none".to_owned();
+            bridge.task_slot_count = 0;
+            bridge.task_board.set_slot_owners("none", Vec::new());
+        }
     }
 }
 
@@ -1340,6 +1455,26 @@ mod tests {
         assert_eq!(parse_hello_info(line).map(|i| i.agent), None);
     }
 
+    #[test]
+    fn idle_serial_does_not_add_phantom_codex() {
+        let mut sessions = ActiveSet::new();
+        sessions.insert(AgentId::ZCode);
+        sessions.insert(AgentId::Hermes);
+
+        let active = effective_active_set(sessions, false);
+        assert!(!active.contains(AgentId::Codex));
+        assert_eq!(
+            Partition::compute(active).owners_json(),
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                json!("zcode"),
+                json!("zcode"),
+                json!("zcode")
+            ]
+        );
+    }
     #[test]
     fn controller_hello_is_distinguished_from_agent_hello() {
         let controller_line = r#"{"bridge":"hello","version":1,"role":"controller","controller":"streamdeck-plugin","instance_id":"p-1","taskSlots":6}"#;
