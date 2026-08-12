@@ -10,6 +10,14 @@ const executorSource = readFileSync(
   new URL("../../plugin/streamdeck/src/codex-action-executor.ts", import.meta.url),
   "utf8",
 );
+const hermesExecutorSource = readFileSync(
+  new URL("../../plugin/streamdeck/src/hermes-action-executor.ts", import.meta.url),
+  "utf8",
+);
+const contextSource = readFileSync(
+  new URL("../../plugin/streamdeck/src/context.ts", import.meta.url),
+  "utf8",
+);
 const propertyInspector = readFileSync(
   new URL("../../plugin/streamdeck/com.micro-emu.codex.sdPlugin/ui/action.html", import.meta.url),
   "utf8",
@@ -76,6 +84,18 @@ test("every advertised Codex action has a concrete local executor", () => {
   ]) {
     assert.ok(executorSource.includes(`"${method}"`), `missing Codex method ${method}`);
   }
+});
+
+test("Hermes-owned actions are capability-gated and never fall through to Codex", () => {
+  assert.match(contextSource, /owner === "hermes"[\s\S]*this\.hermes\.execute/);
+  assert.match(contextSource, /taskId\?\.startsWith\("hermes:"\)/);
+  assert.match(hermesExecutorSource, /MICRO_EMU_HERMES_API_URL/);
+  assert.match(hermesExecutorSource, /MICRO_EMU_HERMES_API_KEY/);
+  assert.match(hermesExecutorSource, /task\.copy-path/);
+  assert.match(hermesExecutorSource, /task\.copy-prompt/);
+  assert.match(hermesExecutorSource, /task\.copy-response/);
+  assert.match(hermesExecutorSource, /task\.fork/);
+  assert.match(hermesExecutorSource, /The action was not sent to Codex/);
 });
 
 test("retired profile ids resolve to an alert instead of ACT06", () => {

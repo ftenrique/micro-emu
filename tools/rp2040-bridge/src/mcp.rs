@@ -191,6 +191,7 @@ pub fn tool_available(name: &str, agent: Option<AgentId>) -> bool {
                 | "set_thread_status"
                 | "publish_tasks"
                 | "set_rgb_config"
+                | "set_display_context"
         ),
         Some(AgentId::ZCode) => matches!(
             name,
@@ -240,5 +241,26 @@ mod tests {
             .expect("set_display_context tool");
         let description = context_tool["description"].as_str().expect("description");
         assert!(description.contains("task-card tools do not update model, effort, or usage"));
+    }
+
+    #[test]
+    fn hermes_has_agent_neutral_context_but_not_codex_transport_tools() {
+        assert!(tool_available("bridge_status", Some(AgentId::Hermes)));
+        assert!(tool_available("publish_tasks", Some(AgentId::Hermes)));
+        assert!(tool_available("set_display_context", Some(AgentId::Hermes)));
+        assert!(!tool_available("send_codex_message", Some(AgentId::Hermes)));
+        assert!(!tool_available("device_status", Some(AgentId::Hermes)));
+    }
+
+    #[test]
+    fn codex_tool_surface_is_unchanged() {
+        for name in [
+            "emit_key",
+            "send_codex_message",
+            "set_display_context",
+            "device_status",
+        ] {
+            assert!(tool_available(name, Some(AgentId::Codex)), "missing {name}");
+        }
     }
 }

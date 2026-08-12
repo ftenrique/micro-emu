@@ -1,5 +1,7 @@
 import { DaemonClient, DisplayContext } from "./daemon-client";
 import { CodexActionExecutor } from "./codex-action-executor";
+import { ZCodeActionExecutor } from "./zcode-action-executor";
+import { HermesActionExecutor } from "./hermes-action-executor";
 
 /**
  * Shared plugin context: holds the daemon client and the latest render state
@@ -8,6 +10,8 @@ import { CodexActionExecutor } from "./codex-action-executor";
 export class PluginContext {
     readonly daemon: DaemonClient;
     readonly codex: CodexActionExecutor;
+    readonly zcode: ZCodeActionExecutor;
+    readonly hermes: HermesActionExecutor;
     private threadStatus: unknown[] = [];
     private taskCards: unknown[] = [];
     private displayContext: DisplayContext | null = null;
@@ -17,9 +21,16 @@ export class PluginContext {
     /** Callbacks invoked when render state changes. */
     private listeners: Set<() => void> = new Set();
 
-    constructor(daemon: DaemonClient, codex = new CodexActionExecutor()) {
+    constructor(
+        daemon: DaemonClient,
+        codex = new CodexActionExecutor(),
+        zcode = new ZCodeActionExecutor(),
+        hermes = new HermesActionExecutor(),
+    ) {
         this.daemon = daemon;
         this.codex = codex;
+        this.zcode = zcode;
+        this.hermes = hermes;
 
         daemon.on("connect", () => {
             this.connected = true;
@@ -76,6 +87,26 @@ export class PluginContext {
 
     getSelectedTaskSlot(): number | null {
         return this.selectedTaskSlot;
+    }
+
+    async executeSelectedAgentAction(actionId: string): Promise<void> {
+        const selectedTask = this.getSelectedTaskCard();
+        const taskId = this.displayContext?.task_id;
+        const owner = selectedTask?.agent
+            ?? (taskId?.startsWith("zcode:") ? "zcode"
+                : taskId?.startsWith("hermes:") ? "hermes" : undefined);
+        if (owner === "zcode") {
+            await this.zcode.execute(actionId, { selectedTask, taskId });
+            return;
+        }
+        if (owner === "hermes") {
+            await this.hermes.execute(actionId, { selectedTask, taskId });
+            return;
+        }
+        if (owner && owner !== "codex") {
+            throw new Error("No action executor is available for " + String(owner));
+        }
+        await this.codex.execute(actionId, { selectedTask, taskId });
     }
 
     getSelectedTaskCard(): Record<string, unknown> | null {

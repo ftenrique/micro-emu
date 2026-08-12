@@ -39,6 +39,9 @@ const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 /// activity on the task board. 3 seconds keeps the Stream Deck responsive
 /// without hammering the SQLite file.
 const ZCODE_POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// Hermes' canonical SQLite state is local and WAL-backed. One second keeps
+/// cards responsive while avoiding contention with the running agent.
+const HERMES_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Codex desktop state is local and cheap to poll. A 250 ms interval keeps
 /// focus and lifecycle responsive without reading SQLite in the 10 ms loop.
 const CODEX_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -48,6 +51,8 @@ const CODEX_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// value never collides in practice.  Presses on these cards are fanned out to
 /// every live ZCode session rather than to this id (see `route_task_device_events`).
 pub const ZCODE_POLL_SESSION: usize = 999;
+/// Synthetic owner for cards mirrored from Hermes' read-only state database.
+pub const HERMES_POLL_SESSION: usize = 998;
 
 // Catalog actions without a concrete owning MCP session are routed to the
 // newest live session for their intended agent. These sentinels cannot collide
@@ -233,6 +238,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     // mirroring how Codex activity arrives via `v.oai.thstatus`.
     let mut last_thstatus_at: Option<Instant> = None;
     let mut next_zcode_poll_at: Option<Instant> = None;
+    let mut next_hermes_poll_at: Option<Instant> = None;
 
     // Acceptor thread.
     let accept_tx = session_tx.clone();
@@ -600,6 +606,17 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                         session.events.push_back(event.clone());
                     }
                 }
+            } else if session_id == HERMES_POLL_SESSION {
+                let targets: Vec<usize> = sessions
+                    .iter()
+                    .filter(|session| session.agent == Some(AgentId::Hermes))
+                    .map(|session| session.id)
+                    .collect();
+                for id in targets {
+                    if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
+                        session.events.push_back(event.clone());
+                    }
+                }
             } else if let Some(session) =
                 sessions.iter_mut().find(|session| session.id == session_id)
             {
@@ -652,7 +669,15 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             if let Some(poll_at) = next_zcode_poll_at {
                 if now >= poll_at {
                     next_zcode_poll_at = Some(now + ZCODE_POLL_INTERVAL);
-                    if let Some(snapshot) = crate::zcode_state::read_zcode_snapshot(now_ms()) {
+                    // Publish only as many recent sessions as ZCode can display
+                    // on the partitioned primary controller. Publishing a fixed
+                    // six-card snapshot while ZCode owns three slots leaves old
+                    // sticky assignments in place and sends newly started tasks
+                    // to overflow with no visible change on the device.
+                    let zcode_slots = bridge.partition.slots_for(AgentId::ZCode).len();
+                    if let Some(snapshot) =
+                        crate::zcode_state::read_zcode_snapshot(now_ms(), zcode_slots)
+                    {
                         match bridge.task_board.publish_tasks(
                             ZCODE_POLL_SESSION,
                             AgentId::ZCode,
@@ -667,6 +692,47 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                                 eprintln!("zcode poll publish failed: {error}");
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Mirror Hermes' canonical state only while its proxy is live. An
+        // explicit Hermes publication is authoritative and suppresses this
+        // synthetic owner until those manual cards disconnect and expire.
+        let hermes_active = sessions
+            .iter()
+            .any(|session| session.agent == Some(AgentId::Hermes));
+        let hermes_has_manual_tasks = bridge
+            .task_board
+            .has_agent_tasks_except(AgentId::Hermes, HERMES_POLL_SESSION);
+        if !hermes_active || hermes_has_manual_tasks {
+            if bridge.task_board.has_session_tasks(HERMES_POLL_SESSION) {
+                bridge.task_board.clear_session(HERMES_POLL_SESSION);
+                let _ = crate::refresh_task_board(&mut bridge);
+            }
+            next_hermes_poll_at = None;
+        } else {
+            if next_hermes_poll_at.is_none() {
+                next_hermes_poll_at = Some(now);
+            }
+            if next_hermes_poll_at.is_some_and(|poll_at| now >= poll_at) {
+                next_hermes_poll_at = Some(now + HERMES_POLL_INTERVAL);
+                let hermes_slots = bridge.partition.slots_for(AgentId::Hermes).len();
+                if let Some(snapshot) =
+                    crate::hermes_state::read_hermes_snapshot(now_ms(), hermes_slots)
+                {
+                    match bridge.task_board.publish_tasks(
+                        HERMES_POLL_SESSION,
+                        AgentId::Hermes,
+                        &snapshot,
+                        now_ms(),
+                    ) {
+                        Ok(_) => {
+                            bridge.has_explicit_task_state = true;
+                            let _ = crate::refresh_task_board(&mut bridge);
+                        }
+                        Err(error) => eprintln!("hermes poll publish failed: {error}"),
                     }
                 }
             }
@@ -1234,6 +1300,11 @@ fn call_tool_for(
         "set_thread_status" => call_set_thread_status(bridge, arguments, agent, session_id),
         "publish_tasks" => {
             let agent_id = agent.unwrap_or(AgentId::Codex);
+            if agent_id == AgentId::Hermes && session_id != HERMES_POLL_SESSION {
+                // Avoid duplicate stable IDs when the first explicit Hermes
+                // snapshot takes ownership from the read-only auto-feed.
+                bridge.task_board.clear_session(HERMES_POLL_SESSION);
+            }
             match bridge
                 .task_board
                 .publish_tasks(session_id, agent_id, arguments, now_ms())

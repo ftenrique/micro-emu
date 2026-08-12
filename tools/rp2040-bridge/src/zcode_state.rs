@@ -10,20 +10,15 @@
 //! unexpected schema, [`read_zcode_snapshot`] returns `None` so the caller can
 //! leave the existing board untouched rather than blanking it.
 
-use crate::tasks::CODEX_TASK_SLOTS;
+use crate::tasks::RECENT_COMPLETION_HIGHLIGHT;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use std::time::Duration;
 
-/// How many active sessions to surface on the combined task board.  The first
-/// [`CODEX_TASK_SLOTS`] slots on the Stream Deck+ mirror Codex Micro, so we
-/// cap the ZCode snapshot at the same number for a consistent layout.
-const MAX_ZCODE_TASKS: usize = CODEX_TASK_SLOTS;
-
 /// A session whose latest model request is still in flight is treated as
 /// running for this long after its last activity, so a card does not flip back
 /// to "queued" between tool calls within a single turn.
-const ACTIVITY_LIVENESS: Duration = Duration::from_secs(30);
+const ACTIVITY_LIVENESS: Duration = Duration::from_secs(10);
 
 /// Returns the path to the ZCode CLI database, or `None` when the home
 /// directory cannot be resolved.
@@ -45,7 +40,7 @@ pub fn zcode_db_path() -> Option<std::path::PathBuf> {
 ///
 /// Returns `None` when the database is unavailable (missing, locked, or
 /// unreadable) so the caller can preserve the previously published board.
-pub fn read_zcode_snapshot(now_ms: u128) -> Option<Value> {
+pub fn read_zcode_snapshot(now_ms: u128, max_tasks: usize) -> Option<Value> {
     let path = zcode_db_path()?;
     let connection = Connection::open_with_flags(
         &path,
@@ -54,6 +49,14 @@ pub fn read_zcode_snapshot(now_ms: u128) -> Option<Value> {
     )
     .ok()?;
 
+    read_zcode_snapshot_from_connection(&connection, now_ms, max_tasks)
+}
+
+fn read_zcode_snapshot_from_connection(
+    connection: &Connection,
+    now_ms: u128,
+    max_tasks: usize,
+) -> Option<Value> {
     let mut statement = connection
         .prepare(
             "SELECT id, title, directory, task_type, time_updated
@@ -66,7 +69,7 @@ pub fn read_zcode_snapshot(now_ms: u128) -> Option<Value> {
         .ok()?;
 
     let rows = statement
-        .query_map([MAX_ZCODE_TASKS as i64], |row| {
+        .query_map([i64::try_from(max_tasks).unwrap_or(i64::MAX)], |row| {
             Ok(SessionRow {
                 id: row.get::<_, String>(0)?,
                 title: row.get::<_, String>(1)?,
@@ -105,6 +108,8 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Option
     let selection = model_selection(connection, &row.id);
 
     let state = derive_state(&latest, row.time_updated, now_ms);
+    let started_at_ms = latest.started_at;
+    let finished_at_ms = latest.completed_at;
     let model = selection
         .as_ref()
         .and_then(|s| s.model.clone())
@@ -120,6 +125,7 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Option
 
     let context = json!({
         "project": project,
+        "workspace_path": row.directory,
         "task": row.title,
         "model": model,
         "effort": effort,
@@ -130,8 +136,14 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Option
     Some(json!({
         "task_id": format!("zcode:{}", row.id),
         "title": row.title,
+        "workspace_path": row.directory,
         "state": state,
         "priority": priority,
+        "started_at_ms": (state != "queued").then_some(started_at_ms),
+        "finished_at_ms": (state == "completed").then_some(
+            finished_at_ms.unwrap_or_else(|| started_at_ms.max(row.time_updated))
+        ),
+        "timing_authoritative": true,
         "context": context,
     }))
 }
@@ -142,12 +154,13 @@ struct ModelUsage {
     model_id: Option<String>,
     variant: Option<String>,
     started_at: i64,
+    completed_at: Option<i64>,
 }
 
 fn latest_model_usage(connection: &Connection, session_id: &str) -> Option<ModelUsage> {
     let mut statement = connection
         .prepare(
-            "SELECT status, model_id, variant, started_at
+            "SELECT status, model_id, variant, started_at, completed_at
              FROM model_usage
              WHERE session_id = ?1
              ORDER BY started_at DESC
@@ -161,6 +174,7 @@ fn latest_model_usage(connection: &Connection, session_id: &str) -> Option<Model
                 model_id: row.get::<_, Option<String>>(1)?,
                 variant: row.get::<_, Option<String>>(2)?,
                 started_at: row.get(3)?,
+                completed_at: row.get(4)?,
             })
         })
         .ok()
@@ -198,16 +212,23 @@ fn model_selection(connection: &Connection, session_id: &str) -> Option<ModelSel
 /// Maps the latest model-usage status and session recency to a task-board
 /// state.  A session is `running` while a model request is in flight, or for a
 /// short grace window after the last activity so brief gaps between tool calls
-/// do not flip the card back to idle.
+/// do not flash green. A recently completed request then remains `completed`
+/// for the rest of the normal completion-highlight window before going idle.
 fn derive_state(latest: &ModelUsage, session_updated_ms: i64, now_ms: u128) -> &'static str {
     match latest.status.as_str() {
         "running" => "running",
         "error" => "error",
         "cancelled" => "queued",
         "completed" | _ => {
-            let last = latest.started_at.max(session_updated_ms) as u128;
-            if now_ms.saturating_sub(last) <= ACTIVITY_LIVENESS.as_millis() {
+            let completed_at = latest
+                .completed_at
+                .unwrap_or_else(|| latest.started_at.max(session_updated_ms))
+                as u128;
+            let elapsed = now_ms.saturating_sub(completed_at);
+            if elapsed <= ACTIVITY_LIVENESS.as_millis() {
                 "running"
+            } else if elapsed <= RECENT_COMPLETION_HIGHLIGHT.as_millis() {
+                "completed"
             } else {
                 "queued"
             }
@@ -268,7 +289,8 @@ mod tests {
                     variant text,
                     agent text,
                     status text not null,
-                    started_at integer not null
+                    started_at integer not null,
+                    completed_at integer
                 );",
             )
             .unwrap();
@@ -383,9 +405,46 @@ mod tests {
             directory: "D:\\proj\\other".to_owned(),
             time_updated: 10000,
         };
-        // Within the 30s liveness window after the last activity.
-        let task = build_task(&connection, &row, 35_000).unwrap();
+        // Within the short liveness window after the last activity.
+        let task = build_task(&connection, &row, 15_000).unwrap();
         assert_eq!(task["state"], "running");
+    }
+
+    #[test]
+    fn completed_session_is_green_phase_before_returning_to_idle() {
+        let latest = ModelUsage {
+            status: "completed".to_owned(),
+            model_id: None,
+            variant: None,
+            started_at: 1_000,
+            completed_at: Some(10_000),
+        };
+
+        assert_eq!(derive_state(&latest, 10_000, 25_000), "completed");
+        assert_eq!(derive_state(&latest, 10_000, 45_000), "queued");
+    }
+
+    #[test]
+    fn snapshot_limit_keeps_only_the_most_recent_sessions() {
+        let connection = fixture_db();
+        connection
+            .execute_batch(
+                "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated, task_type)
+                 VALUES ('old', 'p1', 'old', 'D:\\proj', 'Old', '1', 1, 1, 'interactive'),
+                        ('mid', 'p1', 'mid', 'D:\\proj', 'Mid', '1', 2, 2, 'interactive'),
+                        ('new', 'p1', 'new', 'D:\\proj', 'New', '1', 3, 3, 'interactive');
+                 INSERT INTO model_usage (id, logical_request_id, session_id, provider_id, model_id, status, started_at)
+                 VALUES ('mu-old', 'r-old', 'old', 'provider', 'model', 'completed', 1),
+                        ('mu-mid', 'r-mid', 'mid', 'provider', 'model', 'completed', 2),
+                        ('mu-new', 'r-new', 'new', 'provider', 'model', 'completed', 3);",
+            )
+            .unwrap();
+
+        let snapshot = read_zcode_snapshot_from_connection(&connection, 100_000, 2).unwrap();
+        let tasks = snapshot["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["task_id"], "zcode:new");
+        assert_eq!(tasks[1]["task_id"], "zcode:mid");
     }
 
     #[test]
@@ -396,7 +455,7 @@ mod tests {
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .ok()
-        .and_then(|_| read_zcode_snapshot(0));
+        .and_then(|_| read_zcode_snapshot(0, 6));
         assert!(snapshot.is_none());
     }
 }

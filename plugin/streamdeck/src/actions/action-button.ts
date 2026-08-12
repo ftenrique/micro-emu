@@ -84,10 +84,7 @@ export class ActionButtonAction extends SingletonAction<ActionButtonSettings> {
                 break;
             case "codex-action":
                 if (pressed) {
-                    await this.ctx.codex.execute(item.id, {
-                        selectedTask: this.ctx.getSelectedTaskCard(),
-                        taskId: this.ctx.getDisplayContext()?.task_id,
-                    });
+                    await this.ctx.executeSelectedAgentAction(item.id);
                 }
                 break;
             case "unsupported":

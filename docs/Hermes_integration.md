@@ -27,16 +27,18 @@ a single hardware-owning loop.
 
 ### Key and LCD partition
 
-The six LCD keys are partitioned **dynamically** based on which agents are
-currently active. The bridge supports up to three agents: Codex, ZCode, and
-Hermes. Priority order is **Codex > ZCode > Hermes**.
+The six-key primary controller uses **fixed halves** so connecting another
+agent never moves an existing Codex card: Codex owns `AG00`-`AG02`; ZCode has
+priority on `AG03`-`AG05`; Hermes owns `AG03`-`AG05` only while ZCode is
+absent. Auxiliary task devices remain available to the shared scheduler.
 
 | Active agents            | Codex            | ZCode            | Hermes           |
 |--------------------------|------------------|------------------|------------------|
-| codex only               | AG00–AG05 / 1–6  | —                | —                |
-| hermes only              | —                | —                | AG00–AG05 / 1–6  |
+| codex only               | AG00–AG02 / 1–3  | —                | —                |
+| hermes only              | —                | —                | AG03–AG05 / 4–6  |
 | codex + hermes           | AG00–AG02 / 1–3  | —                | AG03–AG05 / 4–6  |
-| codex + zcode + hermes   | AG00,AG03 / 1,4  | AG01,AG04 / 2,5  | AG02,AG05 / 3,6  |
+| zcode + hermes           | —                | AG03–AG05 / 4–6  | —                |
+| codex + zcode + hermes   | AG00–AG02 / 1–3  | AG03–AG05 / 4–6  | —                |
 
 "Active" means the agent has a live MCP session on the daemon, or — for Codex
 only — the RP2040 serial link is up. When the active set changes, the daemon
@@ -144,7 +146,7 @@ hermes
 
 Inside the Hermes TUI, run `/reload-mcp` after editing the config. Verify the
 connection with `/tools` — you should see `bridge_status`, `poll_events`,
-`set_thread_status`, and `set_rgb_config`.
+`set_thread_status`, `publish_tasks`, and `set_display_context`.
 
 ### 4. Verify
 
@@ -258,7 +260,23 @@ Verify with `codex mcp list` and `/mcp` in the Codex TUI.
 | `bridge_status`    | Report daemon, firmware, serial port, controller, and agent state. |
 | `poll_events`      | Drain buffered physical key presses (`AG03`-`AG05`). Long-poll with `timeout_ms`. |
 | `set_thread_status`| Update LCD slots 4-6 with color/brightness entries.                |
-| `set_rgb_config`   | Send `v.oai.rgbcfg` configuration to the controller.              |
+| `publish_tasks`    | Publish a stable-ID task snapshot with lifecycle and metadata.     |
+| `set_display_context` | Publish model, effort, progress, and usage dashboard metadata.  |
+
+### Automatic session state
+
+While a Hermes proxy is connected, the daemon opens Hermes' canonical
+`state.db` read-only and mirrors the most recent non-archived sessions as task
+cards. On Windows the default is `%LOCALAPPDATA%\hermes\state.db`; elsewhere
+it is `$HERMES_HOME/state.db` or `~/.hermes/state.db`. The adapter publishes
+stable `hermes:<session-id>` IDs, title, workspace, model, lifecycle, and exact
+turn timestamps. Missing, locked, or older databases are ignored without
+clearing manually published cards.
+
+An explicit `publish_tasks` call from Hermes immediately takes precedence over
+the auto-feed and remains authoritative through the normal reconnect lease.
+Use `set_display_context` when Hermes has live usage or effort metadata that is
+not present in the session database.
 
 ### `poll_events`
 
@@ -481,3 +499,5 @@ Hermes sessions share one contention-free task board with Codex and ZCode. Publi
 Configure combined capacity with repeatable daemon options, for example `--device ajazz,serial=AJ-1 --device streamdeck-plus,serial=SD-1`. AJAZZ contributes six slots, Stream Deck+ eight, and XL devices default to eight (override with `task-slots=N`). All eight Stream Deck+ keys select task cards in daemon mode; legacy `set_thread_status` remains available as a session-local adapter.
 
 Selections arrive through `poll_events` as `task_selected`, and reallocation is reported with `layout_changed`. `bridge_status` version 2 includes sessions, device health, assignments/overflow, per-device selection, queue depth, and the 30-second reconnect lease. RGB is centrally configured by the daemon, not individual agents.
+
+Long-pressing a Hermes task card shows or focuses Hermes Desktop, and minimizes it when it is already foreground. Search, terminal, and model-cycle actions for Hermes tasks are queued as agent events; they are never sent to Codex. Workspace-path copying works locally. Copy-prompt, copy-response, and fork use Hermes' Sessions REST API only when MICRO_EMU_HERMES_API_URL and MICRO_EMU_HERMES_API_KEY are configured. Unsupported Hermes actions fail closed instead of falling through to the Codex executor.

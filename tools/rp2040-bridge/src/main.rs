@@ -4,6 +4,8 @@ mod codex_state;
 mod codex_window;
 mod controller;
 mod daemon;
+mod hermes_state;
+mod hermes_window;
 mod mcp;
 mod plugin_controller;
 mod proxy;
@@ -13,6 +15,7 @@ mod streamdeck;
 mod tasks;
 mod wire;
 mod zcode_state;
+mod zcode_window;
 
 use crate::codex::{
     CatalogAction, CodexDecoder, RadialState, frame_json, messages_for_synthetic_key,
@@ -1299,29 +1302,55 @@ fn route_task_toggle(
         return false;
     };
 
-    // Long-press window control is specific to Codex. Other agents retain a
-    // useful long press by treating it as one ordinary task selection.
-    if task.owner_agent != crate::routing::AgentId::Codex {
-        route_task_button(bridge, device_id, slot_count, index, true, now_ms);
-        route_task_button(bridge, device_id, slot_count, index, false, now_ms);
-        return true;
-    }
-
-    match crate::codex_window::is_foreground() {
-        Ok(true) => {
-            if let Err(error) = crate::codex_window::minimize() {
-                eprintln!("Codex window minimize failed: {error}");
+    match task.owner_agent {
+        crate::routing::AgentId::Codex => match crate::codex_window::is_foreground() {
+            Ok(true) => {
+                if let Err(error) = crate::codex_window::minimize() {
+                    eprintln!("Codex window minimize failed: {error}");
+                }
             }
-        }
-        Ok(false) | Err(_) => {
-            // Select before raising the app so the requested task is already
-            // active when the Codex window reaches the foreground.
-            route_task_button(bridge, device_id, slot_count, index, true, now_ms);
-            route_task_button(bridge, device_id, slot_count, index, false, now_ms);
-            if let Err(error) = crate::codex_window::show_and_focus() {
-                eprintln!("Codex window focus failed: {error}");
+            Ok(false) | Err(_) => {
+                // Select before raising the app so the requested task is already
+                // active when the Codex window reaches the foreground.
+                route_task_button(bridge, device_id, slot_count, index, true, now_ms);
+                route_task_button(bridge, device_id, slot_count, index, false, now_ms);
+                if let Err(error) = crate::codex_window::show_and_focus() {
+                    eprintln!("Codex window focus failed: {error}");
+                }
             }
-        }
+        },
+        crate::routing::AgentId::ZCode => match crate::zcode_window::is_foreground() {
+            Ok(true) => {
+                if let Err(error) = crate::zcode_window::minimize() {
+                    eprintln!("ZCode window minimize failed: {error}");
+                }
+            }
+            Ok(false) | Err(_) => {
+                // ZCode has no task deep link. Deliver its task-selection event
+                // before raising the window so the connected plugin can apply it.
+                route_task_button(bridge, device_id, slot_count, index, true, now_ms);
+                route_task_button(bridge, device_id, slot_count, index, false, now_ms);
+                if let Err(error) = crate::zcode_window::show_and_focus() {
+                    eprintln!("ZCode window focus failed: {error}");
+                }
+            }
+        },
+        crate::routing::AgentId::Hermes => match crate::hermes_window::is_foreground() {
+            Ok(true) => {
+                if let Err(error) = crate::hermes_window::minimize() {
+                    eprintln!("Hermes window minimize failed: {error}");
+                }
+            }
+            Ok(false) | Err(_) => {
+                // Hermes task activation remains event-driven. Select first so
+                // the owning MCP session can resume it as the window is raised.
+                route_task_button(bridge, device_id, slot_count, index, true, now_ms);
+                route_task_button(bridge, device_id, slot_count, index, false, now_ms);
+                if let Err(error) = crate::hermes_window::show_and_focus() {
+                    eprintln!("Hermes window focus failed: {error}");
+                }
+            }
+        },
     }
     true
 }
@@ -1403,14 +1432,16 @@ fn route_catalog_action(
         return;
     }
 
+    let task = bridge.task_board.selected_task().cloned();
+    let (session, agent) = catalog_target_session(task.as_ref());
     match action {
-        CatalogAction::AgentSearch => {
+        CatalogAction::AgentSearch if agent == crate::routing::AgentId::Codex => {
             if let Err(error) = crate::codex_window::search_tasks() {
                 eprintln!("Codex task search failed: {error}");
             }
             return;
         }
-        CatalogAction::AgentOpenTerminal => {
+        CatalogAction::AgentOpenTerminal if agent == crate::routing::AgentId::Codex => {
             if let Err(error) = crate::codex_window::toggle_terminal() {
                 eprintln!("Codex terminal toggle failed: {error}");
             }
@@ -1419,8 +1450,6 @@ fn route_catalog_action(
         _ => {}
     }
 
-    let task = bridge.task_board.selected_task().cloned();
-    let (session, agent) = catalog_target_session(task.as_ref());
     bridge.pending_task_events.push((
         session,
         json!({
@@ -1434,7 +1463,29 @@ fn route_catalog_action(
     ));
 }
 
-fn route_model_cycle(bridge: &BridgeRuntime) {
+fn route_model_cycle(bridge: &mut BridgeRuntime) {
+    let task = bridge.task_board.selected_task().cloned();
+    if let Some(task) = task
+        .as_ref()
+        .filter(|task| task.owner_agent != crate::routing::AgentId::Codex)
+    {
+        let (session, agent) = catalog_target_session(Some(task));
+        bridge.pending_task_events.push((
+            session,
+            json!({
+                "type": "catalog_action",
+                "action": "agent.cycle-model",
+                "agent": agent.as_str(),
+                "task_id": task.task_id,
+                "device_id": bridge.task_device_id,
+                "ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis())
+                    .unwrap_or(0),
+            }),
+        ));
+        return;
+    }
     let current_model = bridge
         .task_board
         .selected_task()
@@ -2411,6 +2462,47 @@ mod tests {
         assert_eq!(bridge.pending_task_events[0].0, 9);
         assert_eq!(bridge.pending_task_events[0].1["type"], "catalog_action");
         assert_eq!(bridge.pending_task_events[0].1["action"], "task.retry");
+    }
+
+    #[test]
+    fn hermes_shortcuts_and_model_cycle_are_queued_instead_of_sent_to_codex() {
+        let rendered = Arc::new(Mutex::new(None));
+        let mut bridge = test_bridge(rendered);
+        bridge.task_mode = true;
+        let device_id = bridge.task_device_id.clone();
+        bridge.task_board.set_device(device_id.clone(), 8, true);
+        bridge
+            .task_board
+            .publish_legacy_status(
+                9,
+                crate::routing::AgentId::Hermes,
+                &json!([{"i": 0, "e": 1, "t": "Hermes task", "model": "hermes-4"}]),
+                1,
+            )
+            .unwrap();
+        bridge.task_board.select(&device_id, 0, 2).unwrap();
+        bridge.pending_task_events.clear();
+
+        route_catalog_action(&mut bridge, &device_id, CatalogAction::AgentSearch, 3);
+        assert_eq!(bridge.pending_task_events[0].0, 9);
+        assert_eq!(bridge.pending_task_events[0].1["agent"], "hermes");
+        assert_eq!(bridge.pending_task_events[0].1["action"], "agent.search");
+
+        bridge.pending_task_events.clear();
+        route_catalog_action(&mut bridge, &device_id, CatalogAction::AgentOpenTerminal, 4);
+        assert_eq!(
+            bridge.pending_task_events[0].1["action"],
+            "agent.open-terminal"
+        );
+
+        bridge.pending_task_events.clear();
+        route_model_cycle(&mut bridge);
+        assert_eq!(bridge.pending_task_events[0].0, 9);
+        assert_eq!(bridge.pending_task_events[0].1["agent"], "hermes");
+        assert_eq!(
+            bridge.pending_task_events[0].1["action"],
+            "agent.cycle-model"
+        );
     }
 
     #[test]

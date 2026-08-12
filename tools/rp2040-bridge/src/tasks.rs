@@ -141,6 +141,7 @@ pub struct TaskCard {
     pub owner_agent: AgentId,
     pub title: String,
     pub project: Option<String>,
+    pub workspace_path: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub state: TaskState,
@@ -558,6 +559,7 @@ impl TaskBoard {
             title.clear();
         }
         let project = text_field("project");
+        let workspace_path = text_field("workspace_path");
         let model = text_field("model");
         let effort = text_field("effort");
         let explicit_state = object
@@ -625,6 +627,7 @@ impl TaskBoard {
             owner_agent: agent,
             title,
             project,
+            workspace_path,
             model,
             effort,
             state,
@@ -758,6 +761,15 @@ impl TaskBoard {
         self.tasks
             .values()
             .any(|task| task.owner_session == session)
+    }
+
+    /// Returns true when an agent has cards from any owner other than the
+    /// supplied synthetic session. Auto-feeds use this to yield immediately
+    /// to an MCP client that publishes its own authoritative snapshot.
+    pub fn has_agent_tasks_except(&self, agent: AgentId, excluded_session: usize) -> bool {
+        self.tasks
+            .values()
+            .any(|task| task.owner_agent == agent && task.owner_session != excluded_session)
     }
 
     pub fn expire(&mut self, now_ms: u128) {
@@ -944,9 +956,11 @@ impl TaskBoard {
                         self.now_ms.saturating_sub(finished_at_ms)
                             <= RECENT_COMPLETION_HIGHLIGHT.as_millis()
                     });
-                let completion_highlighted = selected && recently_finished;
-                // Completion green is a focused, recent-result signal: an
-                // unselected completed card returns to the idle color.
+                let completion_highlighted =
+                    recently_finished && (selected || task.owner_agent != AgentId::Codex);
+                // Codex completion green is focused. Auto-polled MCP agents
+                // have no authoritative desktop focus, so recency alone is
+                // their bounded result signal.
                 let color = if task.legacy_key.is_some() {
                     // Codex HID colors also carry selection presentation. Once
                     // adapted into a TaskCard, lifecycle state is the semantic
@@ -978,6 +992,7 @@ impl TaskBoard {
                     "title": task.title,
                     "t": title,
                     "project": task.project,
+                    "workspace_path": task.workspace_path,
                     "model": task.model,
                     "effort": task.effort,
                     "status": task.state.as_str(),
@@ -996,7 +1011,7 @@ impl TaskBoard {
     pub fn status_json(&self) -> Value {
         let tasks = self.tasks.values().map(|task| {
             let assignment = self.assignment(&task.task_id).map(|a| json!({"device_id": a.slot.device_id, "slot": a.slot.slot}));
-            json!({"task_id": task.task_id, "owner_session": task.owner_session, "owner_agent": task.owner_agent.as_str(), "title": task.title, "project": task.project, "model": task.model, "effort": task.effort, "state": task.state.as_str(), "priority": task.priority, "progress": task.progress, "started_at_ms": task.started_at_ms, "finished_at_ms": task.finished_at_ms, "source_slot": task.source_slot, "assignment": assignment, "reconnect_until_ms": task.reconnect_until_ms})
+            json!({"task_id": task.task_id, "owner_session": task.owner_session, "owner_agent": task.owner_agent.as_str(), "title": task.title, "project": task.project, "workspace_path": task.workspace_path, "model": task.model, "effort": task.effort, "state": task.state.as_str(), "priority": task.priority, "progress": task.progress, "started_at_ms": task.started_at_ms, "finished_at_ms": task.finished_at_ms, "source_slot": task.source_slot, "assignment": assignment, "reconnect_until_ms": task.reconnect_until_ms})
         }).collect::<Vec<_>>();
         json!({"selected_task_id": self.selected, "tasks": tasks})
     }
@@ -2223,6 +2238,54 @@ mod tests {
             .expect("completed snapshot");
         assert_eq!(board.tasks["thread"].started_at_ms, Some(123_000));
         assert_eq!(board.tasks["thread"].finished_at_ms, Some(456_000));
+    }
+
+    #[test]
+    fn recent_zcode_completion_is_green_without_hardware_selection() {
+        let mut board = TaskBoard::new();
+        board.set_device("deck", 1, true);
+        board
+            .publish_tasks(
+                999,
+                AgentId::ZCode,
+                &json!({"tasks":[{"task_id":"z","title":"ZCode result","state":"completed","started_at_ms":100,"finished_at_ms":200,"timing_authoritative":true}]}),
+                300,
+            )
+            .unwrap();
+
+        let cards = board.rendered_slots("deck", 1);
+        assert_eq!(cards[0]["selected"], false);
+        assert_eq!(cards[0]["recently_finished"], true);
+        assert_eq!(cards[0]["c"], 0x1b5e20);
+
+        board.expire(30_201);
+        let expired = board.rendered_slots("deck", 1);
+        assert_eq!(expired[0]["recently_finished"], false);
+        assert_eq!(expired[0]["c"], 0x37474f);
+    }
+
+    #[test]
+    fn recent_hermes_completion_is_green_without_hardware_selection() {
+        let mut board = TaskBoard::new();
+        board.set_device("deck", 1, true);
+        board
+            .publish_tasks(
+                998,
+                AgentId::Hermes,
+                &json!({"tasks":[{"task_id":"h","title":"Hermes result","state":"completed","started_at_ms":100,"finished_at_ms":200,"timing_authoritative":true}]}),
+                300,
+            )
+            .unwrap();
+
+        let cards = board.rendered_slots("deck", 1);
+        assert_eq!(cards[0]["selected"], false);
+        assert_eq!(cards[0]["recently_finished"], true);
+        assert_eq!(cards[0]["c"], 0x1b5e20);
+
+        board.expire(30_201);
+        let expired = board.rendered_slots("deck", 1);
+        assert_eq!(expired[0]["recently_finished"], false);
+        assert_eq!(expired[0]["c"], 0x37474f);
     }
 
     #[test]
