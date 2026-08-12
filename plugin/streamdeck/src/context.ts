@@ -3,6 +3,12 @@ import { CodexActionExecutor } from "./codex-action-executor";
 import { ZCodeActionExecutor } from "./zcode-action-executor";
 import { HermesActionExecutor } from "./hermes-action-executor";
 
+/** Display context enriched with the selected task physical number. */
+export interface SelectedDisplayContext extends DisplayContext {
+    agent?: string | null;
+    task_number?: number | null;
+}
+
 /**
  * Shared plugin context: holds the daemon client and the latest render state
  * so action classes can update their key images when state arrives.
@@ -79,6 +85,26 @@ export class PluginContext {
     getDisplayContext(): DisplayContext | null {
         return this.displayContext;
     }
+    /** Returns live display context with selected task-card metadata overlaid. */
+    getSelectedDisplayContext(): SelectedDisplayContext {
+        const merged: SelectedDisplayContext = { ...(this.displayContext ?? {}) };
+        const card = this.getSelectedTaskCard();
+        if (!card) return merged;
+        merged.agent = nonEmptyText(card.agent) ?? merged.agent;
+        merged.task_id = nonEmptyText(card.task_id) ?? merged.task_id;
+        const sourceSlot = Number(card.source_slot ?? card.id ?? card.slot ?? card.i);
+        if (Number.isFinite(sourceSlot)) merged.task_number = sourceSlot + 1;
+        merged.task = descriptiveCardTitle(card) ?? merged.task;
+        merged.project = nonEmptyText(card.project) ?? merged.project;
+        merged.model = nonEmptyText(card.model) ?? merged.model;
+        merged.effort = nonEmptyText(card.effort) ?? merged.effort;
+        merged.status = nonEmptyText(card.status ?? card.state) ?? merged.status;
+        if (card.progress != null) {
+            const progress = Number(card.progress);
+            if (Number.isFinite(progress)) merged.progress = progress;
+        }
+        return merged;
+    }
 
     selectTaskSlot(slot: number): void {
         this.selectedTaskSlot = slot;
@@ -137,4 +163,20 @@ export class PluginContext {
             listener();
         }
     }
+}
+
+/** Returns only a real task title, excluding legacy AG labels. */
+function descriptiveCardTitle(card: Record<string, unknown>): string | undefined {
+    const title = nonEmptyText(card.title);
+    if (title) return title;
+
+    const fallback = nonEmptyText(card.t);
+    if (!fallback || /^AG0[0-5]$/i.test(fallback)) return undefined;
+    return fallback;
+}
+
+function nonEmptyText(value: unknown): string | undefined {
+    if (typeof value !== "string") return undefined;
+    const text = value.trim();
+    return text.length > 0 ? text : undefined;
 }

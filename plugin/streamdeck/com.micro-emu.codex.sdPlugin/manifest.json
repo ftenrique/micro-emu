@@ -48,6 +48,21 @@
             ]
         },
         {
+            "Icon": "imgs/actions/context",
+            "Name": "Context",
+            "States": [
+                {
+                    "Image": "imgs/actions/context"
+                }
+            ],
+            "Tooltip": "Live task, model, or usage context from the Codex display strips.",
+            "UUID": "com.micro-emu.codex.context",
+            "PropertyInspectorPath": "ui/context.html",
+            "Controllers": [
+                "Keypad"
+            ]
+        },
+        {
             "Icon": "imgs/actions/knob",
             "Name": "Knob",
             "Controllers": [

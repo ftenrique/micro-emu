@@ -26,6 +26,12 @@ export interface DisplayContext {
     task_id?: string | null;
     weekly_remaining?: number | null;
     five_hour_remaining?: number | null;
+    wait_reason?: string | null;
+    prompt?: string | null;
+    interaction_id?: string | null;
+    short_action?: string | null;
+    long_action?: string | null;
+    pending_wait_count?: number | null;
 }
 
 /** Configuration for the daemon client. */
@@ -120,6 +126,10 @@ export class DaemonClient extends EventEmitter {
     }
 
     /** Requests the native Codex window toggle for an occupied task slot. */
+    sendTaskAction(index: number, gesture: "short" | "long"): void {
+        this.send({ type: "event", kind: "task-action", index, gesture });
+    }
+
     sendTaskToggle(index: number): void {
         this.send({ type: "event", kind: "task-toggle", index });
     }

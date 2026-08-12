@@ -10,16 +10,8 @@
 //! unexpected schema, [`read_zcode_snapshot`] returns `None` so the caller can
 //! leave the existing board untouched rather than blanking it.
 
-use crate::tasks::RECENT_COMPLETION_HIGHLIGHT;
 use rusqlite::{Connection, OpenFlags};
-use serde_json::{Value, json};
-use std::time::Duration;
-
-/// A session whose latest model request is still in flight is treated as
-/// running for this long after its last activity, so a card does not flip back
-/// to "queued" between tool calls within a single turn.
-const ACTIVITY_LIVENESS: Duration = Duration::from_secs(10);
-
+use serde_json::{json, Value};
 /// Returns the path to the ZCode CLI database, or `None` when the home
 /// directory cannot be resolved.
 pub fn zcode_db_path() -> Option<std::path::PathBuf> {
@@ -59,11 +51,19 @@ fn read_zcode_snapshot_from_connection(
 ) -> Option<Value> {
     let mut statement = connection
         .prepare(
-            "SELECT id, title, directory, task_type, time_updated
-             FROM session
-             WHERE time_archived IS NULL
-               AND task_type IN ('interactive', 'task')
-             ORDER BY time_updated DESC
+            "SELECT s.id, s.title, s.directory, s.time_updated,
+                    mu.status, mu.model_id, mu.variant, mu.started_at, mu.completed_at
+             FROM session AS s
+             JOIN model_usage AS mu ON mu.rowid = (
+                 SELECT latest.rowid FROM model_usage AS latest
+                 WHERE latest.session_id = s.id
+                 ORDER BY latest.started_at DESC, latest.rowid DESC LIMIT 1
+             )
+             WHERE s.time_archived IS NULL
+               AND s.task_type IN ('interactive', 'task')
+             ORDER BY CASE WHEN mu.status = 'running' THEN 0 ELSE 1 END,
+                      MAX(s.time_updated, mu.started_at, COALESCE(mu.completed_at, 0)) DESC,
+                      s.id ASC
              LIMIT ?1;",
         )
         .ok()?;
@@ -74,16 +74,21 @@ fn read_zcode_snapshot_from_connection(
                 id: row.get::<_, String>(0)?,
                 title: row.get::<_, String>(1)?,
                 directory: row.get::<_, String>(2)?,
-                time_updated: row.get::<_, i64>(4)?,
+                time_updated: row.get::<_, i64>(3)?,
+                latest: ModelUsage {
+                    status: row.get(4)?,
+                    model_id: row.get(5)?,
+                    variant: row.get(6)?,
+                    started_at: row.get(7)?,
+                    completed_at: row.get(8)?,
+                },
             })
         })
         .ok()?;
 
     let mut tasks = Vec::new();
     for row in rows.flatten() {
-        if let Some(task) = build_task(&connection, &row, now_ms) {
-            tasks.push(task);
-        }
+        tasks.push(build_task(&connection, &row, now_ms));
     }
 
     if tasks.is_empty() {
@@ -99,25 +104,25 @@ struct SessionRow {
     title: String,
     directory: String,
     time_updated: i64,
+    latest: ModelUsage,
 }
-
 /// Builds a single task object for one session, enriching it with the latest
 /// model-usage status and the model/effort selection.
-fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Option<Value> {
-    let latest = latest_model_usage(connection, &row.id)?;
+fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value {
+    let latest = &row.latest;
     let selection = model_selection(connection, &row.id);
 
-    let state = derive_state(&latest, row.time_updated, now_ms);
+    let state = derive_state(latest, row.time_updated, now_ms);
     let started_at_ms = latest.started_at;
     let finished_at_ms = latest.completed_at;
     let model = selection
         .as_ref()
         .and_then(|s| s.model.clone())
-        .or(latest.model_id);
+        .or_else(|| latest.model_id.clone());
     let effort = selection
         .as_ref()
         .and_then(|s| s.thought_level.clone())
-        .or(latest.variant);
+        .or_else(|| latest.variant.clone());
     let project = project_name(&row.directory);
 
     // Running sessions rank above idle ones so they claim the lowest slots.
@@ -133,7 +138,7 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Option
         "task_id": format!("zcode:{}", row.id),
     });
 
-    Some(json!({
+    json!({
         "task_id": format!("zcode:{}", row.id),
         "title": row.title,
         "workspace_path": row.directory,
@@ -145,7 +150,7 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Option
         ),
         "timing_authoritative": true,
         "context": context,
-    }))
+    })
 }
 
 /// The most recent `model_usage` row for a session, if any.
@@ -155,29 +160,6 @@ struct ModelUsage {
     variant: Option<String>,
     started_at: i64,
     completed_at: Option<i64>,
-}
-
-fn latest_model_usage(connection: &Connection, session_id: &str) -> Option<ModelUsage> {
-    let mut statement = connection
-        .prepare(
-            "SELECT status, model_id, variant, started_at, completed_at
-             FROM model_usage
-             WHERE session_id = ?1
-             ORDER BY started_at DESC
-             LIMIT 1;",
-        )
-        .ok()?;
-    statement
-        .query_row([session_id], |row| {
-            Ok(ModelUsage {
-                status: row.get(0)?,
-                model_id: row.get::<_, Option<String>>(1)?,
-                variant: row.get::<_, Option<String>>(2)?,
-                started_at: row.get(3)?,
-                completed_at: row.get(4)?,
-            })
-        })
-        .ok()
 }
 
 struct ModelSelection {
@@ -209,30 +191,15 @@ fn model_selection(connection: &Connection, session_id: &str) -> Option<ModelSel
     })
 }
 
-/// Maps the latest model-usage status and session recency to a task-board
-/// state.  A session is `running` while a model request is in flight, or for a
-/// short grace window after the last activity so brief gaps between tool calls
-/// do not flash green. A recently completed request then remains `completed`
-/// for the rest of the normal completion-highlight window before going idle.
-fn derive_state(latest: &ModelUsage, session_updated_ms: i64, now_ms: u128) -> &'static str {
-    match latest.status.as_str() {
+/// Maps the persisted model-usage status to a task-board state.
+/// Completion remains visible until the task board acknowledges it through selection.
+fn derive_state(latest: &ModelUsage, _session_updated_ms: i64, _now_ms: u128) -> &'static str {
+    match latest.status.trim().to_ascii_lowercase().as_str() {
         "running" => "running",
         "error" => "error",
         "cancelled" => "queued",
-        "completed" | _ => {
-            let completed_at = latest
-                .completed_at
-                .unwrap_or_else(|| latest.started_at.max(session_updated_ms))
-                as u128;
-            let elapsed = now_ms.saturating_sub(completed_at);
-            if elapsed <= ACTIVITY_LIVENESS.as_millis() {
-                "running"
-            } else if elapsed <= RECENT_COMPLETION_HIGHLIGHT.as_millis() {
-                "completed"
-            } else {
-                "queued"
-            }
-        }
+        "completed" => "completed",
+        _ => "error",
     }
 }
 
@@ -327,13 +294,8 @@ mod tests {
             )
             .unwrap();
 
-        let row = SessionRow {
-            id: "sess_a".to_owned(),
-            title: "Fix task buttons".to_owned(),
-            directory: "D:\\proj\\micro-emu".to_owned(),
-            time_updated: 5000,
-        };
-        let task = build_task(&connection, &row, 6000).unwrap();
+        let snapshot = read_zcode_snapshot_from_connection(&connection, 6000, 6).unwrap();
+        let task = &snapshot["tasks"][0];
         assert_eq!(task["task_id"], "zcode:sess_a");
         assert_eq!(task["state"], "running");
         assert_eq!(task["priority"], 75);
@@ -344,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_completed_session_falls_back_to_queued_after_liveness() {
+    fn old_completed_session_stays_completed_until_selection() {
         let connection = fixture_db();
         connection
             .execute(
@@ -365,20 +327,14 @@ mod tests {
             )
             .unwrap();
 
-        let row = SessionRow {
-            id: "sess_b".to_owned(),
-            title: "Old task".to_owned(),
-            directory: "D:\\proj\\other".to_owned(),
-            time_updated: 1000,
-        };
-        // Well past the 30s liveness window.
-        let task = build_task(&connection, &row, 100_000).unwrap();
-        assert_eq!(task["state"], "queued");
+        let snapshot = read_zcode_snapshot_from_connection(&connection, 100_000, 6).unwrap();
+        let task = &snapshot["tasks"][0];
+        assert_eq!(task["state"], "completed");
         assert_eq!(task["priority"], 40);
     }
 
     #[test]
-    fn recent_completed_session_stays_running_within_liveness() {
+    fn recent_completed_session_is_immediately_completed() {
         let connection = fixture_db();
         connection
             .execute(
@@ -399,15 +355,9 @@ mod tests {
             )
             .unwrap();
 
-        let row = SessionRow {
-            id: "sess_c".to_owned(),
-            title: "Recent task".to_owned(),
-            directory: "D:\\proj\\other".to_owned(),
-            time_updated: 10000,
-        };
-        // Within the short liveness window after the last activity.
-        let task = build_task(&connection, &row, 15_000).unwrap();
-        assert_eq!(task["state"], "running");
+        let snapshot = read_zcode_snapshot_from_connection(&connection, 15_000, 6).unwrap();
+        let task = &snapshot["tasks"][0];
+        assert_eq!(task["state"], "completed");
     }
 
     #[test]
@@ -421,7 +371,7 @@ mod tests {
         };
 
         assert_eq!(derive_state(&latest, 10_000, 25_000), "completed");
-        assert_eq!(derive_state(&latest, 10_000, 45_000), "queued");
+        assert_eq!(derive_state(&latest, 10_000, 45_000), "completed");
     }
 
     #[test]
@@ -445,6 +395,57 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0]["task_id"], "zcode:new");
         assert_eq!(tasks[1]["task_id"], "zcode:mid");
+    }
+
+    #[test]
+    fn running_session_wins_a_capacity_limited_snapshot() {
+        let connection = fixture_db();
+        connection
+            .execute_batch(
+                "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated, task_type)
+                 VALUES ('running-old', 'p1', 'running-old', 'D:\\proj', 'Running', '1', 1, 1, 'interactive'),
+                        ('idle-new', 'p1', 'idle-new', 'D:\\proj', 'Idle', '1', 2, 100, 'interactive');
+                 INSERT INTO model_usage (id, logical_request_id, session_id, provider_id, model_id, status, started_at, completed_at)
+                 VALUES ('mu-running', 'r-running', 'running-old', 'provider', 'model', 'running', 1, NULL),
+                        ('mu-idle', 'r-idle', 'idle-new', 'provider', 'model', 'completed', 100, 100);",
+            )
+            .unwrap();
+
+        let snapshot = read_zcode_snapshot_from_connection(&connection, 100, 1).unwrap();
+        let tasks = snapshot["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["task_id"], "zcode:running-old");
+        assert_eq!(tasks[0]["state"], "running");
+    }
+
+    #[test]
+    fn equal_start_times_use_the_last_inserted_usage_row() {
+        let connection = fixture_db();
+        connection
+            .execute_batch(
+                "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated, task_type)
+                 VALUES ('tie', 'p1', 'tie', 'D:\\proj', 'Tie', '1', 1, 10, 'interactive');
+                 INSERT INTO model_usage (id, logical_request_id, session_id, provider_id, model_id, status, started_at, completed_at)
+                 VALUES ('first', 'r1', 'tie', 'provider', 'model', 'completed', 10, 10),
+                        ('second', 'r2', 'tie', 'provider', 'model', 'running', 10, NULL);",
+            )
+            .unwrap();
+
+        let snapshot = read_zcode_snapshot_from_connection(&connection, 10, 1).unwrap();
+        assert_eq!(snapshot["tasks"][0]["state"], "running");
+    }
+
+    #[test]
+    fn unknown_status_is_visible_as_error() {
+        let latest = ModelUsage {
+            status: "unexpected".to_owned(),
+            model_id: None,
+            variant: None,
+            started_at: 1,
+            completed_at: None,
+        };
+
+        assert_eq!(derive_state(&latest, 1, 1), "error");
     }
 
     #[test]

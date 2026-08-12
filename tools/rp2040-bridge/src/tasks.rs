@@ -9,10 +9,29 @@ use crate::routing::AgentId;
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskAction {
+    pub id: String,
+    pub label: String,
+    pub action: String,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskInteraction {
+    pub id: String,
+    pub kind: String,
+    pub prompt: String,
+    pub short: Option<TaskAction>,
+    pub long: Option<TaskAction>,
+    pub expires_at_ms: Option<u128>,
+
+
+}
 use std::time::Duration;
 
 pub const RECONNECT_GRACE: Duration = Duration::from_secs(30);
-pub const RECENT_COMPLETION_HIGHLIGHT: Duration = Duration::from_secs(30);
 pub const CODEX_TASK_SLOTS: usize = 6;
 
 /// Returns the task title as it should appear on the Stream Deck strip.
@@ -163,6 +182,7 @@ pub struct TaskCard {
     /// show the final elapsed time instead of resetting the card.
     pub finished_at_ms: Option<u128>,
     pub reconnect_until_ms: Option<u128>,
+    pub interaction: Option<TaskInteraction>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -562,6 +582,7 @@ impl TaskBoard {
         let workspace_path = text_field("workspace_path");
         let model = text_field("model");
         let effort = text_field("effort");
+        let interaction = parse_interaction(object.get("interaction"))?;
         let explicit_state = object
             .get("state")
             .or_else(|| object.get("status"))
@@ -644,6 +665,7 @@ impl TaskBoard {
             finished_at_ms: explicit_finished_at
                 .or_else(|| (state == TaskState::Completed).then_some(now_ms)),
             reconnect_until_ms: None,
+            interaction,
         })
     }
 
@@ -902,6 +924,17 @@ impl TaskBoard {
             json!(display_task_title(slot, task_title)),
         );
         context.insert("status".to_owned(), json!(task.state.as_str()));
+        if let Some(interaction) = task.interaction.as_ref() {
+            context.insert("wait_reason".to_owned(), json!(interaction.kind));
+            context.insert("prompt".to_owned(), json!(interaction.prompt));
+            context.insert("interaction_id".to_owned(), json!(interaction.id));
+            if let Some(action) = interaction.short.as_ref() {
+                context.insert("short_action".to_owned(), json!(action.label));
+            }
+            if let Some(action) = interaction.long.as_ref() {
+                context.insert("long_action".to_owned(), json!(action.label));
+            }
+        }
         if let Some(progress) = task.progress {
             context.insert("progress".to_owned(), json!(progress));
         }
@@ -951,30 +984,14 @@ impl TaskBoard {
                 // case suppresses the Stream Deck status palette. Queued
                 // cards always retain the initial dark-grey idle background.
                 let selected = self.selected(device_id) == Some(task.task_id.as_str());
-                let recently_finished = task.state == TaskState::Completed
-                    && task.finished_at_ms.is_some_and(|finished_at_ms| {
-                        self.now_ms.saturating_sub(finished_at_ms)
-                            <= RECENT_COMPLETION_HIGHLIGHT.as_millis()
-                    });
-                let completion_highlighted =
-                    recently_finished && (selected || task.owner_agent != AgentId::Codex);
-                // Codex completion green is focused. Auto-polled MCP agents
-                // have no authoritative desktop focus, so recency alone is
-                // their bounded result signal.
+                // A completed task stays green until it is selected. Selection acknowledges
+                // the completion in `select`, which changes the task back to queued
+                // and lets the next source snapshot retain that acknowledgement.
+                let completed = task.state == TaskState::Completed;
                 let color = if task.legacy_key.is_some() {
-                    // Codex HID colors also carry selection presentation. Once
-                    // adapted into a TaskCard, lifecycle state is the semantic
-                    // source of truth and selection must not repaint it.
-                    if task.state == TaskState::Completed && !completion_highlighted {
-                        TaskState::Queued.display_color()
-                    } else {
-                        task.state.display_color()
-                    }
+                    task.state.display_color()
                 } else {
                     match task.state {
-                        TaskState::Completed if !completion_highlighted => {
-                            TaskState::Queued.display_color()
-                        }
                         TaskState::Queued | TaskState::Completed | TaskState::Reconnecting => {
                             task.state.display_color()
                         }
@@ -985,7 +1002,7 @@ impl TaskBoard {
                     "e": 1,
                     "id": slot,
                     "selected": selected,
-                    "recently_finished": recently_finished,
+                    "recently_finished": completed,
                     // Keep the semantic title separate from `t`, whose legacy
                     // fallback is an HID key label such as AG03. Stream Deck
                     // strips can then preserve a richer display-context name.
@@ -1003,11 +1020,22 @@ impl TaskBoard {
                     "agent": task.owner_agent.as_str(),
                     "started_at_ms": task.started_at_ms,
                     "finished_at_ms": task.finished_at_ms,
-                    "source_slot": task.source_slot
+                    "source_slot": task.source_slot,
+                    "interaction": task.interaction.as_ref().map(interaction_value)
                 })
             })
             .collect()
     }
+    pub fn auto_select_waiting(&mut self, device_id: &str, now_ms: u128) -> Option<Value> {
+        let task_id = self.tasks.values().filter(|task| task.state == TaskState::Waiting && task.interaction.as_ref().is_some_and(|i| i.expires_at_ms.is_none_or(|expires| expires > now_ms))).filter_map(|task| { let assignment = self.assignment(&task.task_id)?; (assignment.slot.device_id == device_id).then_some(task) }).max_by(|a, b| b.priority.cmp(&a.priority).then(a.updated_at_ms.cmp(&b.updated_at_ms)).then(b.task_id.cmp(&a.task_id)))?.task_id.clone();
+        if self.selected.as_deref() == Some(task_id.as_str()) { return None; }
+        let assignment = self.assignment(&task_id)?.slot.clone();
+        let task = self.tasks.get(&task_id)?;
+        self.selected = Some(task_id.clone());
+        self.pending_selection = (task.owner_agent == AgentId::Codex).then(|| (task_id.clone(), now_ms.saturating_add(2_000)));
+        Some(json!({"type":"task_selected","task_id":task_id,"device_id":assignment.device_id,"slot":assignment.slot,"owner_session":task.owner_session,"legacy_key":Value::Null,"automatic":true,"ts":now_ms}))
+    }
+
     pub fn status_json(&self) -> Value {
         let tasks = self.tasks.values().map(|task| {
             let assignment = self.assignment(&task.task_id).map(|a| json!({"device_id": a.slot.device_id, "slot": a.slot.slot}));
@@ -1204,6 +1232,47 @@ fn task_order(a: &TaskCard, b: &TaskCard) -> Ordering {
         .then(b.priority.cmp(&a.priority))
         .then(b.updated_at_ms.cmp(&a.updated_at_ms))
         .then(a.task_id.cmp(&b.task_id))
+}
+
+fn interaction_action_value(action: &TaskAction) -> Value {
+    json!({"id": action.id, "label": action.label, "action": action.action, "payload": action.payload})
+}
+
+fn interaction_value(interaction: &TaskInteraction) -> Value {
+    json!({"id": interaction.id, "kind": interaction.kind, "prompt": interaction.prompt, "short": interaction.short.as_ref().map(interaction_action_value), "long": interaction.long.as_ref().map(interaction_action_value), "expires_at_ms": interaction.expires_at_ms})
+}
+
+fn parse_interaction(value: Option<&Value>) -> Result<Option<TaskInteraction>, String> {
+    let Some(value) = value else { return Ok(None); };
+    let object = value.as_object().ok_or_else(|| "interaction must be an object".to_owned())?;
+    let text = |key: &str, required: bool| -> Result<Option<String>, String> {
+        match object.get(key) {
+            Some(Value::String(value)) if value.chars().count() <= 160 && !value.trim().is_empty() => Ok(Some(value.clone())),
+            None if !required => Ok(None),
+            None => Err(format!("interaction field {key} is required")),
+            Some(Value::String(_)) => Err(format!("interaction field {key} must be non-empty and at most 160 characters")),
+            Some(_) => Err(format!("interaction field {key} must be a string")),
+        }
+    };
+    let action = |key: &str| -> Result<Option<TaskAction>, String> {
+        let Some(value) = object.get(key) else { return Ok(None); };
+        let item = value.as_object().ok_or_else(|| format!("interaction action {key} must be an object"))?;
+        let id = item.get("id").and_then(Value::as_str).ok_or_else(|| format!("interaction action {key}.id is required"))?.to_owned();
+        let label = item.get("label").and_then(Value::as_str).ok_or_else(|| format!("interaction action {key}.label is required"))?.to_owned();
+        let action = item.get("action").and_then(Value::as_str).ok_or_else(|| format!("interaction action {key}.action is required"))?.to_owned();
+        Ok(Some(TaskAction { id, label, action, payload: item.get("payload").cloned().unwrap_or(Value::Null) }))
+    };
+    let id = text("id", true)?.unwrap();
+    let kind = text("kind", true)?.unwrap();
+    let prompt = text("prompt", true)?.unwrap();
+    let expires_at_ms = parse_timestamp_ms(object.get("expires_at_ms"))?;
+    let mut short = action("short")?;
+    let mut long = action("long")?;
+    if kind == "approval" {
+        short = short.or_else(|| Some(TaskAction { id: "approve".to_owned(), label: "Approve".to_owned(), action: "approve".to_owned(), payload: Value::Null }));
+        long = long.or_else(|| Some(TaskAction { id: "reject".to_owned(), label: "Reject".to_owned(), action: "reject".to_owned(), payload: Value::Null }));
+    }
+    Ok(Some(TaskInteraction { id, kind, prompt, short, long, expires_at_ms }))
 }
 
 fn parse_timestamp_ms(value: Option<&Value>) -> Result<Option<u128>, String> {
@@ -1722,8 +1791,8 @@ mod tests {
         assert_eq!(task.state, TaskState::Completed);
         assert_eq!(task.started_at_ms, Some(10));
         assert_eq!(task.finished_at_ms, Some(30));
-        // Completion is retained, but an unselected card presents as idle.
-        assert_eq!(board.rendered_slots("primary", 1)[0]["c"], 0x37474f);
+        // Completion remains green until the card is selected.
+        assert_eq!(board.rendered_slots("primary", 1)[0]["c"], 0x1b5e20);
     }
 
     #[test]
@@ -2241,7 +2310,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_zcode_completion_is_green_without_hardware_selection() {
+    fn zcode_completion_stays_green_until_selection() {
         let mut board = TaskBoard::new();
         board.set_device("deck", 1, true);
         board
@@ -2258,14 +2327,14 @@ mod tests {
         assert_eq!(cards[0]["recently_finished"], true);
         assert_eq!(cards[0]["c"], 0x1b5e20);
 
-        board.expire(30_201);
-        let expired = board.rendered_slots("deck", 1);
-        assert_eq!(expired[0]["recently_finished"], false);
-        assert_eq!(expired[0]["c"], 0x37474f);
+        board.select("deck", 0, 30_201).expect("select completed task");
+        let reviewed = board.rendered_slots("deck", 1);
+        assert_eq!(reviewed[0]["status"], "queued");
+        assert_eq!(reviewed[0]["c"], 0x37474f);
     }
 
     #[test]
-    fn recent_hermes_completion_is_green_without_hardware_selection() {
+    fn hermes_completion_stays_green_until_selection() {
         let mut board = TaskBoard::new();
         board.set_device("deck", 1, true);
         board
@@ -2282,14 +2351,14 @@ mod tests {
         assert_eq!(cards[0]["recently_finished"], true);
         assert_eq!(cards[0]["c"], 0x1b5e20);
 
-        board.expire(30_201);
-        let expired = board.rendered_slots("deck", 1);
-        assert_eq!(expired[0]["recently_finished"], false);
-        assert_eq!(expired[0]["c"], 0x37474f);
+        board.select("deck", 0, 30_201).expect("select completed task");
+        let reviewed = board.rendered_slots("deck", 1);
+        assert_eq!(reviewed[0]["status"], "queued");
+        assert_eq!(reviewed[0]["c"], 0x37474f);
     }
 
     #[test]
-    fn completion_green_requires_the_completed_task_to_be_selected() {
+    fn completion_green_persists_until_selected() {
         let mut board = TaskBoard::new();
         board.set_device("deck", 2, true);
         board.set_slot_owners("deck", vec![Some(AgentId::Codex); 2]);
@@ -2330,15 +2399,18 @@ mod tests {
         assert_eq!(cards[0]["c"], 0x1b5e20);
         assert_eq!(cards[1]["selected"], false);
         assert_eq!(cards[1]["recently_finished"], true);
-        assert_eq!(cards[1]["c"], 0x37474f);
+        assert_eq!(cards[1]["c"], 0x1b5e20);
 
-        // Selection alone must not revive the completion highlight after its
-        // recency window expires.
+        // Time does not clear an unselected completion. Selecting the card
+        // acknowledges it and returns it to the idle palette.
         board.expire(30_201);
-        let expired = board.rendered_slots("deck", 2);
-        assert_eq!(expired[0]["selected"], true);
-        assert_eq!(expired[0]["recently_finished"], false);
-        assert_eq!(expired[0]["c"], 0x37474f);
+        let persistent = board.rendered_slots("deck", 2);
+        assert_eq!(persistent[0]["c"], 0x1b5e20);
+        assert_eq!(persistent[1]["c"], 0x1b5e20);
+        board.select("deck", 0, 30_202).expect("select completed task");
+        let reviewed = board.rendered_slots("deck", 2);
+        assert_eq!(reviewed[0]["status"], "queued");
+        assert_eq!(reviewed[0]["c"], 0x37474f);
     }
 
     #[test]
@@ -2441,5 +2513,18 @@ mod tests {
                 .count(),
             1
         );
+    }
+    #[test]
+    fn approval_interaction_defaults_and_auto_selects_waiting_task() {
+        let mut board = TaskBoard::new();
+        board.set_device("deck", 2, true);
+        board.publish_tasks(7, AgentId::Hermes, &json!({"tasks":[{"task_id":"approval","title":"Deploy","state":"waiting","priority":90,"interaction":{"id":"ask-1","kind":"approval","prompt":"Deploy now?"}}]}), 100).unwrap();
+        let selection = board.auto_select_waiting("deck", 100).expect("automatic selection");
+        assert_eq!(selection["task_id"], "approval");
+        let rendered = board.rendered_slots("deck", 2);
+        assert_eq!(rendered[0]["interaction"]["short"]["action"], "approve");
+        assert_eq!(rendered[0]["interaction"]["long"]["action"], "reject");
+        let context = board.selected_display_context("deck").unwrap();
+        assert_eq!(context["prompt"], "Deploy now?");
     }
 }

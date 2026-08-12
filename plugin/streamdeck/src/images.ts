@@ -79,7 +79,6 @@ export function renderTaskCardImage(
     startedAtMs?: number,
     finishedAtMs?: number,
     selected = false,
-    recentlyFinished = false,
 ): string {
     const normalizedStatus = status.toLowerCase();
     // Codex can send a white legacy `c` value with an idle thstatus entry.
@@ -87,11 +86,10 @@ export function renderTaskCardImage(
     const override = normalizeColor(colorOverride);
     const isWorking = ["running", "working", "active", "thinking"].includes(normalizedStatus);
     const isFinished = ["completed", "complete", "done"].includes(normalizedStatus);
-    const completionHighlighted = isFinished && selected && recentlyFinished;
     const color = normalizedStatus === "idle"
         ? STATUS_COLORS.idle
         : isFinished
-            ? (completionHighlighted ? STATUS_COLORS.completed : STATUS_COLORS.idle)
+            ? STATUS_COLORS.completed
         // Legacy status messages sometimes carry white as a placeholder `c`.
         // It must not replace the semantic task-state background.
         : override === "#ffffff"
@@ -106,10 +104,10 @@ export function renderTaskCardImage(
     const originX = Math.floor((w - digitW) / 2);
     const originY = 42;
     const agentLabel = agent ? agent.toUpperCase() : "";
-    const elapsed = isWorking || completionHighlighted
+    const elapsed = isWorking || isFinished
         ? formatElapsed(startedAtMs, finishedAtMs, isFinished)
         : undefined;
-    const timerColor = completionHighlighted ? "#a5d6a7" : "#90caf9";
+    const timerColor = isFinished ? "#a5d6a7" : "#90caf9";
 
     return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
   <rect x="4" y="4" width="${w - 8}" height="${h - 8}" rx="12" fill="${color}" stroke="#000" stroke-opacity="0.2" stroke-width="1"/>
@@ -137,6 +135,81 @@ export function renderDisconnectedImage(label: string): string {
 </svg>`);
 }
 
+/** Fixed modes supported by the non-Plus Context key. */
+export type ContextKeyMode = "task" | "model" | "usage";
+
+/** Renders one LCD-strip context screen as a square Stream Deck key. */
+export function renderContextKeyImage(mode: ContextKeyMode, ctx: StripContext, connected = true): string {
+    const title = mode === "task" ? "TASK INFO" : mode === "model" ? "MODEL INFO" : "USAGE INFO";
+    if (!connected) {
+        return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">
+  <rect x="4" y="4" width="136" height="136" rx="12" fill="#161b1f" stroke="#333"/>
+  <text x="72" y="50" font-family="sans-serif" font-size="12" font-weight="bold" fill="#777" text-anchor="middle">${title}</text>
+  <text x="72" y="88" font-family="sans-serif" font-size="18" font-weight="bold" fill="#555" text-anchor="middle">OFFLINE</text>
+</svg>`);
+    }
+    const body = mode === "task" ? renderContextTaskBody(ctx)
+        : mode === "model" ? renderContextModelBody(ctx)
+            : renderContextUsageBody(ctx);
+    return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">
+  <rect x="4" y="4" width="136" height="136" rx="12" fill="#10161a" stroke="#000" stroke-opacity="0.4"/>
+  <text x="12" y="22" font-family="sans-serif" font-size="10" font-weight="bold" letter-spacing="1" fill="#607d8b">${title}</text>
+  ${body}
+</svg>`);
+}
+
+function renderContextTaskBody(ctx: StripContext): string {
+    const taskId = truncate(String(ctx.task_number ?? ctx.task_id ?? "—"), 9);
+    const project = truncate(ctx.project ?? "—", 18);
+    const task = truncate(ctx.task ?? "—", 20);
+    return `<text x="12" y="56" font-family="monospace" font-size="26" font-weight="bold" fill="#90caf9">#${escapeXml(String(taskId))}</text>
+  <text x="12" y="78" font-family="sans-serif" font-size="12" fill="#a5d6a7">${escapeXml(project)}</text>
+  <text x="12" y="111" font-family="sans-serif" font-size="16" font-weight="bold" fill="#fff">${escapeXml(task)}</text>
+  <text x="12" y="130" font-family="sans-serif" font-size="9" fill="#607d8b">SELECTED TASK</text>`;
+}
+
+function renderContextModelBody(ctx: StripContext): string {
+    const hasModel = ctx.model != null && ctx.model !== "";
+    const hasEffort = ctx.effort != null && ctx.effort !== "";
+    const status = ctx.status ?? "—";
+    const progress = ctx.progress != null ? `${ctx.progress}%` : "—";
+    const topLabel = hasModel ? "MODEL" : "STATUS";
+    const topValue = truncate(hasModel ? (ctx.model as string) : status.toUpperCase(), 17);
+    const topColor = hasModel ? "#ce93d8" : STATUS_COLORS[status.toLowerCase()] ?? "#ce93d8";
+    const bottomLabel = hasEffort ? "EFFORT" : "PROGRESS";
+    const bottomValue = truncate(hasEffort ? (ctx.effort as string) : progress, 14);
+    const bottomColor = hasEffort ? "#ffcc80" : "#90caf9";
+    return `<text x="12" y="47" font-family="sans-serif" font-size="9" fill="#607d8b">${topLabel}</text>
+  <text x="12" y="70" font-family="sans-serif" font-size="17" font-weight="bold" fill="${topColor}">${escapeXml(topValue)}</text>
+  <text x="12" y="92" font-family="sans-serif" font-size="9" fill="#607d8b">${bottomLabel}</text>
+  <text x="12" y="116" font-family="sans-serif" font-size="16" font-weight="bold" fill="${bottomColor}">${escapeXml(bottomValue)}</text>`;
+}
+
+function renderContextUsageBody(ctx: StripContext): string {
+    const hasUsage = ctx.five_hour_remaining != null || ctx.weekly_remaining != null;
+    if (hasUsage) return `${usageBarKey("5H", ctx.five_hour_remaining, 42)}\n  ${usageBarKey("WK", ctx.weekly_remaining, 82)}`;
+    const status = (ctx.status ?? "idle").toUpperCase();
+    const progress = ctx.progress != null ? `${ctx.progress}%` : "—";
+    const statusColor = STATUS_COLORS[(ctx.status ?? "idle").toLowerCase()] ?? "#37474f";
+    return `<text x="12" y="52" font-family="sans-serif" font-size="9" fill="#607d8b">STATUS</text>
+  <text x="12" y="75" font-family="sans-serif" font-size="17" font-weight="bold" fill="${statusColor}">${escapeXml(status)}</text>
+  <text x="12" y="98" font-family="sans-serif" font-size="9" fill="#607d8b">PROGRESS</text>
+  <text x="12" y="121" font-family="sans-serif" font-size="16" font-weight="bold" fill="#90caf9">${escapeXml(progress)}</text>`;
+}
+
+function usageBarKey(label: string, remaining: number | null | undefined, y: number): string {
+    const barX = 34;
+    const barW = 66;
+    const pct = remaining ?? null;
+    const width = pct === null ? 0 : Math.round((barW * Math.max(0, Math.min(100, pct))) / 100);
+    const color = pct === null ? "#333" : pct <= 10 ? "#b71c1c" : pct <= 25 ? "#ef6c00" : "#2e7d32";
+    const text = pct === null ? "—" : `${pct}%`;
+    return `<text x="12" y="${y + 12}" font-family="monospace" font-size="11" font-weight="bold" fill="#90a4ae">${label}</text>
+  <rect x="${barX}" y="${y}" width="${barW}" height="14" rx="7" fill="#333"/>
+  <rect x="${barX}" y="${y}" width="${width}" height="14" rx="7" fill="${color}"/>
+  <text x="132" y="${y + 13}" font-family="monospace" font-size="18" font-weight="bold" fill="#fff" text-anchor="end">${escapeXml(text)}</text>`;
+}
+
 // --- Touch strip canvases (200x100, one encoder slot on the Stream Deck+) ---
 
 const STRIP_W = 200;
@@ -162,6 +235,7 @@ export function renderStripOffline(label: string): string {
 
 /** Strip context fields shared by the dial canvases. */
 export interface StripContext {
+    agent?: string | null;
     project?: string | null;
     task?: string | null;
     model?: string | null;
@@ -174,15 +248,16 @@ export interface StripContext {
     five_hour_remaining?: number | null;
 }
 
-/** Knob strip: task number, project, shortened task name. */
+/** Knob strip: task number, project, shortened task name, and owning agent. */
 export function renderKnobStrip(ctx: StripContext): string {
     const taskId = ctx.task_number ?? ctx.task_id ?? "—";
+    const agent = truncate((ctx.agent ?? agentFromTaskId(ctx.task_id) ?? "—").toUpperCase(), 12);
     const project = truncate(ctx.project ?? "—", 18);
     const task = truncate(ctx.task ?? "—", 24);
     return stripSvg(`<text x="10" y="26" font-family="monospace" font-size="13" font-weight="bold" fill="#90caf9">#${escapeXml(String(taskId))}</text>
   <text x="${STRIP_W - 10}" y="26" font-family="sans-serif" font-size="12" fill="#a5d6a7" text-anchor="end">${escapeXml(project)}</text>
   <text x="${STRIP_W / 2}" y="58" font-family="sans-serif" font-size="14" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(task)}</text>
-  <text x="${STRIP_W / 2}" y="84" font-family="sans-serif" font-size="10" fill="#666" text-anchor="middle">KNOB</text>`);
+  <text x="${STRIP_W / 2}" y="84" font-family="sans-serif" font-size="16" font-weight="bold" fill="#6366f1" text-anchor="middle">${escapeXml(agent)}</text>`);
 }
 
 /** Crux horizontal strip: model / effort, or status / progress as fallback. */
@@ -313,3 +388,7 @@ function truncate(text: string, maxLen: number): string {
     return text.slice(0, maxLen - 1) + "…";
 }
 
+function agentFromTaskId(taskId: string | null | undefined): string | undefined {
+    const prefix = taskId?.match(/^([^:]+):/u)?.[1];
+    return prefix ? prefix : undefined;
+}

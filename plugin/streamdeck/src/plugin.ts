@@ -10,6 +10,7 @@ import { CruxVerticalAction } from "./actions/crux-vertical";
 import { MicAction } from "./actions/mic";
 import { SendAction } from "./actions/send";
 import { ArrowKeyAction } from "./actions/arrow-key";
+import { ContextKeyAction } from "./actions/context";
 import { CodexActionExecutor } from "./codex-action-executor";
 
 // --- Daemon client setup ---
@@ -49,6 +50,7 @@ streamDeck.actions.registerAction(new CruxVerticalAction(ctx));
 streamDeck.actions.registerAction(new MicAction(ctx));
 streamDeck.actions.registerAction(new SendAction(ctx));
 streamDeck.actions.registerAction(new ArrowKeyAction(ctx));
+streamDeck.actions.registerAction(new ContextKeyAction(ctx));
 // --- Connect to the Stream Deck and the daemon ---
 // Stream Deck+ exposes eight physical key slots (4x2). Report this before
 // connecting so the daemon can route Task Card presses immediately.

@@ -7,6 +7,7 @@
     --micro: #67d6a4;
     --bridge: #7cb7ff;
     --agent: #b6a6ff;
+    --system: #56c2d6;
 }
 
 body {
@@ -49,6 +50,7 @@ body {
 }
 
 .executor-badge[data-executor="Bridge"] { color: var(--bridge); }
+.executor-badge[data-executor="System"] { color: var(--system); }
 .executor-badge[data-executor="Agent"] { color: var(--agent); }
 .executor-badge[data-executor="Codex"] { color: var(--agent); }
 .executor-badge[data-executor="Legacy"] { color: #ffbb6e; }

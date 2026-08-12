@@ -36,9 +36,9 @@ const REPARTITION_DEBOUNCE: Duration = Duration::from_millis(750);
 const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How often the daemon polls ZCode's session database to mirror live
-/// activity on the task board. 3 seconds keeps the Stream Deck responsive
+/// activity on the task board. One second keeps the Stream Deck responsive
 /// without hammering the SQLite file.
-const ZCODE_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const ZCODE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Hermes' canonical SQLite state is local and WAL-backed. One second keeps
 /// cards responsive while avoiding contention with the running agent.
 const HERMES_POLL_INTERVAL: Duration = Duration::from_secs(1);

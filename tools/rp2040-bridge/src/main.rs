@@ -12,6 +12,7 @@ mod proxy;
 mod routing;
 mod serial;
 mod streamdeck;
+mod system_audio;
 mod tasks;
 mod wire;
 mod zcode_state;
@@ -526,6 +527,12 @@ fn connection_default_context() -> DisplayContext {
         task_id: None,
         weekly_remaining: None,
         five_hour_remaining: None,
+        wait_reason: None,
+        prompt: None,
+        interaction_id: None,
+        short_action: None,
+        long_action: None,
+        pending_wait_count: None,
     }
 }
 
@@ -604,6 +611,12 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
             task_id: Some(task.task_id.clone()),
             weekly_remaining,
             five_hour_remaining,
+            wait_reason: None,
+            prompt: None,
+            interaction_id: None,
+            short_action: None,
+            long_action: None,
+            pending_wait_count: None,
         }
     } else {
         DisplayContext {
@@ -616,6 +629,12 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
             task_id: None,
             weekly_remaining,
             five_hour_remaining,
+            wait_reason: None,
+            prompt: None,
+            interaction_id: None,
+            short_action: None,
+            long_action: None,
+            pending_wait_count: None,
         }
     };
     bridge.last_display_context = Some(context);
@@ -824,6 +843,12 @@ fn overlay_display_context(base: &DisplayContext, selected: DisplayContext) -> D
         task_id: selected.task_id.or_else(|| base.task_id.clone()),
         weekly_remaining: selected.weekly_remaining.or(base.weekly_remaining),
         five_hour_remaining: selected.five_hour_remaining.or(base.five_hour_remaining),
+        wait_reason: selected.wait_reason.or_else(|| base.wait_reason.clone()),
+        prompt: selected.prompt.or_else(|| base.prompt.clone()),
+        interaction_id: selected.interaction_id.or_else(|| base.interaction_id.clone()),
+        short_action: selected.short_action.or_else(|| base.short_action.clone()),
+        long_action: selected.long_action.or_else(|| base.long_action.clone()),
+        pending_wait_count: selected.pending_wait_count.or(base.pending_wait_count),
     }
 }
 
@@ -844,6 +869,10 @@ fn apply_controller_state(
 }
 
 fn replay_primary_controller_state(bridge: &mut BridgeRuntime) -> Result<(), String> {
+    if let Some(selection) = bridge.task_board.auto_select_waiting(&bridge.task_device_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)) {
+        let session = selection["owner_session"].as_u64().unwrap_or(0) as usize;
+        bridge.pending_task_events.push((session, selection));
+    }
     let cards = desired_primary_cards(bridge);
     let context = desired_context(bridge);
     let rgb_config = bridge.last_rgb_config.clone();
@@ -860,6 +889,10 @@ fn replay_primary_controller_state(bridge: &mut BridgeRuntime) -> Result<(), Str
 pub(crate) fn refresh_task_board(bridge: &mut BridgeRuntime) -> Result<(), String> {
     if !bridge.task_mode {
         return Ok(());
+    }
+    if let Some(selection) = bridge.task_board.auto_select_waiting(&bridge.task_device_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)) {
+        let session = selection["owner_session"].as_u64().unwrap_or(0) as usize;
+        bridge.pending_task_events.push((session, selection));
     }
     let cards = desired_primary_cards(bridge);
     let context = desired_context(bridge);
@@ -1284,6 +1317,18 @@ fn route_task_button(
     }
     true
 }
+fn route_task_action(bridge: &mut BridgeRuntime, device_id: &str, slot_count: usize, index: u8, gesture: &str, now_ms: u128) -> bool {
+    if !bridge.task_mode || usize::from(index) >= slot_count { return false; }
+    let Some(task) = bridge.task_board.task_at(device_id, usize::from(index)).cloned() else { return false; };
+    if task.state != crate::tasks::TaskState::Waiting || bridge.task_board.selected_task().is_none_or(|selected| selected.task_id != task.task_id) { return true; }
+    let Some(interaction) = task.interaction.as_ref() else { return true; };
+    if interaction.expires_at_ms.is_some_and(|expires| expires <= now_ms) { return true; }
+    let action = match gesture { "short" => interaction.short.as_ref(), "long" => interaction.long.as_ref(), _ => None };
+    let Some(action) = action else { return true; };
+    bridge.pending_task_events.push((task.owner_session, json!({"type":"task_action","task_id":task.task_id,"interaction_id":interaction.id,"action_id":action.id,"action":action.action,"payload":action.payload,"gesture":gesture,"ts":now_ms})));
+    true
+}
+
 fn route_task_toggle(
     bridge: &mut BridgeRuntime,
     device_id: &str,
@@ -1432,6 +1477,15 @@ fn route_catalog_action(
         return;
     }
 
+    // System actions are independent of any task or agent and must not require
+    // the emulated Codex Micro device.
+    if matches!(action, CatalogAction::SystemMicToggle) {
+        if let Err(error) = crate::system_audio::toggle_mic_mute() {
+            eprintln!("System mic toggle failed: {error}");
+        }
+        return;
+    }
+
     let task = bridge.task_board.selected_task().cloned();
     let (session, agent) = catalog_target_session(task.as_ref());
     match action {
@@ -1486,18 +1540,19 @@ fn route_model_cycle(bridge: &mut BridgeRuntime) {
         ));
         return;
     }
-    let current_model = bridge
-        .task_board
-        .selected_task()
-        .and_then(|task| task.model.as_deref())
-        .or_else(|| {
-            bridge
-                .last_display_context
-                .as_ref()
-                .and_then(|context| context.model.as_deref())
-        });
-    match crate::codex_window::cycle_model(current_model) {
-        Ok(model) => eprintln!("Codex model selected: {model}"),
+    match crate::codex_window::cycle_model() {
+        Ok(model) => {
+            // Mirror the freshly written config into the display context so the
+            // strip reflects the cycled model immediately. A selected task with
+            // its own per-thread model still overlays this value (see
+            // `overlay_display_context`), so this is most visible when no task
+            // is selected or the task has no model of its own.
+            if let Some(context) = bridge.last_display_context.as_mut() {
+                context.model = Some(model.to_owned());
+            }
+            let _ = crate::refresh_task_board(bridge);
+            eprintln!("Codex model selected: {model}");
+        }
         Err(error) => eprintln!("Codex model cycle failed: {error}"),
     }
 }
@@ -1515,7 +1570,13 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
                     route_model_cycle(bridge);
                     continue;
                 }
-                if let crate::codex::PhysicalEvent::TaskButton { index, pressed } = event {
+                if let crate::codex::PhysicalEvent::TaskAction { index, gesture } = event {
+            let task_device_id = bridge.task_device_id.clone();
+            let task_slot_count = bridge.task_slot_count;
+            route_task_action(bridge, &task_device_id, task_slot_count, index, if gesture == 0 { "short" } else { "long" }, now_ms);
+            continue;
+        }
+        if let crate::codex::PhysicalEvent::TaskButton { index, pressed } = event {
                     let task_device_id = bridge.task_device_id.clone();
                     let task_slot_count = bridge.task_slot_count;
                     route_task_button(
@@ -1642,6 +1703,12 @@ fn route_task_device_events(
         }
         if let crate::codex::PhysicalEvent::TaskToggle { index } = event {
             route_task_toggle(bridge, device_id, slot_count, index, now_ms);
+            continue;
+        }
+        if let crate::codex::PhysicalEvent::TaskAction { index, gesture } = event {
+            let task_device_id = bridge.task_device_id.clone();
+            let task_slot_count = bridge.task_slot_count;
+            route_task_action(bridge, &task_device_id, task_slot_count, index, if gesture == 0 { "short" } else { "long" }, now_ms);
             continue;
         }
         if let crate::codex::PhysicalEvent::TaskButton { index, pressed } = event {

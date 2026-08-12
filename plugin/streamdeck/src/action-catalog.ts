@@ -15,7 +15,7 @@ export interface ActionCatalogItem {
     title: string;
     description: string;
     icon: string;
-    executor: "Micro" | "Bridge" | "Codex" | "Unavailable";
+    executor: "Micro" | "Bridge" | "Codex" | "System" | "Unavailable";
     dispatch: ActionDispatch;
 }
 
@@ -39,6 +39,10 @@ export const ACTION_CATALOG: readonly ActionCatalogItem[] = [
     { id: "micro.down", category: "Codex Micro", label: "Navigate down", title: "Down", description: "Move the Codex Micro radial control downward one step.", icon: "down", executor: "Micro", dispatch: { kind: "encoder-turn", index: 2, delta: -1 } },
     { id: "micro.left", category: "Codex Micro", label: "Navigate left", title: "Left", description: "Move the Codex Micro radial control left one step.", icon: "left", executor: "Micro", dispatch: { kind: "encoder-turn", index: 0, delta: -1 } },
     { id: "micro.right", category: "Codex Micro", label: "Navigate right", title: "Right", description: "Move the Codex Micro radial control right one step.", icon: "right", executor: "Micro", dispatch: { kind: "encoder-turn", index: 0, delta: 1 } },
+
+    // System controls run on the bridge and do not require the emulated Codex
+    // Micro device, so they work without the RP2040 attached.
+    { id: "system.mic-toggle", category: "System", label: "Microphone mute (system)", title: "Mute Mic", description: "Toggle the operating-system default microphone mute. Runs on the bridge; no Codex Micro device required.", icon: "mic", executor: "System", dispatch: { kind: "catalog-action" } },
 
     // These are implemented inside the bridge and do not require agent support.
     { id: "task.previous", category: "Task navigation", label: "Previous task", title: "Prev Task", description: "Select the previous occupied Task Card, wrapping at the beginning.", icon: "previous", executor: "Bridge", dispatch: { kind: "catalog-action" } },

@@ -5,7 +5,6 @@
 //! proxy is connected. Every query is read-only; a missing, locked, or older
 //! database simply disables the auto-feed without disturbing existing cards.
 
-use crate::tasks::RECENT_COMPLETION_HIGHLIGHT;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -224,7 +223,7 @@ fn derive_state(
     }
     let completed = activity.latest_role.as_deref() == Some("assistant")
         && matches!(finish, "stop" | "completed" | "length");
-    if completed && elapsed <= RECENT_COMPLETION_HIGHLIGHT.as_millis() {
+    if completed {
         return ("completed", Some(started_ms), Some(latest_ms));
     }
     ("queued", None, None)

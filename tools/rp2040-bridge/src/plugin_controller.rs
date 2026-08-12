@@ -119,6 +119,11 @@ fn parse_event(message: &Value) -> Option<PhysicalEvent> {
             let index = message.get("index").and_then(Value::as_u64)? as u8;
             Some(PhysicalEvent::TaskToggle { index })
         }
+        "task-action" => {
+            let index = message.get("index").and_then(Value::as_u64)? as u8;
+            let gesture = match message.get("gesture").and_then(Value::as_str)? { "short" => 0, "long" => 1, _ => return None };
+            Some(PhysicalEvent::TaskAction { index, gesture })
+        }
         "micro-key" => {
             let key = message.get("key").and_then(Value::as_str)?;
             let index = match key {
@@ -461,6 +466,12 @@ mod tests {
             task_id: None,
             weekly_remaining: None,
             five_hour_remaining: None,
+            wait_reason: None,
+            prompt: None,
+            interaction_id: None,
+            short_action: None,
+            long_action: None,
+            pending_wait_count: None,
         };
         controller.apply_display_context(&context).expect("apply");
         let line = writer_rx.recv().expect("render line");
@@ -485,6 +496,12 @@ mod tests {
             task_id: None,
             weekly_remaining: None,
             five_hour_remaining: None,
+            wait_reason: None,
+            prompt: None,
+            interaction_id: None,
+            short_action: None,
+            long_action: None,
+            pending_wait_count: None,
         };
 
         controller.apply_task_cards(&cards).unwrap();

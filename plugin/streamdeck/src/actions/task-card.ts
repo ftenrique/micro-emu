@@ -58,7 +58,12 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
             this.longPressTimers.delete(slot);
             if (!this.pressedSlots.has(slot)) return;
             this.longPressedSlots.add(slot);
-            this.ctx.daemon.sendTaskToggle(slot);
+            const current = this.ctx.getTaskCard(slot) ?? this.ctx.getSlot(slot);
+            if (isWaitingInteraction(current) && this.ctx.getSelectedTaskSlot() === slot && hasAction(current, "long")) {
+                this.ctx.daemon.sendTaskAction(slot, "long");
+            } else {
+                this.ctx.daemon.sendTaskToggle(slot);
+            }
         }, LONG_PRESS_MS));
     }
 
@@ -74,6 +79,11 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
         // A completed long press is a native window toggle, not a second task
         // click. Short presses retain the existing task-selection behavior.
         if (this.longPressedSlots.delete(slot)) return;
+        const current = this.ctx.getTaskCard(slot) ?? this.ctx.getSlot(slot);
+        if (isWaitingInteraction(current) && this.ctx.getSelectedTaskSlot() === slot && hasAction(current, "short")) {
+            this.ctx.daemon.sendTaskAction(slot, "short");
+            return;
+        }
         this.ctx.selectTaskSlot(slot);
         this.ctx.daemon.sendTaskButton(slot, true);
         this.ctx.daemon.sendTaskButton(slot, false);
@@ -138,7 +148,6 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
             : null;
         const color = taskCard?.color ?? taskCard?.c;
         const selected = this.ctx.getSelectedTaskSlot() === slot;
-        const recentlyFinished = taskCard?.recently_finished === true;
         // Assigned task records remain visible in every lifecycle state.
         // e:0 is reserved exclusively for an actually empty slot.
         if (!taskCard || (!enabled && !isFinishedStatus(status))) {
@@ -152,7 +161,6 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
             startedAt,
             finishedAt,
             selected,
-            recentlyFinished,
         ));
     }
 }
@@ -175,4 +183,16 @@ function isRunningStatus(status: string): boolean {
 
 function isFinishedStatus(status: string): boolean {
     return ["completed", "complete", "done"].includes(status.toLowerCase());
+}
+
+
+function isWaitingInteraction(card: Record<string, unknown> | null): boolean {
+    const state = String(card?.status ?? card?.state ?? "").toLowerCase();
+    return state === "waiting" && card?.interaction != null && typeof card.interaction === "object";
+}
+
+function hasAction(card: Record<string, unknown> | null, gesture: "short" | "long"): boolean {
+    if (!card?.interaction || typeof card.interaction !== "object") return false;
+    const action = (card.interaction as Record<string, unknown>)[gesture];
+    return action != null && typeof action === "object";
 }

@@ -718,6 +718,7 @@ fn render_window_image(
     let model = context.model.as_deref().unwrap_or("CODEX");
     let effort = context.effort.as_deref().unwrap_or("DEFAULT");
     let status = context.status.as_deref().unwrap_or("READY");
+    let actionable = context.prompt.as_deref();
 
     draw_text(&mut image, task, 16, 8, 2, [230, 235, 245]);
     draw_text(
@@ -728,6 +729,10 @@ fn render_window_image(
         1,
         [112, 205, 255],
     );
+    if let Some(prompt) = actionable {
+        draw_text(&mut image, &format!("{}: {}", context.wait_reason.as_deref().unwrap_or("WAITING"), prompt.chars().take(80).collect::<String>()), 16, 80, 1, [245, 175, 65]);
+        draw_text(&mut image, &format!("TAP {}  HOLD {}", context.short_action.as_deref().unwrap_or("—"), context.long_action.as_deref().unwrap_or("—")), 16, height.saturating_sub(18), 1, [255, 210, 120]);
+    }
     let progress_label = context
         .progress
         .map(|progress| format!("  {progress}%"))
@@ -782,8 +787,13 @@ fn render_usage_image(
         2,
         [230, 235, 245],
     );
+    if let Some(prompt) = context.prompt.as_deref() {
+        draw_text(&mut image, &format!("{}: {}", context.wait_reason.as_deref().unwrap_or("WAITING"), prompt.chars().take(80).collect::<String>()), 16, 80, 1, [245, 175, 65]);
+        draw_text(&mut image, &format!("TAP {}  HOLD {}", context.short_action.as_deref().unwrap_or("—"), context.long_action.as_deref().unwrap_or("—")), 16, height.saturating_sub(18), 1, [255, 210, 120]);
+    }
     if context.weekly_remaining.is_none() && context.five_hour_remaining.is_none() {
         let status = context.status.as_deref().unwrap_or("READY");
+    let _actionable = context.prompt.as_deref();
         let progress = context
             .progress
             .map(|value| format!("  |  PROGRESS {value}%"))
@@ -1502,6 +1512,12 @@ mod tests {
             display_context: Some(DisplayContext {
                 weekly_remaining: Some(73),
                 five_hour_remaining: Some(28),
+            wait_reason: None,
+            prompt: None,
+            interaction_id: None,
+            short_action: None,
+            long_action: None,
+            pending_wait_count: None,
                 ..DisplayContext::default()
             }),
             display_mode: DisplayMode::Context,
@@ -1518,6 +1534,12 @@ mod tests {
         let updated = DisplayContext {
             weekly_remaining: Some(42),
             five_hour_remaining: Some(81),
+            wait_reason: None,
+            prompt: None,
+            interaction_id: None,
+            short_action: None,
+            long_action: None,
+            pending_wait_count: None,
             ..DisplayContext::default()
         };
         device
@@ -1708,6 +1730,12 @@ mod tests {
             task_id: None,
             weekly_remaining: None,
             five_hour_remaining: None,
+            wait_reason: None,
+            prompt: None,
+            interaction_id: None,
+            short_action: None,
+            long_action: None,
+            pending_wait_count: None,
         };
         let image = render_window_image(&context, 800, 100, Rotation::None).unwrap();
         assert_eq!(
@@ -1725,6 +1753,12 @@ mod tests {
         let context = DisplayContext {
             weekly_remaining: Some(73),
             five_hour_remaining: Some(28),
+            wait_reason: None,
+            prompt: None,
+            interaction_id: None,
+            short_action: None,
+            long_action: None,
+            pending_wait_count: None,
             ..DisplayContext::default()
         };
         let image = render_usage_image(&context, 800, 100, Rotation::None).unwrap();

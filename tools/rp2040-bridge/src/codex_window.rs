@@ -21,13 +21,8 @@ mod native {
     const HWND_TOPMOST: Hwnd = -1;
     const HWND_NOTOPMOST: Hwnd = -2;
     const VK_CONTROL: u8 = 0x11;
-    const VK_SHIFT: u8 = 0x10;
     const VK_G: u8 = 0x47;
     const VK_OEM_3: u8 = 0xc0;
-    const VK_M: u8 = 0x4d;
-    const VK_HOME: u8 = 0x24;
-    const VK_DOWN: u8 = 0x28;
-    const VK_RETURN: u8 = 0x0d;
     const KEYEVENTF_KEYUP: u32 = 0x0002;
 
     const FEATURED_MODELS: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
@@ -156,28 +151,107 @@ mod native {
         Ok(())
     }
 
-    /// Opens Codex's model picker and selects the next featured model.
-    pub fn cycle_model(current_model: Option<&str>) -> Result<&'static str, String> {
-        show_and_focus()?;
-        let target = next_model_index(current_model);
+    /// Advances Codex's default model to the next featured entry by writing it
+    /// to `~/.codex/config.toml`.
+    ///
+    /// An earlier version opened the desktop picker with `Ctrl+Shift+M` and
+    /// steered it with arrow keys, but that shortcut opens the *reasoning
+    /// effort* picker, so a press changed effort instead of the model and the
+    /// dialog only flashed. `config.toml` is the same source the bridge reads
+    /// to display the current model (see `read_codex_config`), so writing it
+    /// keeps Codex and the strip in agreement. Codex applies the new model to
+    /// threads started afterwards — and immediately if the running app watches
+    /// its config file.
+    pub fn cycle_model() -> Result<&'static str, String> {
+        let path = codex_config_path()?;
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let target = next_model_index(read_current_model(&content).as_deref());
+        let new_model = FEATURED_MODELS[target];
 
-        unsafe {
-            key_down(VK_CONTROL);
-            key_down(VK_SHIFT);
-            tap_key(VK_M);
-            key_up(VK_SHIFT);
-            key_up(VK_CONTROL);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        let updated = replace_top_level_model(&content, new_model);
+        std::fs::write(&path, updated)
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+        Ok(new_model)
+    }
 
-        unsafe {
-            tap_key(VK_HOME);
-            for _ in 0..target {
-                tap_key(VK_DOWN);
+    fn codex_config_path() -> Result<std::path::PathBuf, String> {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .map_err(|error| format!("could not resolve home directory: {error}"))?;
+        Ok(std::path::Path::new(&home).join(".codex").join("config.toml"))
+    }
+
+    /// Returns the value of the top-level `model` key, ignoring any keys that
+    /// appear under a `[table]` header. Mirrors the bridge's display reader,
+    /// which only honors keys before the first section.
+    fn read_current_model(content: &str) -> Option<String> {
+        let mut in_section = false;
+        let mut current = None;
+        for line in content.lines() {
+            if line.trim_start().starts_with('[') {
+                in_section = true;
             }
-            tap_key(VK_RETURN);
+            if !in_section && is_top_level_key(line, "model") {
+                if let Some((_, value)) = line.split_once('=') {
+                    current = Some(unquote_toml(value.trim()).to_owned());
+                }
+            }
         }
-        Ok(FEATURED_MODELS[target])
+        current
+    }
+
+    /// Replaces the first top-level `model = ...` line with
+    /// `model = "<new_model>"`, leaving every other line — including any
+    /// `model` keys nested under `[sections]` — untouched. When there is no
+    /// top-level model key, one is prepended.
+    fn replace_top_level_model(content: &str, new_model: &str) -> String {
+        let mut in_section = false;
+        let mut replaced = false;
+        let mut lines: Vec<String> = Vec::new();
+        for line in content.lines() {
+            if line.trim_start().starts_with('[') {
+                in_section = true;
+            }
+            if !in_section && !replaced && is_top_level_key(line, "model") {
+                lines.push(format!("model = \"{new_model}\""));
+                replaced = true;
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+        let mut out = lines.join("\n");
+        if !replaced {
+            out = format!("model = \"{new_model}\"\n{out}");
+        }
+        if content.ends_with('\n') {
+            out.push('\n');
+        }
+        out
+    }
+
+    /// True when `line` is a `<key> = ...` assignment whose key is exactly
+    /// `model`, so siblings such as `model_reasoning_effort` and
+    /// `model_provider` are excluded.
+    fn is_top_level_key(line: &str, key: &str) -> bool {
+        match line.trim_start().strip_prefix(key) {
+            Some(rest) => rest.trim_start().starts_with('='),
+            None => false,
+        }
+    }
+
+    fn unquote_toml(value: &str) -> &str {
+        let bytes = value.as_bytes();
+        if bytes.len() >= 2
+            && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+                || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+        {
+            &value[1..value.len() - 1]
+        } else {
+            value
+        }
     }
 
     /// Focuses Codex and opens task search (Ctrl+G).
@@ -299,7 +373,10 @@ mod native {
 
     #[cfg(test)]
     mod tests {
-        use super::{is_codex_desktop_executable, next_model_index};
+        use super::{
+            is_codex_desktop_executable, next_model_index, read_current_model,
+            replace_top_level_model,
+        };
 
         #[test]
         fn recognizes_packaged_codex_ui_and_helper() {
@@ -319,6 +396,54 @@ mod native {
             assert_eq!(next_model_index(Some("Terra")), 2);
             assert_eq!(next_model_index(Some("gpt-5.5")), 0);
             assert_eq!(next_model_index(None), 0);
+        }
+
+        #[test]
+        fn replace_top_level_model_updates_only_the_first_top_level_key() {
+            let original = "# Codex config\n\
+                model = \"gpt-5.6-sol\"\n\
+                model_reasoning_effort = \"medium\"\n\n\
+                [history]\n\
+                persistence = \"save-all\"\n\
+                model = \"leave-me-alone\"\n";
+            let updated = replace_top_level_model(original, "gpt-5.6-terra");
+
+            assert!(updated.contains("model = \"gpt-5.6-terra\""));
+            // Sibling model_* keys are untouched.
+            assert!(updated.contains("model_reasoning_effort = \"medium\""));
+            // The in-section model line is preserved, not replaced.
+            assert!(updated.contains("model = \"leave-me-alone\""));
+            // Exactly one replacement happened.
+            assert_eq!(updated.matches("gpt-5.6-terra").count(), 1);
+            assert!(updated.ends_with('\n'));
+            // Round-trip: the reader sees exactly what we wrote.
+            assert_eq!(
+                read_current_model(&updated),
+                Some("gpt-5.6-terra".to_owned())
+            );
+        }
+
+        #[test]
+        fn replace_top_level_model_prepends_when_absent() {
+            let original = "model_reasoning_effort = \"medium\"\n";
+            let updated = replace_top_level_model(original, "gpt-5.6-luna");
+
+            assert!(updated.starts_with("model = \"gpt-5.6-luna\"\n"));
+            assert!(updated.contains("model_reasoning_effort = \"medium\""));
+            assert_eq!(read_current_model(&updated), Some("gpt-5.6-luna".to_owned()));
+        }
+
+        #[test]
+        fn replace_top_level_model_creates_a_config_when_empty() {
+            assert_eq!(replace_top_level_model("", "gpt-5.6-sol"), "model = \"gpt-5.6-sol\"\n");
+        }
+
+        #[test]
+        fn read_current_model_skips_keys_inside_sections() {
+            // The first model is top-level (before any header); the second is
+            // under [profiles.fast] and must be ignored.
+            let content = "model = \"real\"\n[profiles.fast]\nmodel = \"ignored\"\n";
+            assert_eq!(read_current_model(content), Some("real".to_owned()));
         }
     }
 }
@@ -344,7 +469,7 @@ pub fn show_and_focus() -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-pub fn cycle_model(_current_model: Option<&str>) -> Result<&'static str, String> {
+pub fn cycle_model() -> Result<&'static str, String> {
     Err("Codex model control is only available on Windows".to_owned())
 }
 
