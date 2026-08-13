@@ -816,7 +816,6 @@ impl TaskBoard {
     }
 
     pub fn select(&mut self, device_id: &str, slot: usize, now_ms: u128) -> Option<Value> {
-        self.now_ms = now_ms;
         let task_id = self
             .assignments
             .iter()
@@ -824,6 +823,15 @@ impl TaskBoard {
                 assignment.slot.device_id == device_id && assignment.slot.slot == slot
             })
             .map(|(id, _)| id.clone())?;
+        self.select_task(&task_id, now_ms)
+    }
+
+    /// Selects an exact task identity, even if scheduler reflow moved it away
+    /// from the slot where a controller last rendered it.
+    pub fn select_task(&mut self, task_id: &str, now_ms: u128) -> Option<Value> {
+        self.now_ms = now_ms;
+        let assignment = self.assignments.get(task_id)?.slot.clone();
+        let task_id = task_id.to_owned();
         let task = self.tasks.get_mut(&task_id)?;
         if task.state == TaskState::Completed {
             self.reviewed_completions.insert(task_id.clone());
@@ -841,12 +849,16 @@ impl TaskBoard {
         Some(json!({
             "type": "task_selected",
             "task_id": task_id,
-            "device_id": device_id,
-            "slot": slot,
+            "device_id": assignment.device_id,
+            "slot": assignment.slot,
             "owner_session": owner_session,
             "legacy_key": legacy_key,
             "ts": now_ms
         }))
+    }
+
+    pub fn task(&self, task_id: &str) -> Option<&TaskCard> {
+        self.tasks.get(task_id)
     }
 
     pub fn task_at(&self, device_id: &str, slot: usize) -> Option<&TaskCard> {

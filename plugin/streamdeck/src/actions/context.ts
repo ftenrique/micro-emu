@@ -11,6 +11,7 @@ export interface ContextKeySettings {
 /** Shows one LCD-strip context screen on a regular Stream Deck key. */
 @action({ UUID: "com.micro-emu.codex.context" })
 export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
+    private readonly showResetTimes = new WeakMap<object, boolean>();
     constructor(private readonly ctx: PluginContext) {
         super();
         this.ctx.addListener(() => this.refreshAll());
@@ -26,7 +27,16 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
 
     onKeyDown(ev: KeyDownEvent<ContextKeySettings>): void {
         const mode = normalizeMode(ev.payload.settings.mode);
-        if (mode === "usage") return;
+        if (mode === "usage") {
+            if (!this.ctx.isConnected()) {
+                ev.action.showAlert();
+                return;
+            }
+            const action = ev.action as KeyAction<ContextKeySettings>;
+            this.showResetTimes.set(action, !(this.showResetTimes.get(action) ?? false));
+            this.refresh(action, ev.payload.settings);
+            return;
+        }
         if (!this.ctx.isConnected()) {
             ev.action.showAlert();
             return;
@@ -44,8 +54,9 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
 
     private refresh(action: KeyAction<ContextKeySettings>, settings: ContextKeySettings): void {
         const mode = normalizeMode(settings.mode);
-        action.setImage(renderContextKeyImage(mode, this.ctx.getSelectedDisplayContext(), this.ctx.isConnected()));
-        action.setTitle(mode === "task" ? "Task" : mode === "model" ? "Model" : "Usage");
+        action.setImage(renderContextKeyImage(mode, this.ctx.getSelectedDisplayContext(), this.ctx.isConnected(), this.showResetTimes.get(action) ?? false));
+        // The key already carries the mode in its header; avoid a redundant Stream Deck title beneath it.
+        action.setTitle("");
     }
 }
 

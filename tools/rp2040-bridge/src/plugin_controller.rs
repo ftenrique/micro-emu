@@ -96,6 +96,18 @@ impl PluginController {
     }
 }
 
+fn event_task_id(message: &Value) -> Option<Option<String>> {
+    match message.get("task_id") {
+        None => Some(None),
+        Some(Value::String(task_id))
+            if !task_id.is_empty() && task_id.chars().count() <= 160 =>
+        {
+            Some(Some(task_id.clone()))
+        }
+        _ => None,
+    }
+}
+
 fn parse_event(message: &Value) -> Option<PhysicalEvent> {
     let event_kind = message.get("kind").and_then(Value::as_str)?;
     match event_kind {
@@ -113,16 +125,31 @@ fn parse_event(message: &Value) -> Option<PhysicalEvent> {
                 .get("pressed")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            Some(PhysicalEvent::TaskButton { index, pressed })
+            Some(PhysicalEvent::TaskButton {
+                index,
+                pressed,
+                task_id: event_task_id(message)?,
+            })
         }
         "task-toggle" => {
             let index = message.get("index").and_then(Value::as_u64)? as u8;
-            Some(PhysicalEvent::TaskToggle { index })
+            Some(PhysicalEvent::TaskToggle {
+                index,
+                task_id: event_task_id(message)?,
+            })
         }
         "task-action" => {
             let index = message.get("index").and_then(Value::as_u64)? as u8;
-            let gesture = match message.get("gesture").and_then(Value::as_str)? { "short" => 0, "long" => 1, _ => return None };
-            Some(PhysicalEvent::TaskAction { index, gesture })
+            let gesture = match message.get("gesture").and_then(Value::as_str)? {
+                "short" => 0,
+                "long" => 1,
+                _ => return None,
+            };
+            Some(PhysicalEvent::TaskAction {
+                index,
+                gesture,
+                task_id: event_task_id(message)?,
+            })
         }
         "micro-key" => {
             let key = message.get("key").and_then(Value::as_str)?;
@@ -350,10 +377,10 @@ mod tests {
     fn poll_keeps_task_micro_and_catalog_events_distinct() {
         let (mut controller, events_tx, _writer_rx) = make_controller(8);
         events_tx
-            .send(json!({"type":"event","kind":"task-button","index":0,"pressed":true}))
+            .send(json!({"type":"event","kind":"task-button","index":0,"pressed":true,"task_id":"thread-finished"}))
             .unwrap();
         events_tx
-            .send(json!({"type":"event","kind":"task-toggle","index":1}))
+            .send(json!({"type":"event","kind":"task-toggle","index":1,"task_id":"thread-running"}))
             .unwrap();
         events_tx
             .send(json!({"type":"event","kind":"micro-key","key":"AG00","pressed":true}))
@@ -371,8 +398,12 @@ mod tests {
                 PhysicalEvent::TaskButton {
                     index: 0,
                     pressed: true,
+                    task_id: Some("thread-finished".to_owned()),
                 },
-                PhysicalEvent::TaskToggle { index: 1 },
+                PhysicalEvent::TaskToggle {
+                    index: 1,
+                    task_id: Some("thread-running".to_owned()),
+                },
                 PhysicalEvent::MicroButton {
                     index: 0,
                     pressed: true,
@@ -396,6 +427,12 @@ mod tests {
         assert!(
             parse_event(&json!({
                 "type":"event", "kind":"catalog-action", "action":"task.delete-forever"
+            }))
+            .is_none()
+        );
+        assert!(
+            parse_event(&json!({
+                "type":"event", "kind":"task-button", "index":0, "task_id":""
             }))
             .is_none()
         );
@@ -466,6 +503,8 @@ mod tests {
             task_id: None,
             weekly_remaining: None,
             five_hour_remaining: None,
+            weekly_reset_at: None,
+            five_hour_reset_at: None,
             wait_reason: None,
             prompt: None,
             interaction_id: None,
@@ -496,6 +535,8 @@ mod tests {
             task_id: None,
             weekly_remaining: None,
             five_hour_remaining: None,
+            weekly_reset_at: None,
+            five_hour_reset_at: None,
             wait_reason: None,
             prompt: None,
             interaction_id: None,

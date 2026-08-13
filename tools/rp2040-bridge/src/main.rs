@@ -12,7 +12,6 @@ mod proxy;
 mod routing;
 mod serial;
 mod streamdeck;
-mod system_audio;
 mod tasks;
 mod wire;
 mod zcode_state;
@@ -527,6 +526,8 @@ fn connection_default_context() -> DisplayContext {
         task_id: None,
         weekly_remaining: None,
         five_hour_remaining: None,
+        weekly_reset_at: None,
+        five_hour_reset_at: None,
         wait_reason: None,
         prompt: None,
         interaction_id: None,
@@ -584,7 +585,7 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
     }
     let (fallback_model, fallback_effort) = read_codex_config();
     let fallback_project = read_latest_codex_session_cwd();
-    let (five_hour_remaining, weekly_remaining) = fetch_codex_usage();
+    let usage = fetch_codex_usage();
 
     let selected = bridge.task_board.selected_task().or_else(|| {
         bridge
@@ -609,8 +610,10 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
             status: Some(task.state.as_str().to_owned()),
             progress: task.progress,
             task_id: Some(task.task_id.clone()),
-            weekly_remaining,
-            five_hour_remaining,
+            weekly_remaining: usage.weekly_remaining,
+            five_hour_remaining: usage.five_hour_remaining,
+            weekly_reset_at: usage.weekly_reset_at,
+            five_hour_reset_at: usage.five_hour_reset_at,
             wait_reason: None,
             prompt: None,
             interaction_id: None,
@@ -627,8 +630,10 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
             status: Some("idle".to_owned()),
             progress: None,
             task_id: None,
-            weekly_remaining,
-            five_hour_remaining,
+            weekly_remaining: usage.weekly_remaining,
+            five_hour_remaining: usage.five_hour_remaining,
+            weekly_reset_at: usage.weekly_reset_at,
+            five_hour_reset_at: usage.five_hour_reset_at,
             wait_reason: None,
             prompt: None,
             interaction_id: None,
@@ -749,27 +754,35 @@ fn find_latest_session_file(dir: &std::path::Path) -> Option<std::path::PathBuf>
 
 /// Fetches live Codex usage (5-hour and weekly remaining percentages) from
 /// the ChatGPT backend API, using the auth tokens from `~/.codex/auth.json`.
-/// Returns (five_hour_remaining, weekly_remaining) as percentages 0-100,
-/// or (None, None) if the fetch fails.
-fn fetch_codex_usage() -> (Option<u8>, Option<u8>) {
+/// Returns live 5-hour and weekly usage percentages and reset timestamps.
+#[derive(Clone, Copy, Debug, Default)]
+struct CodexUsage {
+    five_hour_remaining: Option<u8>,
+    weekly_remaining: Option<u8>,
+    five_hour_reset_at: Option<u64>,
+    weekly_reset_at: Option<u64>,
+}
+
+fn fetch_codex_usage() -> CodexUsage {
+    let unavailable = CodexUsage::default();
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_default();
     let auth_path = std::path::Path::new(&home).join(".codex").join("auth.json");
     let Ok(auth_content) = std::fs::read_to_string(&auth_path) else {
-        return (None, None);
+        return unavailable;
     };
     let Ok(auth) = serde_json::from_str::<Value>(&auth_content) else {
-        return (None, None);
+        return unavailable;
     };
     let tokens = match auth.get("tokens") {
         Some(t) => t,
-        None => return (None, None),
+        None => return unavailable,
     };
     let access_token = tokens.get("access_token").and_then(Value::as_str);
     let account_id = tokens.get("account_id").and_then(Value::as_str);
     let (Some(access_token), Some(account_id)) = (access_token, account_id) else {
-        return (None, None);
+        return unavailable;
     };
 
     let url = "https://chatgpt.com/backend-api/wham/usage";
@@ -782,22 +795,24 @@ fn fetch_codex_usage() -> (Option<u8>, Option<u8>) {
         .call()
     {
         Ok(response) => response,
-        Err(_) => return (None, None),
+        Err(_) => return unavailable,
     };
     let body: Value = match response.into_json() {
         Ok(body) => body,
-        Err(_) => return (None, None),
+        Err(_) => return unavailable,
     };
 
     // Parse rate_limit windows. The API may return 5-hour and/or weekly
-    // windows in either primary_window or secondary_window, so classify
-    // by limit_window_seconds (like the codex-usage-streamdeck project).
+    // windows in either primary_window or secondary_window.
     let rate_limit = match body.get("rate_limit") {
         Some(rl) => rl,
-        None => return (None, None),
+        None => return unavailable,
     };
-    let mut five_hour: Option<u8> = None;
-    let mut weekly: Option<u8> = None;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let mut usage = CodexUsage::default();
     for key in &["primary_window", "secondary_window"] {
         let Some(window) = rate_limit.get(key) else {
             continue;
@@ -812,16 +827,26 @@ fn fetch_codex_usage() -> (Option<u8>, Option<u8>) {
             continue;
         };
         let remaining = (100.0 - used_percent).round().clamp(0.0, 100.0) as u8;
+        let reset_at = window
+            .get("reset_at")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                window
+                    .get("reset_after_seconds")
+                    .and_then(Value::as_u64)
+                    .map(|after| now.saturating_add(after))
+            });
         // <= 24 hours = 5-hour window; >= 3 days = weekly window.
-        if seconds <= 24 * 60 * 60 && five_hour.is_none() {
-            five_hour = Some(remaining);
-        } else if seconds >= 3 * 24 * 60 * 60 && weekly.is_none() {
-            weekly = Some(remaining);
+        if seconds <= 24 * 60 * 60 && usage.five_hour_remaining.is_none() {
+            usage.five_hour_remaining = Some(remaining);
+            usage.five_hour_reset_at = reset_at;
+        } else if seconds >= 3 * 24 * 60 * 60 && usage.weekly_remaining.is_none() {
+            usage.weekly_remaining = Some(remaining);
+            usage.weekly_reset_at = reset_at;
         }
     }
-    (five_hour, weekly)
+    usage
 }
-
 /// Computes the display context for a specific controller device, looking
 /// up the selected task on that device rather than the primary controller.
 fn desired_context_for_device(bridge: &BridgeRuntime, device_id: &str) -> Option<DisplayContext> {
@@ -843,6 +868,8 @@ fn overlay_display_context(base: &DisplayContext, selected: DisplayContext) -> D
         task_id: selected.task_id.or_else(|| base.task_id.clone()),
         weekly_remaining: selected.weekly_remaining.or(base.weekly_remaining),
         five_hour_remaining: selected.five_hour_remaining.or(base.five_hour_remaining),
+        weekly_reset_at: selected.weekly_reset_at.or(base.weekly_reset_at),
+        five_hour_reset_at: selected.five_hour_reset_at.or(base.five_hour_reset_at),
         wait_reason: selected.wait_reason.or_else(|| base.wait_reason.clone()),
         prompt: selected.prompt.or_else(|| base.prompt.clone()),
         interaction_id: selected.interaction_id.or_else(|| base.interaction_id.clone()),
@@ -1259,33 +1286,43 @@ pub(crate) fn detach_controller_for(bridge: &mut BridgeRuntime, error: &str) {
     detach_controller(bridge, error);
 }
 
+fn resolve_task_target(
+    bridge: &BridgeRuntime,
+    device_id: &str,
+    index: u8,
+    task_id: Option<&str>,
+) -> Option<crate::tasks::TaskCard> {
+    match task_id {
+        Some(task_id) => bridge.task_board.task(task_id).cloned(),
+        None => bridge.task_board.task_at(device_id, usize::from(index)).cloned(),
+    }
+}
+
 fn route_task_button(
     bridge: &mut BridgeRuntime,
     device_id: &str,
     slot_count: usize,
     index: u8,
     pressed: bool,
+    task_id: Option<&str>,
     now_ms: u128,
 ) -> bool {
     if !bridge.task_mode || usize::from(index) >= slot_count {
         return false;
     }
-    let Some(task) = bridge
-        .task_board
-        .task_at(device_id, usize::from(index))
-        .cloned()
-    else {
-        return false;
+    let Some(task) = resolve_task_target(bridge, device_id, index, task_id) else {
+        return task_id.is_some();
     };
 
     // Selection is an edge-triggered action. The release belongs only to the
     // legacy key pair; emitting task_selected twice makes one click execute
     // twice in agents that act on selection events.
     if pressed {
-        if let Some(selection) = bridge
-            .task_board
-            .select(device_id, usize::from(index), now_ms)
-        {
+        let selection = match task_id {
+            Some(task_id) => bridge.task_board.select_task(task_id, now_ms),
+            None => bridge.task_board.select(device_id, usize::from(index), now_ms),
+        };
+        if let Some(selection) = selection {
             bridge
                 .pending_task_events
                 .push((task.owner_session, selection));
@@ -1317,9 +1354,9 @@ fn route_task_button(
     }
     true
 }
-fn route_task_action(bridge: &mut BridgeRuntime, device_id: &str, slot_count: usize, index: u8, gesture: &str, now_ms: u128) -> bool {
+fn route_task_action(bridge: &mut BridgeRuntime, device_id: &str, slot_count: usize, index: u8, gesture: &str, task_id: Option<&str>, now_ms: u128) -> bool {
     if !bridge.task_mode || usize::from(index) >= slot_count { return false; }
-    let Some(task) = bridge.task_board.task_at(device_id, usize::from(index)).cloned() else { return false; };
+    let Some(task) = resolve_task_target(bridge, device_id, index, task_id) else { return task_id.is_some(); };
     if task.state != crate::tasks::TaskState::Waiting || bridge.task_board.selected_task().is_none_or(|selected| selected.task_id != task.task_id) { return true; }
     let Some(interaction) = task.interaction.as_ref() else { return true; };
     if interaction.expires_at_ms.is_some_and(|expires| expires <= now_ms) { return true; }
@@ -1334,17 +1371,14 @@ fn route_task_toggle(
     device_id: &str,
     slot_count: usize,
     index: u8,
+    task_id: Option<&str>,
     now_ms: u128,
 ) -> bool {
     if !bridge.task_mode || usize::from(index) >= slot_count {
         return false;
     }
-    let Some(task) = bridge
-        .task_board
-        .task_at(device_id, usize::from(index))
-        .cloned()
-    else {
-        return false;
+    let Some(task) = resolve_task_target(bridge, device_id, index, task_id) else {
+        return task_id.is_some();
     };
 
     match task.owner_agent {
@@ -1357,8 +1391,8 @@ fn route_task_toggle(
             Ok(false) | Err(_) => {
                 // Select before raising the app so the requested task is already
                 // active when the Codex window reaches the foreground.
-                route_task_button(bridge, device_id, slot_count, index, true, now_ms);
-                route_task_button(bridge, device_id, slot_count, index, false, now_ms);
+                route_task_button(bridge, device_id, slot_count, index, true, Some(&task.task_id), now_ms);
+                route_task_button(bridge, device_id, slot_count, index, false, Some(&task.task_id), now_ms);
                 if let Err(error) = crate::codex_window::show_and_focus() {
                     eprintln!("Codex window focus failed: {error}");
                 }
@@ -1373,8 +1407,8 @@ fn route_task_toggle(
             Ok(false) | Err(_) => {
                 // ZCode has no task deep link. Deliver its task-selection event
                 // before raising the window so the connected plugin can apply it.
-                route_task_button(bridge, device_id, slot_count, index, true, now_ms);
-                route_task_button(bridge, device_id, slot_count, index, false, now_ms);
+                route_task_button(bridge, device_id, slot_count, index, true, Some(&task.task_id), now_ms);
+                route_task_button(bridge, device_id, slot_count, index, false, Some(&task.task_id), now_ms);
                 if let Err(error) = crate::zcode_window::show_and_focus() {
                     eprintln!("ZCode window focus failed: {error}");
                 }
@@ -1389,8 +1423,8 @@ fn route_task_toggle(
             Ok(false) | Err(_) => {
                 // Hermes task activation remains event-driven. Select first so
                 // the owning MCP session can resume it as the window is raised.
-                route_task_button(bridge, device_id, slot_count, index, true, now_ms);
-                route_task_button(bridge, device_id, slot_count, index, false, now_ms);
+                route_task_button(bridge, device_id, slot_count, index, true, Some(&task.task_id), now_ms);
+                route_task_button(bridge, device_id, slot_count, index, false, Some(&task.task_id), now_ms);
                 if let Err(error) = crate::hermes_window::show_and_focus() {
                     eprintln!("Hermes window focus failed: {error}");
                 }
@@ -1477,15 +1511,6 @@ fn route_catalog_action(
         return;
     }
 
-    // System actions are independent of any task or agent and must not require
-    // the emulated Codex Micro device.
-    if matches!(action, CatalogAction::SystemMicToggle) {
-        if let Err(error) = crate::system_audio::toggle_mic_mute() {
-            eprintln!("System mic toggle failed: {error}");
-        }
-        return;
-    }
-
     let task = bridge.task_board.selected_task().cloned();
     let (session, agent) = catalog_target_session(task.as_ref());
     match action {
@@ -1566,17 +1591,29 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
             for event in events {
-                if matches!(event, crate::codex::PhysicalEvent::ModelCycle) {
+                if let crate::codex::PhysicalEvent::EncoderButton { index: 2, pressed } = event.clone() {
+                    // The native ACT10 path needs the RP2040 vendor HID
+                    // device. In standalone/no-serial mode, preserve the
+                    // Stream Deck Mic action's press/release semantics with
+                    // Codex's desktop push-to-talk shortcut instead.
+                    if !bridge.has_serial() {
+                        if let Err(error) = crate::codex_window::set_microphone(pressed) {
+                            eprintln!("Codex microphone shortcut failed: {error}");
+                        }
+                        continue;
+                    }
+                }
+                if matches!(&event, crate::codex::PhysicalEvent::ModelCycle) {
                     route_model_cycle(bridge);
                     continue;
                 }
-                if let crate::codex::PhysicalEvent::TaskAction { index, gesture } = event {
+                if let crate::codex::PhysicalEvent::TaskAction { index, gesture, task_id } = event.clone() {
             let task_device_id = bridge.task_device_id.clone();
             let task_slot_count = bridge.task_slot_count;
-            route_task_action(bridge, &task_device_id, task_slot_count, index, if gesture == 0 { "short" } else { "long" }, now_ms);
+            route_task_action(bridge, &task_device_id, task_slot_count, index, if gesture == 0 { "short" } else { "long" }, task_id.as_deref(), now_ms);
             continue;
         }
-        if let crate::codex::PhysicalEvent::TaskButton { index, pressed } = event {
+        if let crate::codex::PhysicalEvent::TaskButton { index, pressed, task_id } = event.clone() {
                     let task_device_id = bridge.task_device_id.clone();
                     let task_slot_count = bridge.task_slot_count;
                     route_task_button(
@@ -1585,16 +1622,17 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
                         task_slot_count,
                         index,
                         pressed,
+                        task_id.as_deref(),
                         now_ms,
                     );
                     continue;
                 }
-                if let crate::codex::PhysicalEvent::CatalogAction { action } = event {
+                if let crate::codex::PhysicalEvent::CatalogAction { action } = event.clone() {
                     let task_device_id = bridge.task_device_id.clone();
                     route_catalog_action(bridge, &task_device_id, action, now_ms);
                     continue;
                 }
-                if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
+                if let crate::codex::PhysicalEvent::Button { index, pressed } = event.clone() {
                     let task_device_id = bridge.task_device_id.clone();
                     let task_slot_count = bridge.task_slot_count;
                     if route_task_button(
@@ -1603,6 +1641,7 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
                         task_slot_count,
                         index,
                         pressed,
+                        None,
                         now_ms,
                     ) {
                         continue;
@@ -1624,7 +1663,7 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
                 // is present, otherwise are buffered for the Codex MCP
                 // session. Non-Codex buttons are always buffered for polling.
                 if let crate::codex::PhysicalEvent::Button { index, pressed }
-                | crate::codex::PhysicalEvent::MicroButton { index, pressed } = event
+                | crate::codex::PhysicalEvent::MicroButton { index, pressed } = event.clone()
                 {
                     if let Some(owner) = bridge.partition.owner_of(index) {
                         if owner != crate::routing::AgentId::Codex {
@@ -1648,7 +1687,7 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
                         }
                     }
                 }
-                if let Some(message) = bridge.radial_state.event(event) {
+                if let Some(message) = bridge.radial_state.event(event.clone()) {
                     if bridge.has_serial() {
                         bridge.send_codex(&message)?;
                     }
@@ -1697,35 +1736,41 @@ fn route_task_device_events(
         .map(|d| d.as_millis())
         .unwrap_or(0);
     for event in events {
-        if matches!(event, crate::codex::PhysicalEvent::ModelCycle) {
+        if let crate::codex::PhysicalEvent::EncoderButton { index: 2, pressed } = event.clone() {
+            if !bridge.has_serial() {
+                if let Err(error) = crate::codex_window::set_microphone(pressed) {
+                    eprintln!("Codex microphone shortcut failed: {error}");
+                }
+                continue;
+            }
+        }
+        if matches!(&event, crate::codex::PhysicalEvent::ModelCycle) {
             route_model_cycle(bridge);
             continue;
         }
-        if let crate::codex::PhysicalEvent::TaskToggle { index } = event {
-            route_task_toggle(bridge, device_id, slot_count, index, now_ms);
+        if let crate::codex::PhysicalEvent::TaskToggle { index, task_id } = event.clone() {
+            route_task_toggle(bridge, device_id, slot_count, index, task_id.as_deref(), now_ms);
             continue;
         }
-        if let crate::codex::PhysicalEvent::TaskAction { index, gesture } = event {
-            let task_device_id = bridge.task_device_id.clone();
-            let task_slot_count = bridge.task_slot_count;
-            route_task_action(bridge, &task_device_id, task_slot_count, index, if gesture == 0 { "short" } else { "long" }, now_ms);
+        if let crate::codex::PhysicalEvent::TaskAction { index, gesture, task_id } = event.clone() {
+            route_task_action(bridge, device_id, slot_count, index, if gesture == 0 { "short" } else { "long" }, task_id.as_deref(), now_ms);
             continue;
         }
-        if let crate::codex::PhysicalEvent::TaskButton { index, pressed } = event {
-            route_task_button(bridge, device_id, slot_count, index, pressed, now_ms);
+        if let crate::codex::PhysicalEvent::TaskButton { index, pressed, task_id } = event.clone() {
+            route_task_button(bridge, device_id, slot_count, index, pressed, task_id.as_deref(), now_ms);
             // An explicit Task Card is always inert when no task occupies its
             // slot. It must never fall through into Micro key routing.
             continue;
         }
-        if let crate::codex::PhysicalEvent::CatalogAction { action } = event {
+        if let crate::codex::PhysicalEvent::CatalogAction { action } = event.clone() {
             route_catalog_action(bridge, device_id, action, now_ms);
             continue;
         }
         // A task card gets first refusal while task mode is active. If the
         // slot has no task (or task mode is off), fall through to the normal
         // physical-event mapping so Agent/Action/Mic/Send/Dial keys work too.
-        if let crate::codex::PhysicalEvent::Button { index, pressed } = event {
-            if route_task_button(bridge, device_id, slot_count, index, pressed, now_ms) {
+        if let crate::codex::PhysicalEvent::Button { index, pressed } = event.clone() {
+            if route_task_button(bridge, device_id, slot_count, index, pressed, None, now_ms) {
                 continue;
             }
             // While task mode is on, a button within the task-slot range is a
@@ -1739,7 +1784,7 @@ fn route_task_device_events(
         // Plugin-backed controllers are auxiliary physical controllers. They
         // must share the same partition and HID routing as the primary device.
         if let crate::codex::PhysicalEvent::Button { index, pressed }
-        | crate::codex::PhysicalEvent::MicroButton { index, pressed } = event
+        | crate::codex::PhysicalEvent::MicroButton { index, pressed } = event.clone()
         {
             if let Some(owner) = bridge.partition.owner_of(index) {
                 if owner != crate::routing::AgentId::Codex {
@@ -2483,8 +2528,8 @@ mod tests {
             )
             .unwrap();
 
-        assert!(route_task_button(&mut bridge, &device_id, 8, 0, true, 2));
-        assert!(route_task_button(&mut bridge, &device_id, 8, 0, false, 3));
+        assert!(route_task_button(&mut bridge, &device_id, 8, 0, true, None, 2));
+        assert!(route_task_button(&mut bridge, &device_id, 8, 0, false, None, 3));
 
         assert_eq!(
             bridge
@@ -2502,6 +2547,54 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn task_button_uses_rendered_identity_when_live_slot_points_elsewhere() {
+        let rendered = Arc::new(Mutex::new(None));
+        let mut bridge = test_bridge(rendered);
+        bridge.task_mode = true;
+        let device_id = bridge.task_device_id.clone();
+        bridge.task_board.set_device(device_id.clone(), 8, true);
+        bridge
+            .task_board
+            .publish_tasks(
+                9,
+                crate::routing::AgentId::Codex,
+                &json!({"tasks": [
+                    {"task_id":"finished","title":"Finished","state":"completed"},
+                    {"task_id":"running","title":"Running","state":"running"}
+                ]}),
+                1,
+            )
+            .unwrap();
+
+        let live_running_slot = bridge
+            .task_board
+            .assignment("running")
+            .expect("running assignment")
+            .slot
+            .slot;
+        assert_eq!(
+            bridge.task_board.task_at(&device_id, live_running_slot).map(|task| task.task_id.as_str()),
+            Some("running")
+        );
+
+        // Model a stale green key image: the key still shows `finished`, but
+        // a newer board snapshot now resolves the same numeric slot to
+        // `running`. The explicit rendered identity must win.
+        assert!(route_task_button(
+            &mut bridge,
+            &device_id,
+            8,
+            live_running_slot as u8,
+            true,
+            Some("finished"),
+            2,
+        ));
+
+        assert_eq!(bridge.task_board.selected_task().map(|task| task.task_id.as_str()), Some("finished"));
+        assert_eq!(bridge.pending_task_events[0].1["task_id"], "finished");
     }
 
     #[test]

@@ -9,7 +9,6 @@ Task Cards, physical Codex Micro controls, and extended actions use separate rou
 | Micro | The plugin sends the existing HID or encoder command to the bridge. |
 | Bridge | The daemon changes task selection or sends a documented Codex desktop shortcut. |
 | Codex | The plugin invokes a Codex deep link or calls the locally installed Codex app-server. |
-| System | The daemon performs an operating-system action on the host. No Codex Micro device or Codex app is required, only the running bridge. |
 
 Codex actions no longer queue an unhandled catalog_action event. A successful request flashes the Stream Deck success indicator; a rejected or unavailable request flashes an alert and is written to the plugin log.
 
@@ -24,7 +23,7 @@ On Windows, app-server actions use the npm Codex CLI. Install @openai/codex, or 
 - micro.rotor-click, micro.rotor-cw, micro.rotor-ccw
 - micro.up, micro.down, micro.left, micro.right
 
-These remain configurable through Codex Micro. AG00-AG05 are deliberately absent because Task Cards own those visible positions.
+These remain configurable through Codex Micro. AG00-AG05 are deliberately absent because Task Cards own those visible positions. When no RP2040 serial link is available, `micro.mic` keeps the same press/release behavior by focusing Codex and holding `Ctrl+Shift+M` until the Stream Deck key is released.
 
 ### Task navigation
 
@@ -55,12 +54,6 @@ Navigation wraps across occupied Task Cards and never emits a Micro key.
 - agent.compact-context: start task context compaction
 - agent.settings: open Codex settings
 
-### System actions
-
-- system.mic-toggle: toggle the operating-system default microphone mute
-
-System actions run on the bridge and do not require the Codex Micro device, so they keep working without the RP2040 attached. `system.mic-toggle` is the no-hardware alternative to `micro.mic` (ACT10): it flips the Windows default capture endpoint mute directly, and the tray mic icon reflects the new state.
-
 ## Retired actions
 
 The picker does not offer operations that the installed Codex protocol cannot execute across clients: interrupt, pin, unpin, approve, reject, open browser, and open editor.
@@ -73,4 +66,4 @@ Every action has an automatic icon and short title. The property inspector expos
 
 ### Context button
 
-The `Context` key is available on regular Stream Deck Keypad controllers. Choose `Task info`, `Model info`, or `Usage info` in the property inspector. It mirrors the corresponding Stream Deck+ LCD context screen; task mode opens Codex task search, model mode cycles the configured featured model, and usage mode is display-only.
+The `Context` key is available on regular Stream Deck Keypad controllers. Choose `Task info`, `Model info`, or `Usage info` in the property inspector. It mirrors the corresponding Stream Deck+ LCD context screen; task mode opens Codex task search, model mode cycles the configured featured model, and pressing usage mode toggles between the remaining percentages and the 5-hour/weekly reset times.

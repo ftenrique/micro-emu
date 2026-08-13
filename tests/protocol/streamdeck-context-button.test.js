@@ -17,12 +17,15 @@ test("Context is a Keypad action with fixed task/model/usage modes", () => {
   assert.match(plugin, /new ContextKeyAction\(ctx\)/);
 });
 
-test("Context actions dispatch task search and model cycle while usage is inert", () => {
-  assert.match(action, /mode === "usage"\) return/);
+test("Context actions dispatch task search/model cycle and toggle usage reset details", () => {
+  assert.match(action, /mode === "usage"/);
+  assert.match(action, /showResetTimes\.set/);
+  assert.match(action, /renderContextKeyImage\(mode, this\.ctx\.getSelectedDisplayContext\(\), this\.ctx\.isConnected\(\),/);
   assert.match(action, /sendCatalogAction\("agent\.search"\)/);
   assert.match(action, /sendModelCycle\(\)/);
   assert.match(action, /value === "model" \|\| value === "usage"/);
   assert.match(action, /showAlert\(\)/);
+  assert.match(action, /action\.setTitle\(""\)/);
 });
 
 test("Context rendering covers strip parity and selected-task overlay", () => {
@@ -30,8 +33,12 @@ test("Context rendering covers strip parity and selected-task overlay", () => {
   assert.match(images, /renderContextTaskBody/);
   assert.match(images, /renderContextModelBody/);
   assert.match(images, /renderContextUsageBody/);
+  assert.match(images, /five_hour_reset_at/);
+  assert.match(images, /weekly_reset_at/);
+  assert.match(images, /formatResetAt/);
   assert.match(images, /pct <= 10/);
   assert.match(images, /pct <= 25/);
   assert.match(context, /getSelectedDisplayContext/);
   assert.match(context, /merged\.task_number = sourceSlot \+ 1/);
+  assert.match(readFileSync(new URL("../../plugin/streamdeck/src/actions/crux-vertical.ts", import.meta.url), "utf8"), /onTouchTap/);
 });

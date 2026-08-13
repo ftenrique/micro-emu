@@ -26,6 +26,8 @@ export interface DisplayContext {
     task_id?: string | null;
     weekly_remaining?: number | null;
     five_hour_remaining?: number | null;
+    weekly_reset_at?: number | null;
+    five_hour_reset_at?: number | null;
     wait_reason?: string | null;
     prompt?: string | null;
     interaction_id?: string | null;
@@ -120,18 +122,18 @@ export class DaemonClient extends EventEmitter {
         this.send({ type: "event", kind: "button", index, pressed });
     }
 
-    /** Selects a task-board slot without reinterpreting it as a Micro key. */
-    sendTaskButton(index: number, pressed: boolean): void {
-        this.send({ type: "event", kind: "task-button", index, pressed });
+    /** Selects the task that was rendered on a task-board slot. */
+    sendTaskButton(index: number, pressed: boolean, taskId: string): void {
+        this.send({ type: "event", kind: "task-button", index, pressed, task_id: taskId });
     }
 
     /** Requests the native Codex window toggle for an occupied task slot. */
-    sendTaskAction(index: number, gesture: "short" | "long"): void {
-        this.send({ type: "event", kind: "task-action", index, gesture });
+    sendTaskAction(index: number, gesture: "short" | "long", taskId: string): void {
+        this.send({ type: "event", kind: "task-action", index, gesture, task_id: taskId });
     }
 
-    sendTaskToggle(index: number): void {
-        this.send({ type: "event", kind: "task-toggle", index });
+    sendTaskToggle(index: number, taskId: string): void {
+        this.send({ type: "event", kind: "task-toggle", index, task_id: taskId });
     }
 
     /** Sends an explicit Codex Micro key, bypassing task-card routing. */

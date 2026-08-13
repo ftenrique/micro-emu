@@ -12,6 +12,8 @@ pub struct DisplayContext {
     pub task_id: Option<String>,
     pub weekly_remaining: Option<u8>,
     pub five_hour_remaining: Option<u8>,
+    pub weekly_reset_at: Option<u64>,
+    pub five_hour_reset_at: Option<u64>,
     pub wait_reason: Option<String>,
     pub prompt: Option<String>,
     pub interaction_id: Option<String>,
@@ -37,6 +39,8 @@ impl DisplayContext {
                     | "task_id"
                     | "weekly_remaining"
                     | "five_hour_remaining"
+                    | "weekly_reset_at"
+                    | "five_hour_reset_at"
                     | "wait_reason"
                     | "prompt"
                     | "interaction_id"
@@ -62,6 +66,21 @@ impl DisplayContext {
                 )),
                 Some(_) => Err(format!(
                     "display context field {name} must be a string or null"
+                )),
+            }
+        }
+
+        fn timestamp_field(
+            object: &serde_json::Map<String, Value>,
+            name: &str,
+        ) -> Result<Option<u64>, String> {
+            match object.get(name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::Number(value)) => value.as_u64().map(Some).ok_or_else(|| {
+                    format!("display context field {name} must be a non-negative integer")
+                }),
+                Some(_) => Err(format!(
+                    "display context field {name} must be an integer or null"
                 )),
             }
         }
@@ -92,6 +111,8 @@ impl DisplayContext {
         let task_id = string_field(object, "task_id")?;
         let weekly_remaining = percentage_field(object, "weekly_remaining")?;
         let five_hour_remaining = percentage_field(object, "five_hour_remaining")?;
+        let weekly_reset_at = timestamp_field(object, "weekly_reset_at")?;
+        let five_hour_reset_at = timestamp_field(object, "five_hour_reset_at")?;
         let pending_wait_count = percentage_field(object, "pending_wait_count")?;
 
         let progress = match object.get("progress") {
@@ -118,6 +139,8 @@ impl DisplayContext {
             task_id,
             weekly_remaining,
             five_hour_remaining,
+            weekly_reset_at,
+            five_hour_reset_at,
             wait_reason: string_field(object, "wait_reason")?,
             prompt: string_field(object, "prompt")?,
             interaction_id: string_field(object, "interaction_id")?,
@@ -138,6 +161,8 @@ impl DisplayContext {
             "task_id": self.task_id,
             "weekly_remaining": self.weekly_remaining,
             "five_hour_remaining": self.five_hour_remaining,
+            "weekly_reset_at": self.weekly_reset_at,
+            "five_hour_reset_at": self.five_hour_reset_at,
             "wait_reason": self.wait_reason,
             "prompt": self.prompt,
             "interaction_id": self.interaction_id,
@@ -310,11 +335,15 @@ mod tests {
             "progress": 42
             ,"weekly_remaining": 73
             ,"five_hour_remaining": 28
+            ,"weekly_reset_at": 1760003600
+            ,"five_hour_reset_at": 1760001800
         }))
         .unwrap();
         assert_eq!(context.progress, Some(42));
         assert_eq!(context.weekly_remaining, Some(73));
         assert_eq!(context.five_hour_remaining, Some(28));
+        assert_eq!(context.weekly_reset_at, Some(1760003600));
+        assert_eq!(context.five_hour_reset_at, Some(1760001800));
         assert_eq!(context.to_value()["model"], "gpt-5");
         assert!(DisplayContext::from_value(&serde_json::json!({"progress": 101})).is_err());
         assert_eq!(DisplayContext::from_value(&serde_json::json!({"prompt": "secret"})).unwrap().prompt.as_deref(), Some("secret"));

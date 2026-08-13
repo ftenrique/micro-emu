@@ -3,6 +3,9 @@
 #[cfg(windows)]
 mod native {
     use std::ffi::c_void;
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
 
     type Bool = i32;
     type Handle = isize;
@@ -21,11 +24,15 @@ mod native {
     const HWND_TOPMOST: Hwnd = -1;
     const HWND_NOTOPMOST: Hwnd = -2;
     const VK_CONTROL: u8 = 0x11;
+    const VK_SHIFT: u8 = 0x10;
     const VK_G: u8 = 0x47;
+    const VK_M: u8 = 0x4d;
     const VK_OEM_3: u8 = 0xc0;
     const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     const FEATURED_MODELS: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+    const CYCLE_MODEL_SCRIPT: &str = include_str!("cycle_codex_model.ps1");
 
     #[repr(C)]
     #[derive(Default)]
@@ -151,22 +158,72 @@ mod native {
         Ok(())
     }
 
-    /// Advances Codex's default model to the next featured entry by writing it
-    /// to `~/.codex/config.toml`.
-    ///
-    /// An earlier version opened the desktop picker with `Ctrl+Shift+M` and
-    /// steered it with arrow keys, but that shortcut opens the *reasoning
-    /// effort* picker, so a press changed effort instead of the model and the
-    /// dialog only flashed. `config.toml` is the same source the bridge reads
-    /// to display the current model (see `read_codex_config`), so writing it
-    /// keeps Codex and the strip in agreement. Codex applies the new model to
-    /// threads started afterwards — and immediately if the running app watches
-    /// its config file.
+    /// Advances the active task through Sol, Terra, and Luna via semantic
+    /// Windows UI Automation controls, then persists the selected default.
+    /// This uses neither keyboard shortcuts nor screen coordinates.
     pub fn cycle_model() -> Result<&'static str, String> {
+        let window = find_codex_window()?;
+        let new_model = select_next_model_with_uia(window)?;
+        // The active task has already changed at this point. Keeping the
+        // config synchronized is useful for future tasks, but a read-only or
+        // temporarily locked config must not turn a successful UI selection
+        // into a reported failure.
+        let _ = persist_default_model(new_model);
+        Ok(new_model)
+    }
+
+    fn select_next_model_with_uia(window: Hwnd) -> Result<&'static str, String> {
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|error| format!("could not start Codex model UI automation: {error}"))?;
+
+        let script = format!("$WindowHandle = {window}\n{CYCLE_MODEL_SCRIPT}");
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "could not open Codex model automation input".to_owned())?
+            .write_all(script.as_bytes())
+            .map_err(|error| format!("could not send Codex model automation: {error}"))?;
+
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("Codex model UI automation did not finish: {error}"))?;
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Codex model UI automation failed: {}",
+                error.trim()
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        FEATURED_MODELS
+            .iter()
+            .copied()
+            .find(|model| stdout.lines().any(|line| line.trim() == *model))
+            .ok_or_else(|| {
+                format!(
+                    "Codex model UI automation returned an unexpected result: {}",
+                    stdout.trim()
+                )
+            })
+    }
+
+    fn persist_default_model(new_model: &str) -> Result<(), String> {
         let path = codex_config_path()?;
         let content = std::fs::read_to_string(&path).unwrap_or_default();
-        let target = next_model_index(read_current_model(&content).as_deref());
-        let new_model = FEATURED_MODELS[target];
 
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -174,14 +231,16 @@ mod native {
         let updated = replace_top_level_model(&content, new_model);
         std::fs::write(&path, updated)
             .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
-        Ok(new_model)
+        Ok(())
     }
 
     fn codex_config_path() -> Result<std::path::PathBuf, String> {
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
             .map_err(|error| format!("could not resolve home directory: {error}"))?;
-        Ok(std::path::Path::new(&home).join(".codex").join("config.toml"))
+        Ok(std::path::Path::new(&home)
+            .join(".codex")
+            .join("config.toml"))
     }
 
     /// Returns the value of the top-level `model` key, ignoring any keys that
@@ -264,6 +323,27 @@ mod native {
         send_control_shortcut(VK_OEM_3)
     }
 
+    /// Holds Codex's push-to-talk shortcut while the Stream Deck key is held.
+    /// The focus step is only needed for the initial press; releasing the
+    /// modifiers in reverse order prevents a stuck keyboard state.
+    pub fn set_microphone(pressed: bool) -> Result<(), String> {
+        if pressed {
+            show_and_focus()?;
+            unsafe {
+                key_down(VK_CONTROL);
+                key_down(VK_SHIFT);
+                key_down(VK_M);
+            }
+        } else {
+            unsafe {
+                key_up(VK_M);
+                key_up(VK_SHIFT);
+                key_up(VK_CONTROL);
+            }
+        }
+        Ok(())
+    }
+
     fn send_control_shortcut(key: u8) -> Result<(), String> {
         show_and_focus()?;
         unsafe {
@@ -272,23 +352,6 @@ mod native {
             key_up(VK_CONTROL);
         }
         Ok(())
-    }
-    fn next_model_index(current_model: Option<&str>) -> usize {
-        let current = current_model
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .replace(' ', "-")
-            .replace('_', "-");
-        let current_index = ["sol", "terra", "luna"].iter().position(|name| {
-            current == *name
-                || current
-                    .strip_suffix(name)
-                    .is_some_and(|prefix| prefix.ends_with('-'))
-        });
-        current_index
-            .map(|index| (index + 1) % FEATURED_MODELS.len())
-            .unwrap_or(0)
     }
 
     unsafe fn key_down(key: u8) {
@@ -373,10 +436,7 @@ mod native {
 
     #[cfg(test)]
     mod tests {
-        use super::{
-            is_codex_desktop_executable, next_model_index, read_current_model,
-            replace_top_level_model,
-        };
+        use super::{is_codex_desktop_executable, read_current_model, replace_top_level_model};
 
         #[test]
         fn recognizes_packaged_codex_ui_and_helper() {
@@ -385,17 +445,6 @@ mod native {
             ));
             assert!(is_codex_desktop_executable(r"C:\apps\codex.exe"));
             assert!(!is_codex_desktop_executable(r"C:\apps\ChatGPT.exe"));
-        }
-
-        #[test]
-        fn featured_models_cycle_and_unknown_models_start_at_sol() {
-            assert_eq!(next_model_index(Some("gpt-5.6-sol")), 1);
-            assert_eq!(next_model_index(Some("GPT-5.6-TERRA")), 2);
-            assert_eq!(next_model_index(Some("gpt-5.6-luna")), 0);
-            assert_eq!(next_model_index(Some("GPT 5.6 Sol")), 1);
-            assert_eq!(next_model_index(Some("Terra")), 2);
-            assert_eq!(next_model_index(Some("gpt-5.5")), 0);
-            assert_eq!(next_model_index(None), 0);
         }
 
         #[test]
@@ -430,12 +479,18 @@ mod native {
 
             assert!(updated.starts_with("model = \"gpt-5.6-luna\"\n"));
             assert!(updated.contains("model_reasoning_effort = \"medium\""));
-            assert_eq!(read_current_model(&updated), Some("gpt-5.6-luna".to_owned()));
+            assert_eq!(
+                read_current_model(&updated),
+                Some("gpt-5.6-luna".to_owned())
+            );
         }
 
         #[test]
         fn replace_top_level_model_creates_a_config_when_empty() {
-            assert_eq!(replace_top_level_model("", "gpt-5.6-sol"), "model = \"gpt-5.6-sol\"\n");
+            assert_eq!(
+                replace_top_level_model("", "gpt-5.6-sol"),
+                "model = \"gpt-5.6-sol\"\n"
+            );
         }
 
         #[test]
@@ -450,7 +505,8 @@ mod native {
 
 #[cfg(windows)]
 pub use native::{
-    cycle_model, is_foreground, minimize, search_tasks, show_and_focus, toggle_terminal,
+    cycle_model, is_foreground, minimize, search_tasks, set_microphone, show_and_focus,
+    toggle_terminal,
 };
 
 #[cfg(not(windows))]
@@ -481,4 +537,9 @@ pub fn search_tasks() -> Result<(), String> {
 #[cfg(not(windows))]
 pub fn toggle_terminal() -> Result<(), String> {
     Err("Codex terminal control is only available on Windows".to_owned())
+}
+
+#[cfg(not(windows))]
+pub fn set_microphone(_pressed: bool) -> Result<(), String> {
+    Err("Codex microphone control is only available on Windows".to_owned())
 }

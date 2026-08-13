@@ -24,6 +24,8 @@ Download `micro-emu-v1.0.0-windows-x64.zip` from the GitHub release, extract it,
 
 To remove it, double-click `Uninstall.cmd` from the same extracted folder. The standalone `.streamDeckPlugin` release asset is also available for users who only want to install or update the plugin.
 
+If you have an RP2040 Zero board, the same bundle also ships the prebuilt firmware (`codex_micro_rp2040_bridge.uf2`) plus a `Flash-Firmware.cmd` helper to flash it; see `README.txt` in the extracted folder. The firmware is also published as a standalone `.uf2` release asset.
+
 
 ## Stream Deck plugin
 

@@ -125,6 +125,8 @@ pub fn tools() -> Value {
                         "task_id": {"type": ["string", "null"]},
                         "weekly_remaining": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
                         "five_hour_remaining": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+                        "weekly_reset_at": {"type": ["integer", "null"], "minimum": 0},
+                        "five_hour_reset_at": {"type": ["integer", "null"], "minimum": 0},
                     },
                     "additionalProperties": false
                 }

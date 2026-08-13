@@ -139,21 +139,21 @@ export function renderDisconnectedImage(label: string): string {
 export type ContextKeyMode = "task" | "model" | "usage";
 
 /** Renders one LCD-strip context screen as a square Stream Deck key. */
-export function renderContextKeyImage(mode: ContextKeyMode, ctx: StripContext, connected = true): string {
+export function renderContextKeyImage(mode: ContextKeyMode, ctx: StripContext, connected = true, showResetTimes = false): string {
     const title = mode === "task" ? "TASK INFO" : mode === "model" ? "MODEL INFO" : "USAGE INFO";
     if (!connected) {
         return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">
   <rect x="4" y="4" width="136" height="136" rx="12" fill="#161b1f" stroke="#333"/>
-  <text x="72" y="50" font-family="sans-serif" font-size="12" font-weight="bold" fill="#777" text-anchor="middle">${title}</text>
+  <text x="72" y="50" font-family="sans-serif" font-size="16" font-weight="bold" fill="#777" text-anchor="middle">${title}</text>
   <text x="72" y="88" font-family="sans-serif" font-size="18" font-weight="bold" fill="#555" text-anchor="middle">OFFLINE</text>
 </svg>`);
     }
     const body = mode === "task" ? renderContextTaskBody(ctx)
         : mode === "model" ? renderContextModelBody(ctx)
-            : renderContextUsageBody(ctx);
+            : renderContextUsageBody(ctx, showResetTimes);
     return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">
   <rect x="4" y="4" width="136" height="136" rx="12" fill="#10161a" stroke="#000" stroke-opacity="0.4"/>
-  <text x="12" y="22" font-family="sans-serif" font-size="10" font-weight="bold" letter-spacing="1" fill="#607d8b">${title}</text>
+  <text x="12" y="24" font-family="sans-serif" font-size="13" font-weight="bold" letter-spacing="0.8" fill="#78909c">${title}</text>
   ${body}
 </svg>`);
 }
@@ -185,11 +185,18 @@ function renderContextModelBody(ctx: StripContext): string {
   <text x="12" y="116" font-family="sans-serif" font-size="16" font-weight="bold" fill="${bottomColor}">${escapeXml(bottomValue)}</text>`;
 }
 
-function renderContextUsageBody(ctx: StripContext): string {
+function renderContextUsageBody(ctx: StripContext, showResetTimes: boolean): string {
     const hasUsage = ctx.five_hour_remaining != null || ctx.weekly_remaining != null;
+    const hasResetTimes = ctx.five_hour_reset_at != null || ctx.weekly_reset_at != null;
+    if (showResetTimes && hasResetTimes) {
+        return `<text x="12" y="47" font-family="sans-serif" font-size="9" fill="#607d8b">5H RESET</text>
+  <text x="12" y="70" font-family="monospace" font-size="16" font-weight="bold" fill="#90caf9">${escapeXml(formatResetAt(ctx.five_hour_reset_at))}</text>
+  <text x="12" y="93" font-family="sans-serif" font-size="9" fill="#607d8b">WEEKLY RESET</text>
+  <text x="12" y="116" font-family="monospace" font-size="16" font-weight="bold" fill="#a5d6a7">${escapeXml(formatResetAt(ctx.weekly_reset_at))}</text>`;
+    }
     if (hasUsage) return `${usageBarKey("5H", ctx.five_hour_remaining, 42)}\n  ${usageBarKey("WK", ctx.weekly_remaining, 82)}`;
     const status = (ctx.status ?? "idle").toUpperCase();
-    const progress = ctx.progress != null ? `${ctx.progress}%` : "—";
+    const progress = ctx.progress != null ? `${ctx.progress}%` : "\u2014";
     const statusColor = STATUS_COLORS[(ctx.status ?? "idle").toLowerCase()] ?? "#37474f";
     return `<text x="12" y="52" font-family="sans-serif" font-size="9" fill="#607d8b">STATUS</text>
   <text x="12" y="75" font-family="sans-serif" font-size="17" font-weight="bold" fill="${statusColor}">${escapeXml(status)}</text>
@@ -246,6 +253,8 @@ export interface StripContext {
     task_number?: number | null;
     weekly_remaining?: number | null;
     five_hour_remaining?: number | null;
+    weekly_reset_at?: number | null;
+    five_hour_reset_at?: number | null;
 }
 
 /** Knob strip: task number, project, shortened task name, and owning agent. */
@@ -280,12 +289,20 @@ export function renderCruxHStrip(ctx: StripContext, clickLabel: string): string 
 }
 
 /** Crux vertical strip: usage bars, or status/progress as fallback. */
-export function renderCruxVStrip(ctx: StripContext, clickLabel: string): string {
+export function renderCruxVStrip(ctx: StripContext, clickLabel: string, showResetTimes = false): string {
     const hasUsage = ctx.five_hour_remaining != null || ctx.weekly_remaining != null;
+    const hasResetTimes = ctx.five_hour_reset_at != null || ctx.weekly_reset_at != null;
+    if (showResetTimes && hasResetTimes) {
+        return stripSvg(`<text x="10" y="28" font-family="sans-serif" font-size="9" fill="#666">5H RESET</text>
+  <text x="${STRIP_W / 2}" y="47" font-family="monospace" font-size="14" font-weight="bold" fill="#90caf9" text-anchor="middle">${escapeXml(formatResetAt(ctx.five_hour_reset_at))}</text>
+  <text x="10" y="65" font-family="sans-serif" font-size="9" fill="#666">WEEKLY RESET</text>
+  <text x="${STRIP_W / 2}" y="84" font-family="monospace" font-size="14" font-weight="bold" fill="#a5d6a7" text-anchor="middle">${escapeXml(formatResetAt(ctx.weekly_reset_at))}</text>
+  <text x="${STRIP_W - 8}" y="16" font-family="monospace" font-size="9" fill="#546e7a" text-anchor="end">â–²â–¼ ${escapeXml(clickLabel)}</text>`);
+    }
     if (hasUsage) {
         return stripSvg(`${usageBar("5H", ctx.five_hour_remaining, 26)}
   ${usageBar("WK", ctx.weekly_remaining, 62)}
-  <text x="${STRIP_W - 8}" y="16" font-family="monospace" font-size="9" fill="#546e7a" text-anchor="end">▲▼ ${escapeXml(clickLabel)}</text>`);
+  <text x="${STRIP_W - 8}" y="16" font-family="monospace" font-size="9" fill="#546e7a" text-anchor="end">â–²â–¼ ${escapeXml(clickLabel)}</text>`);
     }
     // Fallback: show status and progress as text when no usage data.
     const status = (ctx.status ?? "idle").toUpperCase();
@@ -296,6 +313,17 @@ export function renderCruxVStrip(ctx: StripContext, clickLabel: string): string 
   <text x="10" y="72" font-family="sans-serif" font-size="10" fill="#666">PROGRESS</text>
   <text x="${STRIP_W / 2}" y="90" font-family="sans-serif" font-size="14" font-weight="bold" fill="#90caf9" text-anchor="middle">${escapeXml(progress)}</text>
   <text x="${STRIP_W - 8}" y="16" font-family="monospace" font-size="9" fill="#546e7a" text-anchor="end">▲▼ ${escapeXml(clickLabel)}</text>`);
+}
+
+/** Formats a reset timestamp in the user local timezone. */
+function formatResetAt(resetAt: number | null | undefined): string {
+    if (resetAt == null || !Number.isFinite(resetAt)) return "\u2014";
+    return new Intl.DateTimeFormat(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+    }).format(new Date(resetAt * 1_000));
 }
 
 /** Renders a labelled usage bar (remaining percentage) at the given y. */

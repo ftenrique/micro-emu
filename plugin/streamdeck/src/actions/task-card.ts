@@ -21,9 +21,10 @@ type TaskCardInstance = KeyAction<TaskCardSettings> | DialAction<TaskCardSetting
 export class TaskCardAction extends SingletonAction<TaskCardSettings> {
     private readonly ctx: PluginContext;
     private readonly timer: ReturnType<typeof setInterval>;
-    private readonly pressedSlots = new Set<number>();
-    private readonly longPressedSlots = new Set<number>();
-    private readonly longPressTimers = new Map<number, ReturnType<typeof setTimeout>>();
+    private readonly renderedTargets = new WeakMap<TaskCardInstance, string>();
+    private readonly pressedTargets = new WeakMap<TaskCardInstance, { slot: number; taskId: string }>();
+    private readonly longPressedActions = new WeakSet<TaskCardInstance>();
+    private readonly longPressTimers = new WeakMap<TaskCardInstance, ReturnType<typeof setTimeout>>();
     // Stream Deck key-image uploads are not safe to flood concurrently. Keep
     // one device-wide queue and supersede stale renders for the same action.
     private renderQueue: Promise<void> = Promise.resolve();
@@ -46,47 +47,54 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
             ev.action.showAlert();
             return;
         }
+        const action = ev.action as TaskCardInstance;
         const slot = Number(ev.payload.settings.slot ?? 0);
-        // Only occupied cards are selectable; selecting an empty slot would
-        // desync the local highlight from the daemon's selection state.
-        const card = this.ctx.getTaskCard(slot) ?? this.ctx.getSlot(slot);
-        if (!card || Number(card.e ?? 1) === 0) return;
-        this.pressedSlots.add(slot);
-        const previousTimer = this.longPressTimers.get(slot);
+        // Bind the gesture to the identity whose image actually reached this
+        // key. Live task state may reflow while the render queue is draining;
+        // resolving the slot again here could activate a different task.
+        const taskId = this.renderedTargets.get(action);
+        if (!taskId) return;
+        const target = { slot, taskId };
+        this.pressedTargets.set(action, target);
+        const previousTimer = this.longPressTimers.get(action);
         if (previousTimer) clearTimeout(previousTimer);
-        this.longPressTimers.set(slot, setTimeout(() => {
-            this.longPressTimers.delete(slot);
-            if (!this.pressedSlots.has(slot)) return;
-            this.longPressedSlots.add(slot);
-            const current = this.ctx.getTaskCard(slot) ?? this.ctx.getSlot(slot);
-            if (isWaitingInteraction(current) && this.ctx.getSelectedTaskSlot() === slot && hasAction(current, "long")) {
-                this.ctx.daemon.sendTaskAction(slot, "long");
+        this.longPressTimers.set(action, setTimeout(() => {
+            this.longPressTimers.delete(action);
+            if (this.pressedTargets.get(action) !== target) return;
+            this.longPressedActions.add(action);
+            const current = this.ctx.getTaskCardById(taskId);
+            if (isWaitingInteraction(current) && isSelectedTask(this.ctx, taskId) && hasAction(current, "long")) {
+                this.ctx.daemon.sendTaskAction(slot, "long", taskId);
             } else {
-                this.ctx.daemon.sendTaskToggle(slot);
+                this.ctx.daemon.sendTaskToggle(slot, taskId);
             }
         }, LONG_PRESS_MS));
     }
 
     onKeyUp(ev: KeyUpEvent<TaskCardSettings>): void {
-        const slot = Number(ev.payload.settings.slot ?? 0);
+        const action = ev.action as TaskCardInstance;
+        const target = this.pressedTargets.get(action);
         // Never emit a release without its matching press (e.g. when the
         // press was swallowed while disconnected); unpaired releases confuse
         // the daemon's key routing.
-        if (!this.pressedSlots.delete(slot)) return;
-        const timer = this.longPressTimers.get(slot);
+        if (!target) return;
+        this.pressedTargets.delete(action);
+        const { slot, taskId } = target;
+        const timer = this.longPressTimers.get(action);
         if (timer) clearTimeout(timer);
-        this.longPressTimers.delete(slot);
+        this.longPressTimers.delete(action);
         // A completed long press is a native window toggle, not a second task
         // click. Short presses retain the existing task-selection behavior.
-        if (this.longPressedSlots.delete(slot)) return;
-        const current = this.ctx.getTaskCard(slot) ?? this.ctx.getSlot(slot);
-        if (isWaitingInteraction(current) && this.ctx.getSelectedTaskSlot() === slot && hasAction(current, "short")) {
-            this.ctx.daemon.sendTaskAction(slot, "short");
+        if (this.longPressedActions.delete(action)) return;
+        const current = this.ctx.getTaskCardById(taskId);
+        if (isWaitingInteraction(current) && isSelectedTask(this.ctx, taskId) && hasAction(current, "short")) {
+            this.ctx.daemon.sendTaskAction(slot, "short", taskId);
             return;
         }
-        this.ctx.selectTaskSlot(slot);
-        this.ctx.daemon.sendTaskButton(slot, true);
-        this.ctx.daemon.sendTaskButton(slot, false);
+        const currentSlot = cardSlot(current);
+        if (currentSlot != null) this.ctx.selectTaskSlot(currentSlot);
+        this.ctx.daemon.sendTaskButton(slot, true, taskId);
+        this.ctx.daemon.sendTaskButton(slot, false, taskId);
     }
 
     private refreshAll(): void {
@@ -137,6 +145,7 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
     private async refresh(action: TaskCardInstance, settings: TaskCardSettings): Promise<void> {
         const slot = Number(settings.slot ?? 0);
         if (!this.ctx.isConnected()) {
+            this.renderedTargets.delete(action);
             await action.setImage(renderDisconnectedImage(`#${slot}`));
             return;
         }
@@ -151,6 +160,13 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
         // Assigned task records remain visible in every lifecycle state.
         // e:0 is reserved exclusively for an actually empty slot.
         if (!taskCard || (!enabled && !isFinishedStatus(status))) {
+            this.renderedTargets.delete(action);
+            await action.setImage(renderTaskCardImage(slot, null, "", 0x263238));
+            return;
+        }
+        const taskId = taskIdentity(taskCard);
+        if (!taskId) {
+            this.renderedTargets.delete(action);
             await action.setImage(renderTaskCardImage(slot, null, "", 0x263238));
             return;
         }
@@ -162,6 +178,7 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
             finishedAt,
             selected,
         ));
+        this.renderedTargets.set(action, taskId);
     }
 }
 
@@ -195,4 +212,18 @@ function hasAction(card: Record<string, unknown> | null, gesture: "short" | "lon
     if (!card?.interaction || typeof card.interaction !== "object") return false;
     const action = (card.interaction as Record<string, unknown>)[gesture];
     return action != null && typeof action === "object";
+}
+
+function taskIdentity(card: Record<string, unknown>): string | undefined {
+    const value = card.task_id;
+    return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function cardSlot(card: Record<string, unknown> | null): number | undefined {
+    const value = Number(card?.id ?? card?.slot ?? card?.i);
+    return Number.isFinite(value) ? value : undefined;
+}
+
+function isSelectedTask(ctx: PluginContext, taskId: string): boolean {
+    return ctx.getSelectedTaskCard()?.task_id === taskId;
 }

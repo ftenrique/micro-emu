@@ -1730,6 +1730,8 @@ mod tests {
             task_id: None,
             weekly_remaining: None,
             five_hour_remaining: None,
+            weekly_reset_at: None,
+            five_hour_reset_at: None,
             wait_reason: None,
             prompt: None,
             interaction_id: None,

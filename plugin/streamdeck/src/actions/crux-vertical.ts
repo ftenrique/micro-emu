@@ -7,6 +7,7 @@ import {
     type DialDownEvent,
     type DialUpEvent,
     type DialAction,
+    type TouchTapEvent,
 } from "@elgato/streamdeck";
 import { PluginContext } from "../context";
 import { renderCruxVStrip, renderStripOffline } from "../images";
@@ -22,6 +23,7 @@ import { clickLabel, sendClick, type CruxDialSettings } from "./dial-common";
 @action({ UUID: "com.micro-emu.codex.crux-v" })
 export class CruxVerticalAction extends SingletonAction<CruxDialSettings> {
     private readonly ctx: PluginContext;
+    private showResetTimes = false;
 
     constructor(ctx: PluginContext) {
         super();
@@ -61,6 +63,15 @@ export class CruxVerticalAction extends SingletonAction<CruxDialSettings> {
     onDialUp(ev: DialUpEvent<CruxDialSettings>): void {
         sendClick(this.ctx, ev.payload.settings.click, 2, false);
     }
+    onTouchTap(ev: TouchTapEvent<CruxDialSettings>): void {
+        if (!this.ctx.isConnected()) {
+            ev.action.showAlert();
+            return;
+        }
+        this.showResetTimes = !this.showResetTimes;
+        void ev.action.getSettings().then((settings) =>
+            this.refresh(ev.action as DialAction<CruxDialSettings>, settings));
+    }
 
     private refreshAll(): void {
         for (const action of this.actions) {
@@ -77,6 +88,6 @@ export class CruxVerticalAction extends SingletonAction<CruxDialSettings> {
         }
         const ctx = this.ctx.getDisplayContext();
         const label = clickLabel(settings.click, "MIC");
-        action.setFeedback({ canvas: renderCruxVStrip(ctx ?? {}, label) });
+        action.setFeedback({ canvas: renderCruxVStrip(ctx ?? {}, label, this.showResetTimes) });
     }
 }

@@ -138,7 +138,7 @@
                     "Image": "imgs/actions/mic"
                 }
             ],
-            "Tooltip": "Codex Micro microphone toggle (ACT10).",
+            "Tooltip": "Codex Micro microphone (ACT10), or held Ctrl+Shift+M without an RP2040.",
             "UUID": "com.micro-emu.codex.mic",
             "Controllers": [
                 "Keypad"

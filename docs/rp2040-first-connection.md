@@ -1,5 +1,23 @@
 # Primera conexión del RP2040 Zero
 
+## Desde un release (sin compilar)
+
+Si descargaste el bundle de Windows (`micro-emu-vX.Y.Z-windows-x64.zip`), no
+necesitas compilar el firmware: el bundle incluye el UF2 precompilado
+(`codex_micro_rp2040_bridge.uf2`) y un asistente de flasheo.
+
+1. Cerrar ChatGPT y el software oficial de AJAZZ.
+2. Mantener pulsado `BOOT`, conectar un cable USB de datos y soltar `BOOT` al
+   aparecer `RPI-RP2`.
+3. Doble clic en `Flash-Firmware.cmd` dentro de la carpeta extraída.
+
+La placa se reinicia sola y `RPI-RP2` desaparece. Reinicia el puente (o Codex
+Micro) para que detecte la placa. También se publica el UF2 como un asset
+independiente del release para reflashear sin volver a descargar el bundle.
+
+El resto del documento describe el flujo de desarrollo, que compila el firmware
+desde fuente.
+
 ## Antes de conectarlo
 
 ```powershell

@@ -152,6 +152,16 @@ export class PluginContext {
         const card = this.taskCards.find((s: any) => Number(s.id ?? s.slot ?? s.i) === index);
         return (card as Record<string, unknown>) ?? null;
     }
+
+    /** Gets a task card by its stable daemon identity, independent of slot reflow. */
+    getTaskCardById(taskId: string): Record<string, unknown> | null {
+        const card = this.taskCards.find((candidate) =>
+            candidate != null
+            && typeof candidate === "object"
+            && (candidate as Record<string, unknown>).task_id === taskId);
+        return (card as Record<string, unknown>) ?? null;
+    }
+
     /** Registers a listener that is called when render state changes. */
     addListener(fn: () => void): () => void {
         this.listeners.add(fn);

@@ -138,7 +138,6 @@ pub enum CatalogAction {
     AgentOpenEditor,
     AgentCompactContext,
     AgentSettings,
-    SystemMicToggle,
 }
 
 impl CatalogAction {
@@ -169,7 +168,6 @@ impl CatalogAction {
             "agent.open-editor" => Self::AgentOpenEditor,
             "agent.compact-context" => Self::AgentCompactContext,
             "agent.settings" => Self::AgentSettings,
-            "system.mic-toggle" => Self::SystemMicToggle,
             _ => return None,
         })
     }
@@ -201,12 +199,11 @@ impl CatalogAction {
             Self::AgentOpenEditor => "agent.open-editor",
             Self::AgentCompactContext => "agent.compact-context",
             Self::AgentSettings => "agent.settings",
-            Self::SystemMicToggle => "system.mic-toggle",
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PhysicalEvent {
     Button {
         index: u8,
@@ -216,14 +213,17 @@ pub enum PhysicalEvent {
     TaskButton {
         index: u8,
         pressed: bool,
+        task_id: Option<String>,
     },
     /// Long-press request to select/show or minimize the Codex desktop app.
     TaskToggle {
         index: u8,
+        task_id: Option<String>,
     },
     TaskAction {
         index: u8,
         gesture: u8,
+        task_id: Option<String>,
     },
     /// Explicit physical Micro command that bypasses task-card routing.
     MicroButton {
@@ -479,13 +479,6 @@ mod tests {
             ]
         );
         assert!(messages_for_synthetic_key("INVALID").is_err());
-    }
-
-    #[test]
-    fn system_mic_toggle_round_trips() {
-        let action = CatalogAction::parse("system.mic-toggle").expect("known catalog action");
-        assert_eq!(action, CatalogAction::SystemMicToggle);
-        assert_eq!(action.as_str(), "system.mic-toggle");
     }
 }
 
