@@ -1,4 +1,4 @@
-CODEX MICRO 1.0.0 - WINDOWS X64
+CODEX MICRO 1.1.0 - WINDOWS X64
 ================================
 
 INSTALL

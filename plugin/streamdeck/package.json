@@ -1,6 +1,6 @@
 {
     "name": "micro-emu-streamdeck-plugin",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Codex Micro emulation controls for Stream Deck, backed by the rp2040-bridge daemon.",
     "license": "MIT",
     "type": "module",

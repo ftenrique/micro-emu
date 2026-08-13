@@ -78,7 +78,7 @@ class CodexAppServerClient {
             clientInfo: {
                 name: "codex-micro-streamdeck",
                 title: "Codex Micro Stream Deck",
-                version: "1.0.0",
+                version: "1.1.0",
             },
             capabilities: { experimentalApi: true },
         });
