@@ -6,6 +6,10 @@ import * as path from "path";
 /** Default daemon TCP endpoint. */
 export const DEFAULT_DAEMON_PORT = 48360;
 export const DEFAULT_DAEMON_HOST = "127.0.0.1";
+const CONNECT_TIMEOUT_MS = 10_000;
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const HEARTBEAT_TIMEOUT_MS = 45_000;
+const KEEP_ALIVE_INITIAL_DELAY_MS = 10_000;
 
 /** Render state pushed from the daemon to the plugin. */
 export interface RenderState {
@@ -61,11 +65,14 @@ export class DaemonClient extends EventEmitter {
     private reconnectDelay = 250;
     private readonly maxReconnectDelay = 2000;
     private reconnectTimer: NodeJS.Timeout | null = null;
+    private connectTimer: NodeJS.Timeout | null = null;
+    private heartbeatTimer: NodeJS.Timeout | null = null;
     private daemonProcess: ChildProcess | null = null;
     private connected = false;
     private connecting = false;
     private stopped = true;
     private autostartAttempted = false;
+    private lastInboundAt = 0;
     private taskSlots = 0;
     private instanceId: string;
     private options: Required<Pick<DaemonClientOptions, "host" | "port">> & DaemonClientOptions;
@@ -102,6 +109,29 @@ export class DaemonClient extends EventEmitter {
         this.connect();
     }
 
+    /** Forces a fresh daemon session, including while a socket is half-open. */
+    reconnect(reason = "requested"): void {
+        if (this.stopped) return;
+        this.emit(
+            "log",
+            `refreshing daemon connection (${reason})`,
+        );
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        this.clearConnectTimer();
+        this.clearHeartbeat();
+        if (this.socket) {
+            this.socket.destroy();
+            return;
+        }
+        this.buffer = "";
+        this.connected = false;
+        this.connecting = false;
+        this.connect();
+    }
+
     /** Stops the client and cleans up. */
     stop(): void {
         this.stopped = true;
@@ -109,6 +139,8 @@ export class DaemonClient extends EventEmitter {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        this.clearConnectTimer();
+        this.clearHeartbeat();
         if (this.socket) {
             this.socket.destroy();
             this.socket = null;
@@ -173,12 +205,25 @@ export class DaemonClient extends EventEmitter {
         this.socket = socket;
         socket.setEncoding("utf-8");
         socket.setNoDelay(true);
+        socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY_MS);
+        this.connectTimer = setTimeout(() => {
+            if (this.socket !== socket || !this.connecting) return;
+            this.emit("log", `daemon connect timed out after ${CONNECT_TIMEOUT_MS}ms; retrying`);
+            socket.destroy();
+        }, CONNECT_TIMEOUT_MS);
 
         socket.on("connect", () => {
+            if (this.stopped || this.socket !== socket) {
+                socket.destroy();
+                return;
+            }
+            this.clearConnectTimer();
             this.connecting = false;
             this.connected = true;
             this.reconnectDelay = 250;
             this.socket = socket;
+            this.lastInboundAt = Date.now();
+            this.startHeartbeat(socket);
             // Send the controller hello.
             const hello = {
                 bridge: "hello",
@@ -189,10 +234,13 @@ export class DaemonClient extends EventEmitter {
                 taskSlots: this.taskSlots,
             };
             socket.write(JSON.stringify(hello) + "\n");
+            this.emit("log", "daemon connected");
             this.emit("connect");
         });
 
         socket.on("data", (data: string) => {
+            if (this.socket !== socket) return;
+            this.lastInboundAt = Date.now();
             this.buffer += data;
             let newlineIndex: number;
             while ((newlineIndex = this.buffer.indexOf("\n")) >= 0) {
@@ -205,6 +253,7 @@ export class DaemonClient extends EventEmitter {
         });
 
         socket.on("error", (error: Error) => {
+            if (this.socket !== socket) return;
             this.emit("error", error);
             if (!this.connected && !this.autostartAttempted) {
                 this.autostartAttempted = true;
@@ -213,14 +262,16 @@ export class DaemonClient extends EventEmitter {
         });
 
         socket.on("close", () => {
+            if (this.socket !== socket) return;
             const wasConnected = this.connected;
+            this.clearConnectTimer();
+            this.clearHeartbeat();
             this.connecting = false;
             this.buffer = "";
             this.connected = false;
-            if (this.socket === socket) {
-                this.socket = null;
-            }
+            this.socket = null;
             if (wasConnected) {
+                this.emit("log", "daemon connection closed; reconnecting");
                 this.emit("disconnect");
                 if (!this.daemonProcess) {
                     this.autostartAttempted = false;
@@ -232,6 +283,41 @@ export class DaemonClient extends EventEmitter {
         });
 
         socket.connect(this.options.port, this.options.host);
+    }
+
+    /**
+     * Render updates are event-driven and may legitimately be quiet for hours,
+     * so probe the daemon explicitly instead of treating ordinary inactivity as
+     * a disconnect. A suspended process resumes with an old `lastInboundAt`;
+     * the first watchdog tick then tears down a half-open socket immediately.
+     */
+    private startHeartbeat(socket: net.Socket): void {
+        this.clearHeartbeat();
+        this.heartbeatTimer = setInterval(() => {
+            if (this.stopped || !this.connected || this.socket !== socket) return;
+            const idleMs = Date.now() - this.lastInboundAt;
+            if (idleMs >= HEARTBEAT_TIMEOUT_MS) {
+                this.emit(
+                    "log",
+                    `daemon heartbeat timed out after ${idleMs}ms; reconnecting`,
+                );
+                socket.destroy();
+                return;
+            }
+            socket.write(JSON.stringify({ type: "ping", timestamp: Date.now() }) + "\n");
+        }, HEARTBEAT_INTERVAL_MS);
+    }
+
+    private clearConnectTimer(): void {
+        if (!this.connectTimer) return;
+        clearTimeout(this.connectTimer);
+        this.connectTimer = null;
+    }
+
+    private clearHeartbeat(): void {
+        if (!this.heartbeatTimer) return;
+        clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = null;
     }
 
     private scheduleReconnect(): void {
@@ -247,15 +333,19 @@ export class DaemonClient extends EventEmitter {
     private tryAutostart(): void {
         const exe = this.options.bridgeExe;
         if (!exe) {
-            this.emit("log", "daemon unreachable and no bridgeExe configured for autostart");
+            this.emit(
+                "log",
+                "daemon unreachable; bridge executable was not found (set MICRO_EMU_BRIDGE_EXE or reinstall the bridge)",
+            );
             return;
         }
         try {
             const args = ["--daemon", ...(this.options.daemonArgs ?? [])];
             this.daemonProcess = spawn(exe, args, {
-                cwd: this.options.cwd,
+                cwd: this.options.cwd ?? path.dirname(exe),
                 stdio: "ignore",
                 detached: false,
+                windowsHide: true,
             });
             this.daemonProcess.on("error", (error: Error) => {
                 this.emit("log", `daemon autostart failed: ${error.message}`);
@@ -268,6 +358,8 @@ export class DaemonClient extends EventEmitter {
             });
             this.emit("log", "daemon autostarted");
         } catch (error) {
+            this.daemonProcess = null;
+            this.autostartAttempted = false;
             this.emit("log", `daemon autostart error: ${error}`);
         }
     }
@@ -294,6 +386,9 @@ export class DaemonClient extends EventEmitter {
             this.emit("render", message as RenderState);
         } else if (type === "goodbye") {
             this.emit("goodbye");
+            // A goodbye means this controller was detached. Do not wait for
+            // TCP teardown to become observable before entering reconnect.
+            this.socket?.destroy();
         }
     }
 }

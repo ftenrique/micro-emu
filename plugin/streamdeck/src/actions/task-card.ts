@@ -1,10 +1,11 @@
-import streamDeck, { action, SingletonAction, type KeyAction, type DialAction, type WillAppearEvent, type KeyDownEvent, type KeyUpEvent } from "@elgato/streamdeck";
+import streamDeck, { action, SingletonAction, type KeyAction, type DialAction, type WillAppearEvent, type DidReceiveSettingsEvent, type KeyDownEvent, type KeyUpEvent } from "@elgato/streamdeck";
 import type { JsonValue } from "@elgato/utils";
 import { PluginContext } from "../context";
 import { renderTaskCardImage, renderDisconnectedImage } from "../images";
+import { TASK_SLOT_COUNT } from "../task-slots";
 
 const TIMER_REFRESH_MS = 1_000;
-const TASK_SLOT_COUNT = 6;
+// The ninth card is desktop-only when the attached hardware has fewer keys.
 const LONG_PRESS_MS = 650;
 
 /** Settings for the Task Card action. */
@@ -29,6 +30,7 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
     // one device-wide queue and supersede stale renders for the same action.
     private renderQueue: Promise<void> = Promise.resolve();
     private readonly renderVersions = new WeakMap<TaskCardInstance, number>();
+    private readonly actionSettings = new WeakMap<TaskCardInstance, TaskCardSettings>();
     private repairSlot = 0;
 
     constructor(ctx: PluginContext) {
@@ -39,9 +41,16 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
     }
 
     onWillAppear(ev: WillAppearEvent<TaskCardSettings>): void {
-        this.enqueueRefresh(ev.action as TaskCardInstance, ev.payload.settings);
+        const action = ev.action as TaskCardInstance;
+        this.actionSettings.set(action, ev.payload.settings);
+        this.enqueueRefresh(action, ev.payload.settings);
     }
 
+    onDidReceiveSettings(ev: DidReceiveSettingsEvent<TaskCardSettings>): void {
+        const action = ev.action as TaskCardInstance;
+        this.actionSettings.set(action, ev.payload.settings);
+        this.enqueueRefresh(action, ev.payload.settings);
+    }
     onKeyDown(ev: KeyDownEvent<TaskCardSettings>): void {
         if (!this.ctx.isConnected()) {
             ev.action.showAlert();
@@ -95,13 +104,20 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
         if (currentSlot != null) this.ctx.selectTaskSlot(currentSlot);
         this.ctx.daemon.sendTaskButton(slot, true, taskId);
         this.ctx.daemon.sendTaskButton(slot, false, taskId);
+        // Codex's Micro protocol has no AG06/AG07 keys. Extra desktop task
+        // cards still select through the daemon, then open their actual thread
+        // through the local app-server bridge so slots 7-8 remain useful.
+        if (isExtendedCodexTask(current)) {
+            this.ctx.codex
+                .execute("task.open", { selectedTask: current, taskId })
+                .catch((error) => this.logRenderFailure(error));
+        }
     }
 
     private refreshAll(): void {
         for (const action of this.actions) {
-            action.getSettings()
-                .then((settings) => this.enqueueRefresh(action, settings))
-                .catch((error) => this.logRenderFailure(error));
+            const settings = this.actionSettings.get(action);
+            if (settings) this.enqueueRefresh(action, settings);
         }
     }
 
@@ -113,16 +129,14 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
         const repairSlot = this.repairSlot;
         this.repairSlot = (this.repairSlot + 1) % TASK_SLOT_COUNT;
         for (const action of this.actions) {
-            action.getSettings()
-                .then((settings) => {
-                    const slot = Number(settings.slot ?? 0);
-                    const card = this.ctx.getTaskCard(slot) ?? this.ctx.getSlot(slot);
-                    const status = String(card?.status ?? card?.state ?? "").toLowerCase();
-                    if (isRunningStatus(status) || slot === repairSlot) {
-                        this.enqueueRefresh(action, settings);
-                    }
-                })
-                .catch((error) => this.logRenderFailure(error));
+            const settings = this.actionSettings.get(action);
+            if (!settings) continue;
+            const slot = Number(settings.slot ?? 0);
+            const card = this.ctx.getTaskCard(slot) ?? this.ctx.getSlot(slot);
+            const status = String(card?.status ?? card?.state ?? "").toLowerCase();
+            if (isRunningStatus(status) || slot === repairSlot) {
+                this.enqueueRefresh(action, settings);
+            }
         }
     }
 
@@ -226,4 +240,16 @@ function cardSlot(card: Record<string, unknown> | null): number | undefined {
 
 function isSelectedTask(ctx: PluginContext, taskId: string): boolean {
     return ctx.getSelectedTaskCard()?.task_id === taskId;
+}
+
+function isExtendedCodexTask(card: Record<string, unknown> | null): boolean {
+    if (!card || card.agent !== "codex") return false;
+    const sourceSlot = Number(card.source_slot);
+    const taskId = card.task_id;
+    return Number.isInteger(sourceSlot)
+        && sourceSlot >= 6
+        && typeof taskId === "string"
+        && taskId.length > 0
+        && !taskId.startsWith("legacy:")
+        && !taskId.startsWith("codex-hid:");
 }

@@ -12,18 +12,24 @@ import { SendAction } from "./actions/send";
 import { ArrowKeyAction } from "./actions/arrow-key";
 import { ContextKeyAction } from "./actions/context";
 import { CodexActionExecutor } from "./codex-action-executor";
+import { resolveBridgeExecutable } from "./bridge-path";
+import { TASK_SLOT_COUNT } from "./task-slots";
+const SUSPEND_GAP_MS = 60_000;
+const HOST_WAKE_GRACE_MS = 20_000;
+const WATCHDOG_INTERVAL_MS = 15_000;
 
 // --- Daemon client setup ---
-// The bridge exe path can be configured via the MICRO_EMU_BRIDGE_EXE
-// environment variable; defaults to the release build in the repo.
-const bridgeExe = process.env.MICRO_EMU_BRIDGE_EXE ?? undefined;
-const daemonArgs: string[] = [];
-if (process.env.MICRO_EMU_PORT) {
-    daemonArgs.push("--port", process.env.MICRO_EMU_PORT);
-}
-if (process.env.MICRO_EMU_CONTROLLER) {
-    daemonArgs.push("--controller", process.env.MICRO_EMU_CONTROLLER);
-}
+// Stream Deck does not reliably inherit the user's shell environment, so use
+// the installed LOCALAPPDATA copy (with release/dev fallbacks) when the
+// explicit override is absent. Plugin mode must not open the physical HID
+// controller owned by the official Stream Deck application.
+const bridgeExe = resolveBridgeExecutable();
+const daemonArgs = [
+    "--port",
+    process.env.MICRO_EMU_PORT || "auto",
+    "--controller",
+    process.env.MICRO_EMU_CONTROLLER || "none",
+];
 
 const daemon = new DaemonClient({
     bridgeExe,
@@ -37,6 +43,40 @@ daemon.on("error", (error: Error) => {
 daemon.on("log", (message: string) => {
     streamDeck.logger.info(message);
 });
+
+let lastWatchdogTickAt = Date.now();
+let lastSystemWakeAt = 0;
+let hostRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+
+streamDeck.system.onSystemDidWakeUp(() => {
+    lastSystemWakeAt = Date.now();
+    if (hostRecoveryTimer) {
+        clearTimeout(hostRecoveryTimer);
+        hostRecoveryTimer = null;
+    }
+    daemon.reconnect("Stream Deck system wake");
+});
+
+setInterval(() => {
+    const previousTickAt = lastWatchdogTickAt;
+    const now = Date.now();
+    lastWatchdogTickAt = now;
+    const gapMs = now - previousTickAt;
+    if (gapMs < SUSPEND_GAP_MS) return;
+    if (lastSystemWakeAt >= previousTickAt) return;
+    daemon.reconnect(`event-loop gap of ${gapMs}ms`);
+    if (hostRecoveryTimer) return;
+    streamDeck.logger.warn(
+        `System resumed after ${gapMs}ms without a Stream Deck wake event; awaiting host recovery`,
+    );
+    hostRecoveryTimer = setTimeout(() => {
+        streamDeck.logger.error(
+            "Stream Deck host connection did not recover after resume; restarting plugin",
+        );
+        daemon.stop();
+        process.exit(1);
+    }, HOST_WAKE_GRACE_MS);
+}, WATCHDOG_INTERVAL_MS);
 const codex = new CodexActionExecutor((message) => streamDeck.logger.info(message));
 const ctx = new PluginContext(daemon, codex);
 
@@ -52,9 +92,10 @@ streamDeck.actions.registerAction(new SendAction(ctx));
 streamDeck.actions.registerAction(new ArrowKeyAction(ctx));
 streamDeck.actions.registerAction(new ContextKeyAction(ctx));
 // --- Connect to the Stream Deck and the daemon ---
-// Stream Deck+ exposes eight physical key slots (4x2). Report this before
-// connecting so the daemon can route Task Card presses immediately.
-daemon.setTaskSlots(8);
+// Stream Deck+ exposes eight physical key slots (4x2). The ninth logical
+// Task Card remains available on larger layouts, pages, and desktop-only
+// profiles, so report the full logical capacity to the daemon.
+daemon.setTaskSlots(TASK_SLOT_COUNT);
 streamDeck.connect();
 daemon.start();
 

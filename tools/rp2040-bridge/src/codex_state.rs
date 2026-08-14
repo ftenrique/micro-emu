@@ -5,7 +5,7 @@
 //! metadata, lifecycle, and timing instead come from Codex's thread database
 //! and append-only rollout events.
 
-use crate::tasks::{CODEX_TASK_SLOTS, TaskState};
+use crate::tasks::{CODEX_HID_SLOTS, CODEX_TASK_SLOTS, TaskState};
 use rusqlite::OpenFlags;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -124,7 +124,11 @@ fn read_codex_snapshot_from(
             "state": state.as_str(),
             "priority": if state.active() { 100 } else { 50 },
             "source_slot": source_slot,
-            "legacy_key": format!("AG0{source_slot}"),
+            // Only the six physical Micro positions have synthetic HID keys.
+            // Extra Stream Deck task cards are selected through the desktop
+            // task path instead of trying to emit nonexistent AG06/AG07 keys.
+            "legacy_key": (source_slot < CODEX_HID_SLOTS)
+                .then(|| format!("AG0{source_slot}")),
             "started_at_ms": lifecycle.started_at_ms,
             "finished_at_ms": lifecycle.finished_at_ms,
             "timing_authoritative": true,

@@ -116,7 +116,7 @@ The proxy starts or attaches to the loopback-only daemon. Key tools include `bri
 
 ## Multi-controller task board
 
-The daemon combines task slots across active controllers and assigns published tasks using stable IDs. An AKP03E supplies six slots; Stream Deck + and XL controllers supply eight by default. It also supports dynamic key and LCD-slot partitioning for Codex, ZCode, and Hermes sessions.
+The daemon combines task slots across active controllers and assigns published tasks using stable IDs. An AKP03E supplies six physical slots; Stream Deck + and XL controllers expose nine logical task slots by default, with any hardware-only tail remaining disabled. It also supports dynamic key and LCD-slot partitioning for Codex, ZCode, and Hermes sessions.
 
 See [the multi-agent guide](docs/multi-agent-coexistence.md) for the session and partitioning model.
 

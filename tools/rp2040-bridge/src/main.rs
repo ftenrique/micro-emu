@@ -484,14 +484,15 @@ fn connection_default_cards(
     slot_count: usize,
     partition: Option<&crate::routing::Partition>,
 ) -> Vec<Value> {
-    const COLORS: [u32; 8] = [
+    const COLORS: [u32; crate::tasks::CODEX_TASK_SLOTS] = [
         0x1565c0, 0x00897b, 0x6a1b9a, 0xef6c00, 0x2e7d32, 0xad1457, 0x0277bd, 0x5d4037,
+        0x455a64,
     ];
-    let active_slots = slot_count.min(8);
-    // Always return the complete physical card set. Explicitly disabling the
-    // unused tail prevents a previous eight-card standby frame from surviving
-    // when Codex is assigned only six logical slots.
-    (0..8)
+    let active_slots = slot_count.min(crate::tasks::CODEX_TASK_SLOTS);
+    // Return the complete logical card set for this controller. Explicitly
+    // disabling the unused tail prevents a previous standby frame from
+    // surviving when Codex is assigned only its six physical positions.
+    (0..active_slots)
         .map(|id| {
             let owner = partition.and_then(|partition| partition.owner_of(id as u8));
             let enabled = if partition.is_some() {
@@ -2504,7 +2505,7 @@ mod tests {
             task_board: crate::tasks::TaskBoard::new(),
             task_mode: false,
             task_device_id: "streamdeck-plus:test".to_owned(),
-            task_slot_count: 8,
+            task_slot_count: crate::tasks::CODEX_TASK_SLOTS,
             pending_task_events: Vec::new(),
         }
     }
@@ -2699,10 +2700,51 @@ mod tests {
                 .all(|(_, event)| event["type"] == "task_selected")
         );
     }
+
+    #[test]
+    fn ninth_task_button_routes_with_a_task_identity() {
+        let rendered = Arc::new(Mutex::new(None));
+        let mut bridge = test_bridge(rendered);
+        bridge.task_mode = true;
+        let device_id = bridge.task_device_id.clone();
+        bridge
+            .task_board
+            .set_device(device_id.clone(), crate::tasks::CODEX_TASK_SLOTS, true);
+        bridge
+            .task_board
+            .publish_codex_snapshot(
+                &json!({
+                    "tasks": [{
+                        "task_id": "codex-slot-nine",
+                        "title": "Slot nine",
+                        "state": "queued",
+                        "source_slot": 8
+                    }]
+                }),
+                1,
+            )
+            .expect("publish ninth task");
+
+        assert!(route_task_button(
+            &mut bridge,
+            &device_id,
+            crate::tasks::CODEX_TASK_SLOTS,
+            8,
+            true,
+            Some("codex-slot-nine"),
+            2,
+        ));
+        assert_eq!(
+            bridge.task_board.selected_task().map(|task| task.task_id.as_str()),
+            Some("codex-slot-nine")
+        );
+    }
+
+
     #[test]
     fn connection_defaults_are_visible_cards() {
-        let cards = connection_default_cards(8, None);
-        assert_eq!(cards.len(), 8);
+        let cards = connection_default_cards(crate::tasks::CODEX_TASK_SLOTS, None);
+        assert_eq!(cards.len(), crate::tasks::CODEX_TASK_SLOTS);
         assert!(cards.iter().all(|card| card["e"] == 1));
         assert!(cards.iter().all(|card| card.get("agent").is_none()));
         assert!(cards.iter().all(|card| card["b"] == 0.70));
@@ -2718,7 +2760,7 @@ mod tests {
             .expect("render lock")
             .clone()
             .expect("payload");
-        assert_eq!(payload.as_array().expect("cards").len(), 8);
+        assert_eq!(payload.as_array().expect("cards").len(), crate::tasks::CODEX_TASK_SLOTS);
         assert_eq!(payload[0]["e"], 1);
 
         let reconnected = Arc::new(Mutex::new(None));
@@ -2733,7 +2775,7 @@ mod tests {
             .clone()
             .expect("payload");
         assert!(payload[0].get("agent").is_none());
-        assert_eq!(payload[7]["e"], 1);
+        assert_eq!(payload[8]["e"], 1);
     }
 
     #[test]

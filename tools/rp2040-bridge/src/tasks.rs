@@ -32,7 +32,12 @@ pub struct TaskInteraction {
 use std::time::Duration;
 
 pub const RECONNECT_GRACE: Duration = Duration::from_secs(30);
-pub const CODEX_TASK_SLOTS: usize = 6;
+/// Number of Codex desktop tasks exposed to the task board. This may exceed
+/// the six physical Codex Micro LCD/HID positions when a larger controller or
+/// a desktop-only task-card layout is connected.
+pub const CODEX_TASK_SLOTS: usize = 9;
+/// Number of physical task positions represented by the Codex Micro protocol.
+pub const CODEX_HID_SLOTS: usize = 6;
 
 /// Returns the task title as it should appear on the Stream Deck strip.
 ///
@@ -402,14 +407,14 @@ impl TaskBoard {
         let selection_guard_active = !self.selection_activation_guards.is_empty();
         let session = 0;
         let mut cards = Vec::with_capacity(entries.len());
-        for (position, entry) in entries.iter().enumerate().take(6) {
+        for (position, entry) in entries.iter().enumerate().take(CODEX_HID_SLOTS) {
             let index = entry
                 .get("id")
                 .or_else(|| entry.get("i"))
                 .and_then(Value::as_u64)
                 .and_then(|slot| usize::try_from(slot).ok())
                 .unwrap_or(position);
-            if index >= 6 {
+            if index >= CODEX_HID_SLOTS {
                 continue;
             }
             let task_id = format!("codex-hid:{index}");
@@ -1067,19 +1072,18 @@ impl TaskBoard {
         }
         let available: Vec<DeviceSlot> = self.devices.values().flatten().cloned().collect();
         let available_set: HashSet<DeviceSlot> = available.iter().cloned().collect();
+        let partitioned_device_id = self.partitioned_device_id.clone();
+        let slot_owners = self.slot_owners.clone();
         self.assignments.retain(|task_id, assignment| {
             self.tasks.get(task_id).is_some_and(|task| {
                 task.state.eligible()
                     && available_set.contains(&assignment.slot)
-                    && (self.partitioned_device_id.as_deref()
+                    && (partitioned_device_id.as_deref()
                         != Some(assignment.slot.device_id.as_str())
-                        || self.slot_owners.is_empty()
-                        || self
-                            .slot_owners
+                        || slot_owners
                             .get(assignment.slot.slot)
                             .copied()
-                            .flatten()
-                            == Some(task.owner_agent))
+                            .is_none_or(|owner| owner == Some(task.owner_agent)))
             })
         });
         self.pin_codex_hid_primary_slots();
@@ -1180,9 +1184,15 @@ impl TaskBoard {
     }
 
     fn slot_owner(&self, slot: &DeviceSlot) -> Option<Option<AgentId>> {
-        (self.partitioned_device_id.as_deref() == Some(slot.device_id.as_str())
-            && !self.slot_owners.is_empty())
-        .then(|| self.slot_owners.get(slot.slot).copied().flatten())
+        if self.partitioned_device_id.as_deref() != Some(slot.device_id.as_str())
+            || self.slot_owners.is_empty()
+        {
+            return None;
+        }
+        // The partition describes the six Micro positions. A larger primary
+        // controller may have additional task-only slots; keep those slots
+        // unrestricted instead of reserving them as unowned.
+        self.slot_owners.get(slot.slot).copied()
     }
 
     /// Codex HID task IDs are logical hardware positions, not scheduler work
@@ -1357,6 +1367,39 @@ mod tests {
     }
 
     #[test]
+    fn extended_primary_slots_accept_desktop_codex_tasks() {
+        let mut board = TaskBoard::new();
+        board.set_device("streamdeck", CODEX_TASK_SLOTS, true);
+        board.set_slot_owners(
+            "streamdeck",
+            (0..8)
+                .map(|slot| (slot < CODEX_HID_SLOTS).then_some(AgentId::Codex))
+                .collect(),
+        );
+        let tasks = (0..CODEX_TASK_SLOTS)
+            .map(|slot| {
+                json!({
+                    "task_id": format!("codex-{slot}"),
+                    "title": format!("Task {slot}"),
+                    "state": "queued",
+                    "source_slot": slot,
+                    "legacy_key": (slot < CODEX_HID_SLOTS).then(|| format!("AG0{slot}"))
+                })
+            })
+            .collect::<Vec<_>>();
+        board
+            .publish_codex_snapshot(&json!({"tasks": tasks}), 1)
+            .expect("publish nine Codex tasks");
+
+        let cards = board.rendered_slots("streamdeck", CODEX_TASK_SLOTS);
+        assert_eq!(cards[6]["task_id"], "codex-6");
+        assert_eq!(cards[7]["task_id"], "codex-7");
+        assert_eq!(cards[8]["task_id"], "codex-8");
+        assert_eq!(cards[6]["legacy_key"], Value::Null);
+        assert_eq!(cards[7]["legacy_key"], Value::Null);
+        assert_eq!(cards[8]["legacy_key"], Value::Null);
+    }
+    #[test]
     fn legacy_status_accepts_i_and_percent_brightness() {
         let mut board = TaskBoard::new();
         board.set_device("plus", 8, true);
@@ -1429,7 +1472,7 @@ mod tests {
             display_task_title(0, "6 \u{2014} Existing label"),
             "1 \u{2014} Existing label"
         );
-        assert_eq!(display_task_title(6, "Build bridge"), "Build bridge");
+        assert_eq!(display_task_title(6, "Build bridge"), "7 \u{2014} Build bridge");
     }
 
     #[test]

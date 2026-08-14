@@ -91,6 +91,16 @@ impl PluginController {
                 }
                 None
             }
+            "ping" => {
+                let timestamp = message.get("timestamp").cloned().unwrap_or(Value::Null);
+                if self
+                    .send(json!({"type":"pong", "timestamp":timestamp}))
+                    .is_err()
+                {
+                    self.disconnected = true;
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -477,6 +487,18 @@ mod tests {
             .unwrap();
         let _ = controller.poll(0).expect("poll");
         assert_eq!(controller.task_slot_count(), MAX_PLUGIN_TASK_SLOTS);
+    }
+
+    #[test]
+    fn ping_replies_with_matching_pong() {
+        let (mut controller, events_tx, writer_rx) = make_controller(2);
+        events_tx
+            .send(json!({"type":"ping","timestamp":12345}))
+            .unwrap();
+        assert!(controller.poll(0).expect("poll").is_empty());
+        let pong = writer_rx.recv().expect("pong");
+        assert_eq!(pong["type"], "pong");
+        assert_eq!(pong["timestamp"], 12345);
     }
 
     #[test]

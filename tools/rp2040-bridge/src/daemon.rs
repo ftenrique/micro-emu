@@ -329,6 +329,18 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                         writer,
                     );
                     let device_id = controller.device_id();
+                    // A reconnect reuses the plugin process instance id. Remove
+                    // the old mapping before installing its replacement so a
+                    // late disconnect from the stale socket cannot detach both.
+                    let replaced =
+                        remove_plugin_sessions_by_device(&mut plugin_sessions, &device_id);
+                    if !replaced.is_empty() {
+                        eprintln!(
+                            "plugin controller {device_id} replacing stale sessions {replaced:?}"
+                        );
+                        detach_plugin_controller(&mut bridge, &device_id);
+                    }
+
                     let slots = controller.task_slot_count();
                     // With --controller none, the first Stream Deck plugin is
                     // the physical deck. Promote it to the partitioned primary
@@ -1139,6 +1151,23 @@ fn remove_plugin_session(
     Some(device_id)
 }
 
+/// Removes every stale session mapping for a reconnecting plugin device.
+fn remove_plugin_sessions_by_device(
+    plugin_sessions: &mut Vec<(usize, String)>,
+    device_id: &str,
+) -> Vec<usize> {
+    let mut removed = Vec::new();
+    plugin_sessions.retain(|(session_id, candidate)| {
+        if candidate.as_str() == device_id {
+            removed.push(*session_id);
+            false
+        } else {
+            true
+        }
+    });
+    removed
+}
+
 /// Detaches a plugin controller from `aux_controllers` by device_id, shutting
 /// it down and removing it from the task board.
 fn detach_plugin_controller(bridge: &mut crate::BridgeRuntime, device_id: &str) {
@@ -1504,6 +1533,18 @@ fn resolve_pending_polls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_removes_only_stale_device_sessions() {
+        let mut mappings = vec![
+            (10, "deck:a".to_owned()),
+            (11, "deck:b".to_owned()),
+            (12, "deck:a".to_owned()),
+        ];
+        let removed = remove_plugin_sessions_by_device(&mut mappings, "deck:a");
+        assert_eq!(removed, vec![10, 12]);
+        assert_eq!(mappings, vec![(11, "deck:b".to_owned())]);
+    }
 
     #[test]
     fn parses_hello_line() {

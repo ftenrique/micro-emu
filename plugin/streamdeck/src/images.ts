@@ -22,19 +22,21 @@ function svgDataUrl(svg: string): string {
     return `data:image/svg+xml;base64,${Buffer.from(svg, "utf-8").toString("base64")}`;
 }
 
-/** 5x3 pixel font for digits 0-7, matching the HID path's DIGITS array. */
+/** 5x3 pixel font for digits 0-9, matching the task-card numbering style. */
 const DIGITS: number[][] = [
-    [0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1], // 0
-    [1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1], // 1
-    [1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0], // 2
-    [1, 0, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1], // 3
-    [1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0], // 4
-    [0, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0], // 5
-    [1, 1, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1], // 6
-    [0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1], // 7
+    [0, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0], // 0
+    [1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1], // 1
+    [1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1], // 2
+    [1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0], // 3
+    [1, 0, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1], // 4
+    [1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0], // 5
+    [0, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0], // 6
+    [1, 1, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0], // 7
+    [1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1], // 8
+    [1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0], // 9
 ];
 
-/** Renders a big pixel-font digit (0-7) as SVG rects, matching the HID path. */
+/** Renders a big pixel-font digit (0-9) as SVG rects. */
 function renderDigit(digit: number, originX: number, originY: number, cell: number, color: string): string {
     if (digit < 0 || digit >= DIGITS.length) return "";
     const glyph = DIGITS[digit];
@@ -113,7 +115,7 @@ export function renderTaskCardImage(
   <rect x="4" y="4" width="${w - 8}" height="${h - 8}" rx="12" fill="${color}" stroke="#000" stroke-opacity="0.2" stroke-width="1"/>
   ${selected ? `<rect x="${w - 9}" y="12" width="5" height="${h - 24}" rx="2.5" fill="#fff"/>` : ""}
   <text x="${w / 2}" y="19" font-family="sans-serif" font-size="14" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(agentLabel)}</text>
-  ${renderDigit(slot, originX, originY, cell, "#c4c2ff")}
+  ${renderDigit(slot + 1, originX, originY, cell, "#c4c2ff")}
   ${elapsed ? `<text x="${w / 2}" y="135" font-family="monospace" font-size="26" font-weight="bold" fill="${timerColor}" text-anchor="middle">${elapsed}</text>` : ""}
 </svg>`);
 }
