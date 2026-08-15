@@ -64,6 +64,14 @@ Old Stream Deck profiles keep a tombstone for these identifiers. Pressing one sh
 
 Every action has an automatic icon and short title. The property inspector exposes icon and title overrides; clearing either returns to the catalog default. Pre-catalog numeric settings remain safe: indices 6-8 map to ACT06-ACT08, while indices 0-5 retain hidden legacy AG behavior until the user chooses a catalog action.
 
+### Crux dials
+
+The Crux Horizontal and Vertical dials expose the same catalog as the Action Button for their dial press. `Native press` (the default) keeps the original Codex Micro behavior — the dial's own encoder button, ACT12 / Send on the horizontal dial and ACT10 / Mic on the vertical one — and every catalog group above is selectable the same way, including task navigation and Codex workflow actions. The touch strip label shows the assigned action's short title, and press feedback matches the Action Button: a success flash for Codex workflow actions and an alert when the bridge is offline or the action is rejected.
+
+Pre-catalog click tokens (`ag0`-`ag5`, `act6`-`act8`, `mic`, `send`, `rotor`) keep working: they resolve to their catalog equivalents (or the legacy AG Micro keys) at runtime, even though the property inspector no longer lists them.
+
 ### Context button
 
 The `Context` key is available on regular Stream Deck Keypad controllers. Choose `Task info`, `Model info`, or `Usage info` in the property inspector. It mirrors the corresponding Stream Deck+ LCD context screen; task mode opens Codex task search, model mode cycles the configured featured model, and pressing usage mode toggles between the remaining percentages and the 5-hour/weekly reset times.
+
+In `Usage info` mode a second setting, `Usage Source`, picks which agent reports the limits: `Codex` (default) or `ZCode`. The bridge fetches Codex limits from the ChatGPT backend API (`~/.codex/auth.json`) and ZCode limits from the Z.AI monitor endpoint (key from `~/.zcode/v2/config.json`) — no MCP calls are involved. Every display context carries both agents' snapshots (`agents_usage`), so each usage display renders its own configured source and two displays can show Codex and ZCode at the same time. The Context key's choice is also pushed to the daemon as the global source for the hardware LCD strip (labeled `LIMITS CODEX`/`LIMITS ZCODE`); the daemon defaults to Codex and the selection is re-sent on reconnect. The Crux Vertical dial has the same `Usage Source` setting for its touch strip, scoped to that dial only.

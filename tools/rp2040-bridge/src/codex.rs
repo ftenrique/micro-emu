@@ -236,6 +236,10 @@ pub enum PhysicalEvent {
     },
     /// Advance the selected Codex task through the featured model list.
     ModelCycle,
+    /// Select which agent's usage limits feed the usage displays.
+    UsageSelect {
+        agent: crate::usage::UsageAgent,
+    },
     EncoderTurn {
         index: u8,
         delta: i8,

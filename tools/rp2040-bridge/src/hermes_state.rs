@@ -10,7 +10,13 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const ACTIVITY_LIVENESS: Duration = Duration::from_secs(10);
+use crate::tasks::{TASK_PRIORITY_ACTIVE, TASK_PRIORITY_IDLE};
+
+/// How recently a session must have shown message activity for a structurally
+/// open turn to still count as running. Tool executions between model calls
+/// can pause message writes for minutes, so this matches ZCode's
+/// `RUNNING_WINDOW_MS` (see zcode_state.rs).
+const ACTIVITY_LIVENESS: Duration = Duration::from_secs(300);
 
 pub fn hermes_db_path() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("HERMES_HOME") {
@@ -175,7 +181,11 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value 
     let task_id = format!("hermes:{}", row.id);
     let project = row.cwd.as_deref().map(project_name);
     let effort = row.model_config.as_deref().and_then(model_effort);
-    let priority = if state == "running" { 75 } else { 40 };
+    let priority = if state == "running" {
+        TASK_PRIORITY_ACTIVE
+    } else {
+        TASK_PRIORITY_IDLE
+    };
     json!({
         "task_id": task_id,
         "title": row.title,

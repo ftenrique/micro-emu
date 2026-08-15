@@ -5,6 +5,17 @@
 //! to mirror active ZCode sessions on the Stream Deck task board, the same
 //! way Codex Micro activity arrives via `v.oai.thstatus` serial frames.
 //!
+//! `model_usage` rows are only written when a model request *finishes*, so
+//! the latest row always carries a terminal status (`completed`,
+//! `cancelled`, or `error`) and cannot distinguish an in-flight turn from a
+//! finished one.  Live activity is instead detected from the session's
+//! newest persisted message: a user message (a fresh prompt or tool result
+//! awaiting its next model call), an assistant message still streaming
+//! (`time.created` persisted without `time.completed`), or an assistant
+//! message that ended in tool calls all mean the turn is still running.  A
+//! recency bound on `session.time_updated` keeps aborted turns, whose
+//! streaming message is never finalized, from looking active forever.
+//!
 //! All queries open the database read-only so the running ZCode process keeps
 //! its write lock undisturbed.  If the database is missing, locked, or has an
 //! unexpected schema, [`read_zcode_snapshot`] returns `None` so the caller can
@@ -12,6 +23,15 @@
 
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
+
+use crate::tasks::{TASK_PRIORITY_ACTIVE, TASK_PRIORITY_IDLE};
+
+/// How recently a session must have been updated for a structurally open
+/// turn to still count as running.  Tool executions between model calls can
+/// pause database writes for minutes; past this bound an open tail is
+/// treated as an abandoned or aborted turn.
+const RUNNING_WINDOW_MS: u128 = 300_000;
+
 /// Returns the path to the ZCode CLI database, or `None` when the home
 /// directory cannot be resolved.
 pub fn zcode_db_path() -> Option<std::path::PathBuf> {
@@ -40,6 +60,10 @@ pub fn read_zcode_snapshot(now_ms: u128, max_tasks: usize) -> Option<Value> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
+    // Tolerate a transient write lock from the running ZCode process.
+    connection
+        .busy_timeout(std::time::Duration::from_millis(100))
+        .ok()?;
 
     read_zcode_snapshot_from_connection(&connection, now_ms, max_tasks)
 }
@@ -49,12 +73,14 @@ fn read_zcode_snapshot_from_connection(
     now_ms: u128,
     max_tasks: usize,
 ) -> Option<Value> {
+    // LEFT JOIN: a brand-new session has no finished model request yet, but
+    // its persisted prompt already makes it a live, running task.
     let mut statement = connection
         .prepare(
             "SELECT s.id, s.title, s.directory, s.time_updated,
                     mu.status, mu.model_id, mu.variant, mu.started_at, mu.completed_at
              FROM session AS s
-             JOIN model_usage AS mu ON mu.rowid = (
+             LEFT JOIN model_usage AS mu ON mu.rowid = (
                  SELECT latest.rowid FROM model_usage AS latest
                  WHERE latest.session_id = s.id
                  ORDER BY latest.started_at DESC, latest.rowid DESC LIMIT 1
@@ -62,7 +88,7 @@ fn read_zcode_snapshot_from_connection(
              WHERE s.time_archived IS NULL
                AND s.task_type IN ('interactive', 'task')
              ORDER BY CASE WHEN mu.status = 'running' THEN 0 ELSE 1 END,
-                      MAX(s.time_updated, mu.started_at, COALESCE(mu.completed_at, 0)) DESC,
+                      MAX(s.time_updated, COALESCE(mu.started_at, 0), COALESCE(mu.completed_at, 0)) DESC,
                       s.id ASC
              LIMIT ?1;",
         )
@@ -70,18 +96,24 @@ fn read_zcode_snapshot_from_connection(
 
     let rows = statement
         .query_map([i64::try_from(max_tasks).unwrap_or(i64::MAX)], |row| {
+            let status: Option<String> = row.get(4)?;
+            let model_id = row.get(5)?;
+            let variant = row.get(6)?;
+            let started_at = row.get::<_, Option<i64>>(7)?.unwrap_or(0);
+            let completed_at = row.get(8)?;
+            let latest = status.map(|status| ModelUsage {
+                status,
+                model_id,
+                variant,
+                started_at,
+                completed_at,
+            });
             Ok(SessionRow {
-                id: row.get::<_, String>(0)?,
-                title: row.get::<_, String>(1)?,
-                directory: row.get::<_, String>(2)?,
-                time_updated: row.get::<_, i64>(3)?,
-                latest: ModelUsage {
-                    status: row.get(4)?,
-                    model_id: row.get(5)?,
-                    variant: row.get(6)?,
-                    started_at: row.get(7)?,
-                    completed_at: row.get(8)?,
-                },
+                id: row.get(0)?,
+                title: row.get(1)?,
+                directory: row.get(2)?,
+                time_updated: row.get(3)?,
+                latest,
             })
         })
         .ok()?;
@@ -104,29 +136,34 @@ struct SessionRow {
     title: String,
     directory: String,
     time_updated: i64,
-    latest: ModelUsage,
+    latest: Option<ModelUsage>,
 }
 /// Builds a single task object for one session, enriching it with the latest
 /// model-usage status and the model/effort selection.
 fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value {
-    let latest = &row.latest;
     let selection = model_selection(connection, &row.id);
+    let tail = session_tail(connection, &row.id);
+    let latest = row.latest.as_ref();
 
-    let state = derive_state(latest, row.time_updated, now_ms);
-    let started_at_ms = latest.started_at;
-    let finished_at_ms = latest.completed_at;
+    let state = derive_state(latest, tail.as_ref(), row.time_updated, now_ms);
+    let started_at_ms = latest.map(|usage| usage.started_at);
+    let finished_at_ms = latest.and_then(|usage| usage.completed_at);
     let model = selection
         .as_ref()
         .and_then(|s| s.model.clone())
-        .or_else(|| latest.model_id.clone());
+        .or_else(|| latest.and_then(|usage| usage.model_id.clone()));
     let effort = selection
         .as_ref()
         .and_then(|s| s.thought_level.clone())
-        .or_else(|| latest.variant.clone());
+        .or_else(|| latest.and_then(|usage| usage.variant.clone()));
     let project = project_name(&row.directory);
 
     // Running sessions rank above idle ones so they claim the lowest slots.
-    let priority = if state == "running" { 75 } else { 40 };
+    let priority = if state == "running" {
+        TASK_PRIORITY_ACTIVE
+    } else {
+        TASK_PRIORITY_IDLE
+    };
 
     let context = json!({
         "project": project,
@@ -144,9 +181,11 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value 
         "workspace_path": row.directory,
         "state": state,
         "priority": priority,
-        "started_at_ms": (state != "queued").then_some(started_at_ms),
+        // A running turn without a finished request yet has no request start
+        // timestamp; the session's last update is the closest stable anchor.
+        "started_at_ms": (state != "queued").then_some(started_at_ms.or(Some(row.time_updated))),
         "finished_at_ms": (state == "completed").then_some(
-            finished_at_ms.unwrap_or_else(|| started_at_ms.max(row.time_updated))
+            finished_at_ms.unwrap_or_else(|| started_at_ms.unwrap_or(0).max(row.time_updated))
         ),
         "timing_authoritative": true,
         "context": context,
@@ -160,6 +199,55 @@ struct ModelUsage {
     variant: Option<String>,
     started_at: i64,
     completed_at: Option<i64>,
+}
+
+/// Lifecycle shape of a session's newest persisted message.
+struct SessionTail {
+    role: String,
+    /// Assistant message whose completion timestamp has not been written yet.
+    streaming: bool,
+    /// Assistant message that finished with tool calls still executing.
+    ends_with_tool_calls: bool,
+}
+
+/// Reads the newest message of a session and reduces it to its lifecycle
+/// shape.  Returns `None` when the message table is unavailable or the
+/// session has no messages, so state derivation falls back to the terminal
+/// model-usage status.
+fn session_tail(connection: &Connection, session_id: &str) -> Option<SessionTail> {
+    // Two indexed point queries rather than one ordered scan: sorting by the
+    // sequence tiebreak would make SQLite read every message blob of the
+    // session, and long sessions carry hundreds of them.
+    let latest_time: i64 = connection
+        .prepare("SELECT MAX(time_created) FROM message WHERE session_id = ?1")
+        .ok()?
+        .query_row([session_id], |row| row.get(0))
+        .ok()?;
+    let data: String = connection
+        .prepare(
+            "SELECT data FROM message
+             WHERE session_id = ?1 AND time_created = ?2
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .ok()?
+        .query_row(rusqlite::params![session_id, latest_time], |row| row.get(0))
+        .ok()?;
+    let value: Value = serde_json::from_str(&data).ok()?;
+    let role = value.get("role").and_then(Value::as_str)?.to_owned();
+    if role != "user" && role != "assistant" {
+        return None;
+    }
+    let completed = value
+        .get("time")
+        .and_then(|time| time.get("completed"))
+        .and_then(Value::as_i64)
+        .filter(|completed| *completed > 0);
+    let is_assistant = role == "assistant";
+    Some(SessionTail {
+        streaming: is_assistant && completed.is_none(),
+        ends_with_tool_calls: value.get("finish").and_then(Value::as_str) == Some("tool-calls"),
+        role,
+    })
 }
 
 struct ModelSelection {
@@ -191,16 +279,49 @@ fn model_selection(connection: &Connection, session_id: &str) -> Option<ModelSel
     })
 }
 
-/// Maps the persisted model-usage status to a task-board state.
-/// Completion remains visible until the task board acknowledges it through selection.
-fn derive_state(latest: &ModelUsage, _session_updated_ms: i64, _now_ms: u128) -> &'static str {
-    match latest.status.trim().to_ascii_lowercase().as_str() {
-        "running" => "running",
-        "error" => "error",
-        "cancelled" => "queued",
-        "completed" => "completed",
-        _ => "error",
+/// Maps the terminal model-usage status and live message tail to a
+/// task-board state.  A structurally open, recently active turn is running
+/// regardless of the previous request's terminal status.  Completion remains
+/// visible until the task board acknowledges it through selection.
+fn derive_state(
+    latest: Option<&ModelUsage>,
+    tail: Option<&SessionTail>,
+    session_updated_ms: i64,
+    now_ms: u128,
+) -> &'static str {
+    if turn_in_flight(tail, session_updated_ms, now_ms) {
+        return "running";
     }
+    match latest {
+        // No finished request: the session exists but has not produced a
+        // terminal status yet.
+        None => "queued",
+        Some(latest) => match latest.status.trim().to_ascii_lowercase().as_str() {
+            "running" => "running",
+            "error" => "error",
+            "cancelled" => "queued",
+            "completed" => "completed",
+            _ => "error",
+        },
+    }
+}
+
+/// True when the session's newest message shows a turn still in flight and
+/// the session was updated recently enough for that to be trustworthy.
+fn turn_in_flight(tail: Option<&SessionTail>, session_updated_ms: i64, now_ms: u128) -> bool {
+    let Some(tail) = tail else { return false };
+    let structurally_open = match tail.role.as_str() {
+        // A user message is a fresh prompt or a tool result awaiting its
+        // next model call.
+        "user" => true,
+        "assistant" => tail.streaming || tail.ends_with_tool_calls,
+        _ => false,
+    };
+    if !structurally_open {
+        return false;
+    }
+    let last_update_ms = u128::try_from(session_updated_ms.max(0)).unwrap_or(0);
+    now_ms.saturating_sub(last_update_ms) < RUNNING_WINDOW_MS
 }
 
 /// Reduces a workspace directory to a short project label (the final path
@@ -258,10 +379,86 @@ mod tests {
                     status text not null,
                     started_at integer not null,
                     completed_at integer
+                );
+                CREATE TABLE message (
+                    id text primary key,
+                    session_id text not null,
+                    time_created integer not null,
+                    time_updated integer not null,
+                    sequence integer,
+                    data text not null
                 );",
             )
             .unwrap();
         connection
+    }
+
+    /// Inserts one persisted message, mirroring the lifecycle fields ZCode
+    /// writes: `time.completed` and `finish` appear only when generation
+    /// finishes.
+    fn insert_message(
+        connection: &Connection,
+        session_id: &str,
+        sequence: i64,
+        time_created: i64,
+        role: &str,
+        finish: Option<&str>,
+        completed_at: Option<i64>,
+    ) {
+        let mut time = serde_json::Map::new();
+        time.insert("created".to_owned(), json!(time_created));
+        if let Some(completed_at) = completed_at {
+            time.insert("completed".to_owned(), json!(completed_at));
+        }
+        let mut message = serde_json::Map::new();
+        message.insert("role".to_owned(), json!(role));
+        message.insert("time".to_owned(), Value::Object(time));
+        if let Some(finish) = finish {
+            message.insert("finish".to_owned(), json!(finish));
+        }
+        connection
+            .execute(
+                "INSERT INTO message (id, session_id, time_created, time_updated, sequence, data)
+                 VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
+                rusqlite::params![
+                    format!("msg-{session_id}-{sequence}"),
+                    session_id,
+                    time_created,
+                    sequence,
+                    Value::Object(message).to_string()
+                ],
+            )
+            .unwrap();
+    }
+
+    fn insert_session(connection: &Connection, id: &str, time_updated: i64) {
+        connection
+            .execute(
+                "INSERT INTO session (id, project_id, slug, directory, title, version,
+                                      time_created, time_updated, task_type)
+                 VALUES (?1, 'p1', 'slug', 'D:\\proj\\micro-emu', ?1, '1', 1000, ?2, 'interactive')",
+                rusqlite::params![id, time_updated],
+            )
+            .unwrap();
+    }
+
+    fn insert_usage(
+        connection: &Connection,
+        id: &str,
+        session_id: &str,
+        status: &str,
+        started_at: i64,
+        completed_at: Option<i64>,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO model_usage (id, logical_request_id, session_id, provider_id,
+                                          model_id, variant, agent, status, started_at, completed_at)
+                 VALUES (?1, 'r1', ?2, 'builtin:zai-coding-plan',
+                         'GLM-5.3', 'max', 'zcode-agent', ?3, ?4, ?5)",
+                rusqlite::params![id, session_id, status, started_at, completed_at],
+            )
+            .unwrap();
     }
 
     #[test]
@@ -370,8 +567,8 @@ mod tests {
             completed_at: Some(10_000),
         };
 
-        assert_eq!(derive_state(&latest, 10_000, 25_000), "completed");
-        assert_eq!(derive_state(&latest, 10_000, 45_000), "completed");
+        assert_eq!(derive_state(Some(&latest), None, 10_000, 25_000), "completed");
+        assert_eq!(derive_state(Some(&latest), None, 10_000, 45_000), "completed");
     }
 
     #[test]
@@ -445,7 +642,83 @@ mod tests {
             completed_at: None,
         };
 
-        assert_eq!(derive_state(&latest, 1, 1), "error");
+        assert_eq!(derive_state(Some(&latest), None, 1, 1), "error");
+    }
+
+    #[test]
+    fn streaming_tail_maps_terminal_status_to_running() {
+        // The latest model request finished, but the session's newest
+        // assistant message has no completion timestamp: the next request is
+        // still generating.
+        let connection = fixture_db();
+        insert_session(&connection, "sess_stream", 10_000);
+        insert_usage(&connection, "mu1", "sess_stream", "completed", 9_000, Some(9_500));
+        insert_message(&connection, "sess_stream", 1, 9_600, "user", None, None);
+        insert_message(&connection, "sess_stream", 2, 10_500, "assistant", None, None);
+
+        let snapshot = read_zcode_snapshot_from_connection(&connection, 11_000, 6).unwrap();
+        let task = &snapshot["tasks"][0];
+        assert_eq!(task["state"], "running");
+        assert_eq!(task["priority"], 75);
+        assert_eq!(task["started_at_ms"], 9_000);
+    }
+
+    #[test]
+    fn tool_call_tail_keeps_turn_running() {
+        // The newest assistant message completed with finish=tool-calls:
+        // tools are executing and the turn is still in flight.
+        let connection = fixture_db();
+        insert_session(&connection, "sess_tools", 10_000);
+        insert_usage(&connection, "mu1", "sess_tools", "completed", 9_000, Some(10_400));
+        insert_message(&connection, "sess_tools", 1, 9_000, "user", None, None);
+        insert_message(&connection, "sess_tools", 2, 10_500, "assistant", Some("tool-calls"), Some(10_480));
+
+        let snapshot = read_zcode_snapshot_from_connection(&connection, 11_000, 6).unwrap();
+        assert_eq!(snapshot["tasks"][0]["state"], "running");
+    }
+
+    #[test]
+    fn stopped_tail_falls_back_to_terminal_status() {
+        // The newest assistant message finished with stop: the turn is over,
+        // so the terminal model-usage status decides.
+        let connection = fixture_db();
+        insert_session(&connection, "sess_done", 10_000);
+        insert_usage(&connection, "mu1", "sess_done", "completed", 9_000, Some(10_400));
+        insert_message(&connection, "sess_done", 1, 9_000, "user", None, None);
+        insert_message(&connection, "sess_done", 2, 10_500, "assistant", Some("stop"), Some(10_480));
+
+        let snapshot = read_zcode_snapshot_from_connection(&connection, 11_000, 6).unwrap();
+        assert_eq!(snapshot["tasks"][0]["state"], "completed");
+    }
+
+    #[test]
+    fn stale_open_tail_is_not_running() {
+        // An aborted turn leaves its streaming message uncompleted forever.
+        // Past the recency window the terminal status wins again.
+        let connection = fixture_db();
+        insert_session(&connection, "sess_stale", 10_000);
+        insert_usage(&connection, "mu1", "sess_stale", "completed", 9_000, Some(9_500));
+        insert_message(&connection, "sess_stale", 1, 10_500, "assistant", None, None);
+
+        let snapshot =
+            read_zcode_snapshot_from_connection(&connection, 10_000 + RUNNING_WINDOW_MS + 1, 6)
+                .unwrap();
+        assert_eq!(snapshot["tasks"][0]["state"], "completed");
+    }
+
+    #[test]
+    fn session_without_model_usage_publishes_running_turn() {
+        // A brand-new session: the prompt is persisted but no model request
+        // has finished yet.  The task board still shows it as running.
+        let connection = fixture_db();
+        insert_session(&connection, "sess_fresh", 10_000);
+        insert_message(&connection, "sess_fresh", 1, 9_900, "user", None, None);
+
+        let snapshot = read_zcode_snapshot_from_connection(&connection, 11_000, 6).unwrap();
+        let task = &snapshot["tasks"][0];
+        assert_eq!(task["task_id"], "zcode:sess_fresh");
+        assert_eq!(task["state"], "running");
+        assert_eq!(task["started_at_ms"], 10_000);
     }
 
     #[test]

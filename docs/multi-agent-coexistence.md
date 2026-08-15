@@ -1,5 +1,15 @@
 # Multi-Agent Coexistence: Why One Agent Monopolizes the Deck, and How to Fix It
 
+> **Status (2026-08-14): resolved.** All four root causes below have been
+> implemented and the symptom is gone. This document is kept as the design
+> rationale; the cited line numbers were accurate as of 2026-08-10 and have
+> drifted since. One planned detail changed during implementation: the
+> partition uses **fixed halves** (Codex AG00–AG02, ZCode AG03–AG05, Hermes
+> AG03–AG05 only while ZCode is absent) rather than the 1-agent-owns-all /
+> 3-agent column split described here — see `Partition::compute` in
+> `routing.rs` and the tables in `ZCode_integration.md` /
+> `Hermes_integration.md` for the current model.
+
 **Audience:** an implementation agent (or developer) who has not seen this codebase before.
 Every claim below cites exact files and line numbers (as of 2026-08-10). Read the cited code
 before changing anything.
@@ -18,9 +28,11 @@ behaves as if the partition is wrong (e.g. a 3-way split when only 2 agents are 
 Two cooperating systems exist in `tools/rp2040-bridge/src/`:
 
 1. **Partition system** (`routing.rs`):
-   - `Partition::compute(ActiveSet)` (`routing.rs:133-162`) assigns each of the 6 keys/LCD
-     slots an owner based on which agents are active:
-     - 1 agent → owns all 6; 2 agents → 3+3 split; 3 agents → column split `i % 3`.
+   - `Partition::compute(ActiveSet)` assigns each of the 6 keys/LCD
+     slots an owner based on which agents are active. (This document was
+     written against the older dynamic model — 1 agent owning all 6,
+     a 3-agent column split `i % 3`. The shipped implementation uses fixed
+     halves; see the status note above and `routing.rs`.)
    - `EventRouting::route_button` (`routing.rs:309-325`) delivers key presses only to the
      slot's owner.
    - `FusedLcdState` (`routing.rs:354-421`) merges each agent's `thstatus` writes so an agent

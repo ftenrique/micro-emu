@@ -153,9 +153,15 @@ export function renderContextKeyImage(mode: ContextKeyMode, ctx: StripContext, c
     const body = mode === "task" ? renderContextTaskBody(ctx)
         : mode === "model" ? renderContextModelBody(ctx)
             : renderContextUsageBody(ctx, showResetTimes);
+    // Tag the usage screen with the reporting agent so the source is
+    // visible at a glance (codex/zcode).
+    const agentTag = mode === "usage" && ctx.usage_agent
+        ? `<text x="132" y="24" font-family="sans-serif" font-size="10" font-weight="bold" letter-spacing="0.6" fill="#6366f1" text-anchor="end">${escapeXml(ctx.usage_agent.toUpperCase())}</text>`
+        : "";
     return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">
   <rect x="4" y="4" width="136" height="136" rx="12" fill="#10161a" stroke="#000" stroke-opacity="0.4"/>
-  <text x="12" y="24" font-family="sans-serif" font-size="13" font-weight="bold" letter-spacing="0.8" fill="#78909c">${title}</text>
+  <text x="12" y="24" font-family="sans-serif" font-size="13" font-weight="bold" letter-spacing="1.2" fill="#78909c">${title}</text>
+  ${agentTag}
   ${body}
 </svg>`);
 }
@@ -257,6 +263,8 @@ export interface StripContext {
     five_hour_remaining?: number | null;
     weekly_reset_at?: number | null;
     five_hour_reset_at?: number | null;
+    /** Agent the usage fields belong to ("codex" | "zcode"). */
+    usage_agent?: string | null;
 }
 
 /** Knob strip: task number, project, shortened task name, and owning agent. */
@@ -294,15 +302,21 @@ export function renderCruxHStrip(ctx: StripContext, clickLabel: string): string 
 export function renderCruxVStrip(ctx: StripContext, clickLabel: string, showResetTimes = false): string {
     const hasUsage = ctx.five_hour_remaining != null || ctx.weekly_remaining != null;
     const hasResetTimes = ctx.five_hour_reset_at != null || ctx.weekly_reset_at != null;
+    // The reporting agent (codex/zcode) rides along in the top-left corner.
+    const agentTag = ctx.usage_agent
+        ? `<text x="10" y="16" font-family="sans-serif" font-size="10" font-weight="bold" letter-spacing="0.6" fill="#6366f1">${escapeXml(ctx.usage_agent.toUpperCase())}</text>`
+        : "";
     if (showResetTimes && hasResetTimes) {
-        return stripSvg(`<text x="10" y="28" font-family="sans-serif" font-size="9" fill="#666">5H RESET</text>
+        return stripSvg(`${agentTag}
+  <text x="10" y="28" font-family="sans-serif" font-size="9" fill="#666">5H RESET</text>
   <text x="${STRIP_W / 2}" y="47" font-family="monospace" font-size="14" font-weight="bold" fill="#90caf9" text-anchor="middle">${escapeXml(formatResetAt(ctx.five_hour_reset_at))}</text>
   <text x="10" y="65" font-family="sans-serif" font-size="9" fill="#666">WEEKLY RESET</text>
   <text x="${STRIP_W / 2}" y="84" font-family="monospace" font-size="14" font-weight="bold" fill="#a5d6a7" text-anchor="middle">${escapeXml(formatResetAt(ctx.weekly_reset_at))}</text>
   <text x="${STRIP_W - 8}" y="16" font-family="monospace" font-size="9" fill="#546e7a" text-anchor="end">â–²â–¼ ${escapeXml(clickLabel)}</text>`);
     }
     if (hasUsage) {
-        return stripSvg(`${usageBar("5H", ctx.five_hour_remaining, 26)}
+        return stripSvg(`${agentTag}
+  ${usageBar("5H", ctx.five_hour_remaining, 26)}
   ${usageBar("WK", ctx.weekly_remaining, 62)}
   <text x="${STRIP_W - 8}" y="16" font-family="monospace" font-size="9" fill="#546e7a" text-anchor="end">â–²â–¼ ${escapeXml(clickLabel)}</text>`);
     }
@@ -310,7 +324,8 @@ export function renderCruxVStrip(ctx: StripContext, clickLabel: string, showRese
     const status = (ctx.status ?? "idle").toUpperCase();
     const progress = ctx.progress != null ? `${ctx.progress}%` : "—";
     const statusColor = STATUS_COLORS[(ctx.status ?? "idle").toLowerCase()] ?? "#37474f";
-    return stripSvg(`<text x="10" y="30" font-family="sans-serif" font-size="10" fill="#666">STATUS</text>
+    return stripSvg(`${agentTag}
+  <text x="10" y="30" font-family="sans-serif" font-size="10" fill="#666">STATUS</text>
   <text x="${STRIP_W / 2}" y="50" font-family="sans-serif" font-size="16" font-weight="bold" fill="${statusColor}" text-anchor="middle">${escapeXml(status)}</text>
   <text x="10" y="72" font-family="sans-serif" font-size="10" fill="#666">PROGRESS</text>
   <text x="${STRIP_W / 2}" y="90" font-family="sans-serif" font-size="14" font-weight="bold" fill="#90caf9" text-anchor="middle">${escapeXml(progress)}</text>

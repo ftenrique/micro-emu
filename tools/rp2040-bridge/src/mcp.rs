@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
-pub const DISPLAY_CONTEXT_INSTRUCTIONS: &str = "The RP2040 v.oai.thstatus path updates task cards only; it does not update the dashboard model, effort, weekly_remaining, or five_hour_remaining fields. Call set_display_context with the current live metadata at task start and again whenever any display-context value changes. Standby or test values on the display are not live context.";
+pub const DISPLAY_CONTEXT_INSTRUCTIONS: &str = "The RP2040 v.oai.thstatus path updates task cards only; it does not publish live dashboard context. Model, effort, weekly_remaining, and five_hour_remaining values shown before an explicit update may be standby or auto-derived placeholders and are not live context. Call set_display_context with the current live metadata at task start and again whenever any display-context value changes.";
 
 pub fn start_input_reader() -> Receiver<Result<Value, String>> {
     let (sender, receiver) = mpsc::channel();
@@ -90,7 +90,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "set_thread_status",
-                "description": "Publish live Codex task/status state to the assigned LCD slots using v.oai.thstatus. The colored numbered cards shown before this call are standby indicators, not task data; call this whenever task status changes. This updates task cards only: call set_display_context separately for live model, effort, and usage metadata. Use bridge_status to see which slots you own.",
+                "description": "Publish live task/status state to this session's assigned LCD slots as task cards. The colored numbered cards shown before this call are standby indicators, not task data; call this whenever task status changes. This updates task cards only: call set_display_context separately for live model, effort, and usage metadata. Use bridge_status to see which slots you own.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"status": {"type": "array", "items": {"type": "object"}}},
@@ -112,7 +112,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "set_display_context",
-                "description": "Publish live project/task/model/effort/status/progress and remaining weekly/five-hour usage metadata to the connected device displays. Call this at task start and whenever any display-context value changes; v.oai.thstatus and task-card tools do not update model, effort, or usage. A horizontal Stream Deck + swipe alternates the context and usage screens.",
+                "description": "Publish live project/task/model/effort/status/progress and remaining weekly/five-hour usage metadata to the connected device displays. Call this at task start and whenever any display-context value changes; v.oai.thstatus and task-card tools do not update model, effort, or usage. A horizontal Stream Deck + swipe alternates the context and usage screens. Approval interactions can additionally set wait_reason, prompt, interaction_id, short_action, long_action, and pending_wait_count.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -127,6 +127,12 @@ pub fn tools() -> Value {
                         "five_hour_remaining": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
                         "weekly_reset_at": {"type": ["integer", "null"], "minimum": 0},
                         "five_hour_reset_at": {"type": ["integer", "null"], "minimum": 0},
+                        "wait_reason": {"type": ["string", "null"]},
+                        "prompt": {"type": ["string", "null"]},
+                        "interaction_id": {"type": ["string", "null"]},
+                        "short_action": {"type": ["string", "null"]},
+                        "long_action": {"type": ["string", "null"]},
+                        "pending_wait_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
                     },
                     "additionalProperties": false
                 }
@@ -161,9 +167,9 @@ pub fn tool_error(message: impl Into<String>) -> Value {
     json!({"isError": true, "content": [{"type": "text", "text": message}]})
 }
 
-/// Returns the tool list filtered for the given agent. `None` means the
-/// agent has not been identified yet (e.g. direct `--mcp` STDIO mode) and
-/// all tools are exposed for backward compatibility.
+/// Returns the tool list filtered for the given agent. `None` exposes every
+/// tool without filtering; daemon callers always pass `Some(agent)`, while
+/// direct `--mcp` STDIO mode serves the unfiltered `tools()` list.
 pub fn tools_for(agent: Option<AgentId>) -> Value {
     let all = tools()["tools"].as_array().unwrap_or(&Vec::new()).clone();
     let filtered: Vec<Value> = all
@@ -192,7 +198,6 @@ pub fn tool_available(name: &str, agent: Option<AgentId>) -> bool {
                 | "poll_events"
                 | "set_thread_status"
                 | "publish_tasks"
-                | "set_rgb_config"
                 | "set_display_context"
         ),
         Some(AgentId::ZCode) => matches!(
@@ -201,7 +206,6 @@ pub fn tool_available(name: &str, agent: Option<AgentId>) -> bool {
                 | "poll_events"
                 | "set_thread_status"
                 | "publish_tasks"
-                | "set_rgb_config"
                 | "set_display_context"
         ),
         // Codex or unknown (legacy --mcp): all tools.
@@ -213,7 +217,7 @@ pub fn tool_available(name: &str, agent: Option<AgentId>) -> bool {
 pub fn poll_events_tool() -> Value {
     json!({
         "name": "poll_events",
-        "description": "Drain buffered physical controller events for the calling agent. With timeout_ms > 0, waits up to that many milliseconds for events to arrive (long-poll). Returns an array of events; key events have shape {type:\"key\", key, pressed, ts} and partition change events have shape {type:\"partition\", keys, slots, agents, ts}.",
+        "description": "Drain buffered controller and task events for the calling agent. With timeout_ms > 0, waits up to that many milliseconds for the first event to arrive (long-poll). Returns an object of shape {\"events\": [...]}. Key events have shape {type:\"key\", key, pressed, ts}; partition changes {type:\"partition\", keys, slots, agents, ts}; task-card selections {type:\"task_selected\", task_id, device_id, slot, owner_session, legacy_key, ts}; task-board updates {type:\"layout_changed\", tasks, ts}.",
         "inputSchema": {
             "type": "object",
             "properties": {

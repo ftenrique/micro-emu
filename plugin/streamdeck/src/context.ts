@@ -1,4 +1,4 @@
-import { DaemonClient, DisplayContext } from "./daemon-client";
+import { AgentUsageFields, DaemonClient, DisplayContext } from "./daemon-client";
 import { CodexActionExecutor } from "./codex-action-executor";
 import { ZCodeActionExecutor } from "./zcode-action-executor";
 import { HermesActionExecutor } from "./hermes-action-executor";
@@ -23,6 +23,8 @@ export class PluginContext {
     private displayContext: DisplayContext | null = null;
     private selectedTaskSlot: number | null = null;
     private connected = false;
+    /** Usage source selected from the Context key; codex by default. */
+    private usageAgent: "codex" | "zcode" = "codex";
 
     /** Callbacks invoked when render state changes. */
     private listeners: Set<() => void> = new Set();
@@ -40,6 +42,9 @@ export class PluginContext {
 
         daemon.on("connect", () => {
             this.connected = true;
+            // The daemon may have restarted and lost the selection; restate
+            // it so usage keeps reporting the chosen agent.
+            this.daemon.sendUsageAgent(this.usageAgent);
             this.notifyListeners();
         });
         daemon.on("disconnect", () => {
@@ -78,6 +83,38 @@ export class PluginContext {
         return this.connected;
     }
 
+    /** Selects the usage source and notifies the daemon. */
+    setUsageAgent(agent: "codex" | "zcode"): void {
+        if (this.usageAgent === agent) return;
+        this.usageAgent = agent;
+        this.daemon.sendUsageAgent(agent);
+        this.notifyListeners();
+    }
+
+    getUsageAgent(): "codex" | "zcode" {
+        return this.usageAgent;
+    }
+
+    /** Usage fields for one agent, regardless of the globally selected
+     * source. Prefers the bridge's per-agent snapshots; falls back to the
+     * top-level fields when they already report this agent (older bridges
+     * only send those for the selected source). */
+    getUsageFields(agent: "codex" | "zcode"): AgentUsageFields {
+        const ctx = this.displayContext;
+        const fromMap = ctx?.agents_usage?.[agent];
+        if (fromMap) return fromMap;
+        const topLevelOwner = ctx?.usage_agent ?? this.usageAgent;
+        if (topLevelOwner === agent) {
+            return {
+                five_hour_remaining: ctx?.five_hour_remaining,
+                weekly_remaining: ctx?.weekly_remaining,
+                five_hour_reset_at: ctx?.five_hour_reset_at,
+                weekly_reset_at: ctx?.weekly_reset_at,
+            };
+        }
+        return {};
+    }
+
     getThreadStatus(): unknown[] {
         return this.threadStatus;
     }
@@ -88,6 +125,9 @@ export class PluginContext {
     /** Returns live display context with selected task-card metadata overlaid. */
     getSelectedDisplayContext(): SelectedDisplayContext {
         const merged: SelectedDisplayContext = { ...(this.displayContext ?? {}) };
+        // Fall back to the local selection when the daemon has not labeled
+        // the usage fields (older bridge or unlabeled explicit context).
+        merged.usage_agent = nonEmptyText(merged.usage_agent) ?? this.usageAgent;
         const card = this.getSelectedTaskCard();
         if (!card) return merged;
         merged.agent = nonEmptyText(card.agent) ?? merged.agent;

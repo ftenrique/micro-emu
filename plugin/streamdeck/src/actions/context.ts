@@ -3,9 +3,13 @@ import type { JsonValue } from "@elgato/utils";
 import { PluginContext } from "../context";
 import { renderContextKeyImage, type ContextKeyMode } from "../images";
 
+/** Agent whose usage limits the Usage mode reports. */
+export type UsageAgent = "codex" | "zcode";
+
 export interface ContextKeySettings {
     [key: string]: JsonValue;
     mode?: ContextKeyMode;
+    usageAgent?: UsageAgent;
 }
 
 /** Shows one LCD-strip context screen on a regular Stream Deck key. */
@@ -18,10 +22,12 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
     }
 
     onWillAppear(ev: WillAppearEvent<ContextKeySettings>): void {
+        this.syncUsageAgent(ev.payload.settings);
         this.refresh(ev.action as KeyAction<ContextKeySettings>, ev.payload.settings);
     }
 
     onDidReceiveSettings(ev: DidReceiveSettingsEvent<ContextKeySettings>): void {
+        this.syncUsageAgent(ev.payload.settings);
         this.refresh(ev.action as KeyAction<ContextKeySettings>, ev.payload.settings);
     }
 
@@ -45,6 +51,14 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
         else this.ctx.daemon.sendModelCycle();
     }
 
+    /** Pushes the configured usage source to the daemon whenever a key in
+     * Usage mode appears or its settings change. Task/Model keys leave the
+     * current selection untouched. */
+    private syncUsageAgent(settings: ContextKeySettings): void {
+        if (normalizeMode(settings.mode) !== "usage") return;
+        this.ctx.setUsageAgent(normalizeUsageAgent(settings.usageAgent));
+    }
+
     private refreshAll(): void {
         for (const action of this.actions) {
             action.getSettings().then((settings) =>
@@ -54,7 +68,14 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
 
     private refresh(action: KeyAction<ContextKeySettings>, settings: ContextKeySettings): void {
         const mode = normalizeMode(settings.mode);
-        action.setImage(renderContextKeyImage(mode, this.ctx.getSelectedDisplayContext(), this.ctx.isConnected(), this.showResetTimes.get(action) ?? false));
+        let ctx = this.ctx.getSelectedDisplayContext();
+        if (mode === "usage") {
+            // This key always renders its own configured source, independent
+            // of the global selection it pushes to the daemon.
+            const agent = normalizeUsageAgent(settings.usageAgent);
+            ctx = { ...ctx, ...this.ctx.getUsageFields(agent), usage_agent: agent };
+        }
+        action.setImage(renderContextKeyImage(mode, ctx, this.ctx.isConnected(), this.showResetTimes.get(action) ?? false));
         // The key already carries the mode in its header; avoid a redundant Stream Deck title beneath it.
         action.setTitle("");
     }
@@ -62,4 +83,9 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
 
 export function normalizeMode(value: unknown): ContextKeyMode {
     return value === "model" || value === "usage" ? value : "task";
+}
+
+/** Codex is the default usage source; anything else resolves to it. */
+export function normalizeUsageAgent(value: unknown): UsageAgent {
+    return value === "zcode" ? "zcode" : "codex";
 }

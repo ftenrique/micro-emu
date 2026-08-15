@@ -7,20 +7,50 @@
 <body>
     <sdpi-item label="Dial Push Action">
         <sdpi-select setting="click" default="native">
-            <option value="native">Default (Send / ACT12)</option>
-            <option value="ag0">AG00 (Agent 0)</option>
-            <option value="ag1">AG01 (Agent 1)</option>
-            <option value="ag2">AG02 (Agent 2)</option>
-            <option value="ag3">AG03 (Agent 3)</option>
-            <option value="ag4">AG04 (Agent 4)</option>
-            <option value="ag5">AG05 (Agent 5)</option>
-            <option value="act6">ACT06 (Action 6)</option>
-            <option value="act7">ACT07 (Action 7)</option>
-            <option value="act8">ACT08 (Action 8)</option>
-            <option value="mic">Mic (ACT10)</option>
-            <option value="send">Send (ACT12)</option>
-            <option value="rotor">Rotor click (ENC_CLK)</option>
+            <option value="native" data-description="Press the dial's own horizontal encoder (radial X, ACT12 / Send).">Native press (Send · ACT12)</option>
+            <optgroup label="Codex Micro">
+                <option value="micro.act06" data-description="Press the physical ACT06 command. Its meaning remains configurable in Codex Micro.">ACT06</option>
+                <option value="micro.act07" data-description="Press the physical ACT07 command. Its meaning remains configurable in Codex Micro.">ACT07</option>
+                <option value="micro.act08" data-description="Press the physical ACT08 command. Its meaning remains configurable in Codex Micro.">ACT08</option>
+                <option value="micro.mic" data-description="Press the Codex Micro microphone control (ACT10).">Microphone (ACT10)</option>
+                <option value="micro.send" data-description="Press the Codex Micro send control (ACT12).">Send (ACT12)</option>
+                <option value="micro.rotor-click" data-description="Press the Codex Micro rotor.">Rotor click (ENC_CLK)</option>
+                <option value="micro.rotor-cw" data-description="Turn the Codex Micro rotor one step clockwise.">Rotor clockwise (ENC_CW)</option>
+                <option value="micro.rotor-ccw" data-description="Turn the Codex Micro rotor one step counter-clockwise.">Rotor counter-clockwise (ENC_CC)</option>
+                <option value="micro.up" data-description="Move the Codex Micro radial control upward one step.">Navigate up</option>
+                <option value="micro.down" data-description="Move the Codex Micro radial control downward one step.">Navigate down</option>
+                <option value="micro.left" data-description="Move the Codex Micro radial control left one step.">Navigate left</option>
+                <option value="micro.right" data-description="Move the Codex Micro radial control right one step.">Navigate right</option>
+            </optgroup>
+            <optgroup label="Task navigation">
+                <option value="task.previous" data-description="Select the previous occupied Task Card, wrapping at the beginning.">Previous task</option>
+                <option value="task.next" data-description="Select the next occupied Task Card, wrapping at the end.">Next task</option>
+                <option value="task.first" data-description="Select the first occupied Task Card.">First task</option>
+                <option value="task.last" data-description="Select the last occupied Task Card.">Last task</option>
+            </optgroup>
+            <optgroup label="Task lifecycle">
+                <option value="task.open" data-description="Open and focus the selected Codex task.">Open selected task</option>
+                <option value="task.retry" data-description="Replay the selected task's latest prompt as a new Codex turn.">Retry task</option>
+                <option value="task.fork" data-description="Fork the selected Codex task and open the new task.">Fork task</option>
+                <option value="task.archive" data-description="Archive the selected Codex task.">Archive task</option>
+            </optgroup>
+            <optgroup label="Task interaction">
+                <option value="task.copy-prompt" data-description="Copy the selected Codex task's latest user prompt.">Copy prompt</option>
+                <option value="task.copy-response" data-description="Copy the selected Codex task's latest agent response.">Copy last response</option>
+                <option value="task.copy-path" data-description="Copy the selected Codex task's workspace path.">Copy workspace path</option>
+            </optgroup>
+            <optgroup label="Codex workflow">
+                <option value="agent.new-task" data-description="Open the Codex new-task screen.">New task</option>
+                <option value="agent.search" data-description="Focus Codex and open task search.">Search tasks</option>
+                <option value="agent.review-changes" data-description="Start a Codex review of uncommitted workspace changes.">Review changes</option>
+                <option value="agent.run-tests" data-description="Start a Codex turn that runs and diagnoses the relevant tests.">Run tests</option>
+                <option value="agent.open-terminal" data-description="Focus Codex and toggle its bottom terminal.">Open terminal</option>
+                <option value="agent.compact-context" data-description="Start Codex context compaction for the selected task.">Compact context</option>
+                <option value="agent.settings" data-description="Open Codex settings.">Codex settings</option>
+            </optgroup>
         </sdpi-select>
     </sdpi-item>
+    <p class="click-hint" aria-live="polite"></p>
+    <script src="crux-config.js"></script>
 </body>
 </html>

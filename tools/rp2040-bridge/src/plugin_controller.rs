@@ -179,6 +179,13 @@ fn parse_event(message: &Value) -> Option<PhysicalEvent> {
             Some(PhysicalEvent::CatalogAction { action })
         }
         "model-cycle" => Some(PhysicalEvent::ModelCycle),
+        "usage-agent" => {
+            let agent = message
+                .get("agent")
+                .and_then(Value::as_str)
+                .and_then(crate::usage::UsageAgent::parse)?;
+            Some(PhysicalEvent::UsageSelect { agent })
+        }
         "encoder-turn" => {
             let index = message.get("index").and_then(Value::as_u64)? as u8;
             let delta = message
@@ -401,6 +408,9 @@ mod tests {
         events_tx
             .send(json!({"type":"event","kind":"model-cycle"}))
             .unwrap();
+        events_tx
+            .send(json!({"type":"event","kind":"usage-agent","agent":"zcode"}))
+            .unwrap();
 
         assert_eq!(
             controller.poll(0).expect("poll"),
@@ -422,6 +432,9 @@ mod tests {
                     action: CatalogAction::TaskRetry,
                 },
                 PhysicalEvent::ModelCycle,
+                PhysicalEvent::UsageSelect {
+                    agent: crate::usage::UsageAgent::ZCode,
+                },
             ]
         );
     }
@@ -443,6 +456,12 @@ mod tests {
         assert!(
             parse_event(&json!({
                 "type":"event", "kind":"task-button", "index":0, "task_id":""
+            }))
+            .is_none()
+        );
+        assert!(
+            parse_event(&json!({
+                "type":"event", "kind":"usage-agent", "agent":"hermes"
             }))
             .is_none()
         );
@@ -527,6 +546,8 @@ mod tests {
             five_hour_remaining: None,
             weekly_reset_at: None,
             five_hour_reset_at: None,
+            usage_agent: None,
+            agents_usage: None,
             wait_reason: None,
             prompt: None,
             interaction_id: None,
@@ -559,6 +580,8 @@ mod tests {
             five_hour_remaining: None,
             weekly_reset_at: None,
             five_hour_reset_at: None,
+            usage_agent: None,
+            agents_usage: None,
             wait_reason: None,
             prompt: None,
             interaction_id: None,

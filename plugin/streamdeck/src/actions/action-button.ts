@@ -12,7 +12,8 @@ import streamDeck from "@elgato/streamdeck";
 import type { JsonValue } from "@elgato/utils";
 import { PluginContext } from "../context";
 import { renderControlKeyImage } from "../button-icons";
-import { resolveCatalogAction, type ActionCatalogItem } from "../action-catalog";
+import { resolveCatalogAction } from "../action-catalog";
+import { catalogActionNeedsBridge, dispatchCatalogAction } from "../action-dispatch";
 
 /** Settings for a catalog-driven Action Button. */
 export interface ActionButtonSettings {
@@ -46,14 +47,12 @@ export class ActionButtonAction extends SingletonAction<ActionButtonSettings> {
 
     async onKeyDown(ev: KeyDownEvent<ActionButtonSettings>): Promise<void> {
         const item = resolveCatalogAction(ev.payload.settings.actionId, ev.payload.settings.index);
-        const needsBridge = item.dispatch.kind !== "codex-action"
-            && item.dispatch.kind !== "unsupported";
-        if (needsBridge && !this.ctx.isConnected()) {
+        if (catalogActionNeedsBridge(item) && !this.ctx.isConnected()) {
             ev.action.showAlert();
             return;
         }
         try {
-            await this.dispatch(item, true);
+            await dispatchCatalogAction(this.ctx, item, true);
             if (item.dispatch.kind === "codex-action") {
                 await ev.action.showOk();
             }
@@ -65,32 +64,8 @@ export class ActionButtonAction extends SingletonAction<ActionButtonSettings> {
     }
 
     onKeyUp(ev: KeyUpEvent<ActionButtonSettings>): void {
-        this.dispatch(resolveCatalogAction(ev.payload.settings.actionId, ev.payload.settings.index), false);
-    }
-
-    private async dispatch(item: ActionCatalogItem, pressed: boolean): Promise<void> {
-        switch (item.dispatch.kind) {
-            case "micro-key":
-                this.ctx.daemon.sendMicroKey(item.dispatch.key, pressed);
-                break;
-            case "encoder-button":
-                this.ctx.daemon.sendEncoderButton(item.dispatch.index, pressed);
-                break;
-            case "encoder-turn":
-                if (pressed) this.ctx.daemon.sendEncoderTurn(item.dispatch.index, item.dispatch.delta);
-                break;
-            case "catalog-action":
-                if (pressed) this.ctx.daemon.sendCatalogAction(item.id);
-                break;
-            case "codex-action":
-                if (pressed) {
-                    await this.ctx.executeSelectedAgentAction(item.id);
-                }
-                break;
-            case "unsupported":
-                if (pressed) throw new Error(item.dispatch.reason);
-                break;
-        }
+        const item = resolveCatalogAction(ev.payload.settings.actionId, ev.payload.settings.index);
+        void dispatchCatalogAction(this.ctx, item, false);
     }
 
     private refreshAll(): void {

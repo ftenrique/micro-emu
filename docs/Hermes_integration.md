@@ -34,17 +34,18 @@ absent. Auxiliary task devices remain available to the shared scheduler.
 
 | Active agents            | Codex            | ZCode            | Hermes           |
 |--------------------------|------------------|------------------|------------------|
-| codex only               | AG00–AG02 / 1–3  | —                | —                |
-| hermes only              | —                | —                | AG03–AG05 / 4–6  |
-| codex + hermes           | AG00–AG02 / 1–3  | —                | AG03–AG05 / 4–6  |
-| zcode + hermes           | —                | AG03–AG05 / 4–6  | —                |
-| codex + zcode + hermes   | AG00–AG02 / 1–3  | AG03–AG05 / 4–6  | —                |
+| codex only               | AG00–AG02 / 0–2  | —                | —                |
+| hermes only              | —                | —                | AG03–AG05 / 3–5  |
+| codex + hermes           | AG00–AG02 / 0–2  | —                | AG03–AG05 / 3–5  |
+| zcode + hermes           | —                | AG03–AG05 / 3–5  | —                |
+| codex + zcode + hermes   | AG00–AG02 / 0–2  | AG03–AG05 / 3–5  | —                |
 
 "Active" means the agent has a live MCP session on the daemon, or — for Codex
-only — the RP2040 serial link is up. When the active set changes, the daemon
-debounces for 750 ms and then recomputes the partition. Each active agent
-receives a **partition event** via `poll_events` notifying it of its new keys
-and slots. LCD state is retained through repartitions.
+only — the RP2040 serial link is up **and** has forwarded a Codex status
+frame (`v.oai.thstatus`) within the last 60 seconds. When the active set
+changes, the daemon debounces for 750 ms and then recomputes the partition.
+Each active agent receives a **partition event** via `poll_events` notifying
+it of its new keys and slots. LCD state is retained through repartitions.
 
 See the [ZCode integration guide](./ZCode_integration.md) for the full
 partition matrix with all three agents.
@@ -113,8 +114,10 @@ The daemon prints a `bridge-ready` line and listens on `127.0.0.1:48360`:
 ```json
 {"type":"bridge-ready","firmware":"standalone","port":"none","rp2040":false,
  "controller":{"kind":"ajazz","connected":true},"mode":"daemon",
- "partition":{"codex":{"keys":["AG00","AG01","AG02"],"slots":[0,1,2]},
-              "hermes":{"keys":["AG03","AG04","AG05"],"slots":[3,4,5]}}}
+ "agents":{"codex":{"events":0,"keys":[],"slots":[]},
+           "zcode":{"events":0,"keys":[],"slots":[]},
+           "hermes":{"events":0,"keys":["AG03","AG04","AG05"],"slots":[3,4,5]}},
+ "partition":{"owners":[null,null,null,"hermes","hermes","hermes"]}}
 ```
 
 ### 2. Register the proxy with Hermes

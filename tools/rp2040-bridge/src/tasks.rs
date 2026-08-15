@@ -38,6 +38,11 @@ pub const RECONNECT_GRACE: Duration = Duration::from_secs(30);
 pub const CODEX_TASK_SLOTS: usize = 9;
 /// Number of physical task positions represented by the Codex Micro protocol.
 pub const CODEX_HID_SLOTS: usize = 6;
+/// Priority auto-fed task cards use while their agent turn is active. Shared
+/// by every agent state feed so the scheduler ranks agents consistently.
+pub const TASK_PRIORITY_ACTIVE: u64 = 75;
+/// Priority auto-fed task cards use while their agent is idle.
+pub const TASK_PRIORITY_IDLE: u64 = 40;
 
 /// Returns the task title as it should appear on the Stream Deck strip.
 ///
@@ -611,12 +616,14 @@ impl TaskBoard {
         } else {
             TaskState::parse(None)?
         };
-        let priority = object
+        let priority_value = object
             .get("priority")
             .and_then(Value::as_u64)
-            .unwrap_or(50)
-            .try_into()
-            .map_err(|_| "priority must be from 0 to 100".to_owned())?;
+            .unwrap_or(50);
+        if priority_value > 100 {
+            return Err("priority must be from 0 to 100".to_owned());
+        }
+        let priority = priority_value as u8;
         let progress = match object.get("progress") {
             None | Some(Value::Null) => None,
             Some(value) => Some(

@@ -25,24 +25,33 @@ daemon over TCP loopback, identifies itself with a hello line, and pumps
 JSON-RPC lines bidirectionally. The daemon multiplexes all sessions against
 a single hardware-owning loop.
 
-### Dynamic key and LCD partition
+### Key and LCD partition
 
-The six LCD keys are partitioned **dynamically** based on which agents are
-currently active. Priority order is **Codex > ZCode > Hermes**.
+The six LCD keys are partitioned in **fixed halves** based on which agents are
+currently active. Codex always owns the first half (AG00–AG02 / slots 0–2)
+while it is active; ZCode has priority for the second half (AG03–AG05 /
+slots 3–5); Hermes uses that second half only while ZCode is absent. Unused
+halves stay unowned: presses on their keys are dropped and their LCD cards
+render off.
 
 | Active agents            | Codex            | ZCode            | Hermes           |
 |--------------------------|------------------|------------------|------------------|
-| codex only               | AG00–AG05 / 1–6  | —                | —                |
-| zcode only               | —                | AG00–AG05 / 1–6  | —                |
-| hermes only              | —                | —                | AG00–AG05 / 1–6  |
-| codex + zcode            | AG00–AG02 / 1–3  | AG03–AG05 / 4–6  | —                |
-| codex + hermes           | AG00–AG02 / 1–3  | —                | AG03–AG05 / 4–6  |
-| zcode + hermes           | —                | AG00–AG02 / 1–3  | AG03–AG05 / 4–6  |
-| codex + zcode + hermes   | AG00,AG03 / 1,4  | AG01,AG04 / 2,5  | AG02,AG05 / 3,6  |
+| codex only               | AG00–AG02 / 0–2  | —                | —                |
+| zcode only               | —                | AG03–AG05 / 3–5  | —                |
+| hermes only              | —                | —                | AG03–AG05 / 3–5  |
+| codex + zcode            | AG00–AG02 / 0–2  | AG03–AG05 / 3–5  | —                |
+| codex + hermes           | AG00–AG02 / 0–2  | —                | AG03–AG05 / 3–5  |
+| zcode + hermes           | —                | AG03–AG05 / 3–5  | —                |
+| codex + zcode + hermes   | AG00–AG02 / 0–2  | AG03–AG05 / 3–5  | —                |
 
 "Active" means the agent has a live MCP session on the daemon, or — for Codex
-only — the RP2040 serial link is up (ChatGPT drives Codex over HID without an
-MCP session).
+only — the RP2040 serial link is up **and** has forwarded a Codex status
+frame (`v.oai.thstatus`) within the last 60 seconds (ChatGPT drives Codex
+over HID without an MCP session), or — for ZCode — the ZCode desktop app is
+running (the bridge mirrors its session database directly, so ZCode keeps its
+cards and its half of the deck across MCP proxy reconnects and daemon
+restarts; closing the app releases them). A silently connected RP2040 does
+not claim a share of the deck.
 
 When the active set changes (agent connects, disconnects, or the RP2040 is
 attached/detached), the daemon waits 750 ms (debounce) and then recomputes the
@@ -50,9 +59,6 @@ partition. Each active agent receives a **partition event** via `poll_events`
 notifying it of its new keys and slots. LCD state is retained through
 repartitions: if an agent's slot set grows, its previously painted entries
 reappear.
-
-The 3-agent column split assumes the AKP03E 3×2 grid where `AG00..AG02` is the
-top row and `AG03..AG05` the bottom row, so `{n, n+3}` is a visual column.
 
 ## Prerequisites
 
@@ -111,15 +117,15 @@ Replace `ajazz` with `streamdeck-plus`, `streamdeck-plus-xl`, or
 testing without a physical device.
 
 The daemon prints a `bridge-ready` line and listens on `127.0.0.1:48360`.
-Since ZCode is the only active agent, it owns all six keys and slots:
+ZCode owns its fixed second half; the first half stays unowned:
 
 ```json
 {"type":"bridge-ready","firmware":"standalone","port":"none","rp2040":false,
  "controller":{"kind":"ajazz","connected":true},"mode":"daemon",
  "agents":{"codex":{"events":0,"keys":[],"slots":[]},
-           "zcode":{"events":0,"keys":["AG00","AG01","AG02","AG03","AG04","AG05"],"slots":[0,1,2,3,4,5]},
+           "zcode":{"events":0,"keys":["AG03","AG04","AG05"],"slots":[3,4,5]},
            "hermes":{"events":0,"keys":[],"slots":[]}},
- "partition":{"owners":["zcode","zcode","zcode","zcode","zcode","zcode"]}}
+ "partition":{"owners":[null,null,null,"zcode","zcode","zcode"]}}
 ```
 
 ### 2. Register the proxy with ZCode
@@ -160,18 +166,18 @@ already running. If you started the daemon manually in step 1, you can omit
 
 Confirm the server is enabled in the MCP Servers list. Ask ZCode Agent to
 call `bridge_status`. You should see the daemon report `mode: "daemon"`,
-`rp2040: false`, and ZCode owning all six keys.
+`rp2040: false`, and ZCode owning AG03–AG05 / slots 3–5.
 
-Press `AG00` on the physical controller, then ask ZCode to call `poll_events`
+Press `AG03` on the physical controller, then ask ZCode to call `poll_events`
 (or `poll_events` with `timeout_ms: 5000` for a long-poll). You should
 receive:
 
 ```json
-{"events": [{"type": "key", "key": "AG00", "pressed": true, "ts": 1709000000000}]}
+{"events": [{"type": "key", "key": "AG03", "pressed": true, "ts": 1709000000000}]}
 ```
 
-Call `set_thread_status` with 6 entries — all six LCD slots update since
-ZCode is the sole agent.
+Call `set_thread_status` with 3 entries — ZCode's three LCD slots update;
+the unowned first half stays off.
 
 ---
 
@@ -233,21 +239,22 @@ codex mcp add micro_emu_bridge `
 1. Start ChatGPT — it should detect Codex Micro via the RP2040 HID.
 2. Start ZCode — it should connect to the bridge MCP server.
 3. Ask each agent to call `bridge_status`. Both should report `mode: "daemon"`
-   and `rp2040: true`. The partition shows Codex with `AG00–AG02` / slots 1–3
-   and ZCode with `AG03–AG05` / slots 4–6.
+   and `rp2040: true`. The partition shows Codex with `AG00–AG02` / slots 0–2
+   and ZCode with `AG03–AG05` / slots 3–5.
 4. Press `AG00` — ChatGPT/Codex receives it via HID.
 5. Press `AG03` — call `poll_events` from ZCode to receive it.
-6. Call `set_thread_status` from ZCode with 3 entries — LCD slots 4–6 update.
-   Call it from Codex with 3 entries — slots 1–3 update. The controller shows
+6. Call `set_thread_status` from ZCode with 3 entries — LCD slots 3–5 update.
+   Call it from Codex with 3 entries — slots 0–2 update. The controller shows
    all six slots fused.
 
 ---
 
 ## Deployment C: all three agents (Codex + ZCode + Hermes)
 
-When all three agents are active, the partition switches to the **column
-split**: Codex gets `AG00`+`AG03` (slots 1, 4), ZCode gets `AG01`+`AG04`
-(slots 2, 5), Hermes gets `AG02`+`AG05` (slots 3, 6).
+When all three agents are active, the fixed halves stay in place: Codex keeps
+`AG00–AG02` (slots 0–2), ZCode keeps `AG03–AG05` (slots 3–5), and Hermes gets
+no keys — ZCode has priority for the second half. Hermes only receives keys
+while ZCode is disconnected (it then takes over `AG03–AG05`).
 
 ### 1. Start the daemon
 
@@ -264,25 +271,28 @@ Register all three proxies:
 See the [Hermes integration guide](./Hermes_integration.md) for Hermes-specific
 setup.
 
-### 3. Verify the column split
+### 3. Verify the partition
 
 1. Ensure all three agents are connected (check `bridge_status` → `agents`).
 2. The `partition.owners` array should be
-   `["codex","zcode","hermes","codex","zcode","hermes"]`.
-3. Press `AG01` — ZCode receives it via `poll_events`.
-4. Press `AG03` — Codex receives it via HID.
-5. Press `AG05` — Hermes receives it via `poll_events`.
-6. Each agent's `set_thread_status` writes only its 2 assigned slots.
+   `["codex","codex","codex","zcode","zcode","zcode"]`. Hermes reports empty
+   `keys`/`slots`.
+3. Press `AG01` — ChatGPT/Codex receives it via HID.
+4. Press `AG03` — call `poll_events` from ZCode to receive it.
+5. Pressing AG03–AG05 while ZCode is connected never reaches Hermes; close
+   the ZCode proxy (or ZCode itself) and wait 750 ms for Hermes to take over
+   the second half.
+6. Codex's `set_thread_status` writes slots 0–2, ZCode's writes slots 3–5.
 
 ### 4. Disconnect one agent
 
-When an agent disconnects (e.g., you close Hermes), the daemon debounces for
-750 ms and then repartitions into a 2-agent half split. The surviving agents
-receive a partition event via `poll_events`:
+When an agent disconnects (e.g., you close ZCode), the daemon debounces for
+750 ms and then repartitions: Hermes takes over the second half. The
+surviving agents receive a partition event via `poll_events`:
 
 ```json
-{"type": "partition", "keys": ["AG00","AG01","AG02"], "slots": [0,1,2],
- "agents": ["codex","zcode"], "ts": 1709000000750}
+{"type": "partition", "keys": ["AG03","AG04","AG05"], "slots": [3,4,5],
+ "agents": ["codex","hermes"], "ts": 1709000000750}
 ```
 
 ---
@@ -294,10 +304,13 @@ receive a partition event via `poll_events`:
 | Tool                 | Description                                                        |
 |----------------------|--------------------------------------------------------------------|
 | `bridge_status`      | Report daemon, firmware, serial port, controller, and agent state. |
-| `poll_events`        | Drain buffered physical key presses for your keys. Long-poll with `timeout_ms`. Also delivers partition change events. |
+| `poll_events`        | Drain buffered key presses, partition changes, and task events for your keys. Long-poll with `timeout_ms`. |
 | `set_thread_status`  | Update the LCD slots currently assigned to your agent.             |
-| `set_rgb_config`     | Send `v.oai.rgbcfg` configuration to the controller.               |
+| `publish_tasks`      | Publish a complete task-card snapshot for your session.            |
 | `set_display_context`| Update the Stream Deck + dashboard with project, task, model and effort metadata. |
+
+RGB configuration is daemon-managed; there is no `set_rgb_config` tool in
+daemon mode.
 
 ### `poll_events`
 
@@ -330,8 +343,8 @@ Partition change event response:
 
 ```json
 {"events": [
-  {"type": "partition", "keys": ["AG01","AG04"], "slots": [1,4],
-   "agents": ["codex","zcode","hermes"], "ts": 1709000000750}
+  {"type": "partition", "keys": ["AG03","AG04","AG05"], "slots": [3,4,5],
+   "agents": ["codex","zcode"], "ts": 1709000000750}
 ]}
 ```
 
@@ -384,6 +397,30 @@ XL as the physical controller.
 This is a device-global setting: the last agent to call it wins. Use
 `bridge_status` to check the current `displayContext`.
 
+### Usage limits (bridge-side, no MCP required)
+
+The Stream Deck `Context` key in `Usage info` mode can report ZCode's
+5-hour/weekly limits instead of Codex's (pick `ZCode` under **Usage Source**;
+`Codex` is the default). The bridge reads them directly:
+
+- ZCode: `GET https://api.z.ai/api/monitor/usage/quota/limit` with the
+  coding-plan API key ZCode persists in `~/.zcode/v2/config.json`
+  (`provider["builtin:zai-coding-plan"].options.apiKey`). `TOKENS_LIMIT` maps
+  to the 5-hour window, `TIME_LIMIT` to the weekly quota; `nextResetTime` is
+  epoch milliseconds.
+- Codex: `GET https://chatgpt.com/backend-api/wham/usage` with the tokens
+  from `~/.codex/auth.json`.
+
+Snapshots are cached per agent and refreshed every 5 minutes (and on
+selection changes), then composed into the display context as
+`five_hour_remaining` / `weekly_remaining` plus reset timestamps, with
+`usage_agent` naming the source. Every display context also carries an
+`agents_usage` map with both agents' snapshots, so the Context key and each
+Crux Vertical dial (both have a `Usage Source` setting) can render codex and
+zcode usage side by side. Usage fields are bridge-owned: an agent's explicit
+`set_display_context` push does not pin its own limits to the strip after
+the user switches source.
+
 ### `bridge_status`
 
 ```json
@@ -394,12 +431,12 @@ This is a device-global setting: the last agent to call it wins. Use
   "rp2040": true,
   "controller": {"kind": "ajazz", "connected": true, "model": "AKP03E", "serial": null},
   "agents": {
-    "codex": {"events": 0, "keys": ["AG00","AG03"], "slots": [0,3]},
-    "zcode": {"events": 2, "keys": ["AG01","AG04"], "slots": [1,4]},
-    "hermes": {"events": 0, "keys": ["AG02","AG05"], "slots": [2,5]}
+    "codex": {"events": 0, "keys": ["AG00","AG01","AG02"], "slots": [0,1,2]},
+    "zcode": {"events": 2, "keys": ["AG03","AG04","AG05"], "slots": [3,4,5]},
+    "hermes": {"events": 0, "keys": [], "slots": []}
   },
   "partition": {
-    "owners": ["codex","zcode","hermes","codex","zcode","hermes"]
+    "owners": ["codex","codex","codex","zcode","zcode","zcode"]
   },
   "mode": "daemon"
 }
@@ -509,19 +546,21 @@ other agents.
 
 - The `--autostart` flag uses a lockfile in
   `%LOCALAPPDATA%\micro-emu\bridge-daemon.lock` to prevent race conditions.
-  If the lockfile is stale (older than 30 seconds), it is removed
+  If the lockfile is stale (older than 10 seconds), it is removed
   automatically.
 - If you still see issues, start the daemon manually and omit `--autostart`
   from the proxy configurations.
 
 ### Partition changes unexpectedly
 
-- The partition is dynamic: connecting or disconnecting an agent changes
-  which keys/slots each agent owns. The daemon debounces for 750 ms before
+- The partition follows the active set: connecting or disconnecting an agent
+  changes which halves are owned. The daemon debounces for 750 ms before
   applying the change.
-- Codex is considered active whenever the RP2040 is connected, even without
-  an MCP session. If you want ZCode to own all keys, use `--port none` so
-  Codex is not active.
+- Codex is considered active while the RP2040 is connected and has forwarded
+  a Codex status frame within the last 60 seconds — not merely because the
+  board is plugged in. With `--port none` (and no Codex proxy connected),
+  Codex is inactive and its half stays unowned; presses on AG00–AG02 are
+  dropped.
 - Check `bridge_status` → `partition.owners` to see the current assignment.
 
 ## Task publishing and combined devices
@@ -535,3 +574,35 @@ The daemon treats task instances—not product names—as ownership units, so mu
 The response reports the stable assignment for every task (`device_id` plus physical `slot`) or `null` when the combined board is full. Use repeatable daemon options such as `--device ajazz,serial=AJ-1 --device streamdeck-plus,serial=SD-1`; capacities are six AJAZZ slots and eight Stream Deck+ slots. XL models default to eight and accept `task-slots=N`.
 
 Task selection is delivered to the owning session as `task_selected`; `layout_changed` is emitted after reflow. `bridge_status` version 2 reports sessions, devices, assignments, overflow, selected task per device, queue depth, and reconnect leases. A disconnect retains cards for 30 seconds, allowing the same stable task ids to reclaim their slots. The touch-strip context follows the selected card, while RGB remains centrally daemon-managed.
+
+### Selecting sessions and raising the app (Windows)
+
+ZCode has no deep link or local API for opening a session, so the bridge
+drives the desktop app directly through Windows UI Automation:
+
+- **Short press** on an auto-fed ZCode card selects it on the board as usual
+  *and* switches the ZCode desktop app to that session. The bridge locates the
+  sidebar row by the card title (rows expose `"<title><relative time>"`),
+  invokes it, and waits until the session appears as the active conversation.
+  If the sidebar is collapsed, it is opened for the selection and collapsed
+  again afterwards. The selection runs on a background worker — a burst of
+  presses collapses to the most recent one — and never blocks the daemon loop.
+- **Long press** keeps the toggle semantics: when the ZCode window is in the
+  foreground it is minimized, otherwise the session is selected first and the
+  window is then raised. If Windows denies the foreground switch, the bridge
+  relaunches `ZCode.exe` so Electron's single-instance handshake raises the
+  window from inside the app.
+
+The first press after ZCode starts — or after its accessibility tree has been
+torn down for lack of automation clients — can take several seconds: Chromium
+only builds the tree once it notices a client, so the script pokes MSAA while
+polling and the daemon retries a failed selection up to three times (a newer
+press always supersedes the retry). Selection needs the ZCode desktop app to
+be running and, as anywhere else on the board, a live task card to press; the
+auto-feed publishes while a ZCode MCP proxy is connected **or** the desktop
+app is running.
+
+The daemon also appends lifecycle events (agent sessions, repartitions,
+auto-feed gaps, selection failures) to
+`%LOCALAPPDATA%\micro-emu\logs\bridge-daemon.log` — check it first when the
+deck appears to disconnect.

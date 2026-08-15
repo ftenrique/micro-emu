@@ -5,7 +5,9 @@
 //! metadata, lifecycle, and timing instead come from Codex's thread database
 //! and append-only rollout events.
 
-use crate::tasks::{CODEX_HID_SLOTS, CODEX_TASK_SLOTS, TaskState};
+use crate::tasks::{
+    CODEX_HID_SLOTS, CODEX_TASK_SLOTS, TASK_PRIORITY_ACTIVE, TASK_PRIORITY_IDLE, TaskState,
+};
 use rusqlite::OpenFlags;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -49,7 +51,7 @@ struct CodexStateCache {
     focus: FocusCursor,
 }
 
-pub fn read_codex_snapshot() -> Option<Value> {
+pub fn read_codex_snapshot(max_tasks: usize) -> Option<Value> {
     static CACHE: OnceLock<Mutex<CodexStateCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(CodexStateCache::default()));
     let mut cache = cache.lock().ok()?;
@@ -62,6 +64,7 @@ pub fn read_codex_snapshot() -> Option<Value> {
     read_codex_snapshot_from(
         &Path::new(&home).join(".codex"),
         logs_dir.as_deref(),
+        max_tasks,
         &mut cache,
     )
 }
@@ -69,6 +72,7 @@ pub fn read_codex_snapshot() -> Option<Value> {
 fn read_codex_snapshot_from(
     codex_dir: &Path,
     logs_dir: Option<&Path>,
+    max_tasks: usize,
     cache: &mut CodexStateCache,
 ) -> Option<Value> {
     let titles = read_index_titles(&codex_dir.join("session_index.jsonl"));
@@ -94,7 +98,7 @@ fn read_codex_snapshot_from(
         )
         .ok()?;
     let rows = statement
-        .query_map([CODEX_TASK_SLOTS as u64], |row| {
+        .query_map([u64::try_from(max_tasks).unwrap_or(u64::MAX)], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -122,7 +126,11 @@ fn read_codex_snapshot_from(
             "model": model,
             "effort": effort,
             "state": state.as_str(),
-            "priority": if state.active() { 100 } else { 50 },
+            "priority": if state.active() {
+                TASK_PRIORITY_ACTIVE
+            } else {
+                TASK_PRIORITY_IDLE
+            },
             "source_slot": source_slot,
             // Only the six physical Micro positions have synthetic HID keys.
             // Extra Stream Deck task cards are selected through the desktop
@@ -137,16 +145,19 @@ fn read_codex_snapshot_from(
         }));
     }
 
-    if tasks.is_empty() {
-        return None;
-    }
-    let selected_task_id = logs_dir
-        .and_then(|logs| refresh_focused_task(&mut cache.focus, logs))
-        .filter(|selected| {
-            tasks
-                .iter()
-                .any(|task| task.get("task_id").and_then(Value::as_str) == Some(selected))
-        });
+    // An empty array is a valid publish: it clears stale Codex cards when
+    // every thread is archived, instead of leaving them on the board.
+    let selected_task_id = if tasks.is_empty() {
+        None
+    } else {
+        logs_dir
+            .and_then(|logs| refresh_focused_task(&mut cache.focus, logs))
+            .filter(|selected| {
+                tasks.iter().any(|task| {
+                    task.get("task_id").and_then(Value::as_str) == Some(selected)
+                })
+            })
+    };
     Some(json!({
         "selected_task_id": selected_task_id,
         "tasks": tasks
@@ -619,9 +630,13 @@ mod tests {
         )
         .expect("focus log");
 
-        let snapshot =
-            read_codex_snapshot_from(&root, Some(&logs), &mut CodexStateCache::default())
-                .expect("snapshot");
+        let snapshot = read_codex_snapshot_from(
+            &root,
+            Some(&logs),
+            CODEX_TASK_SLOTS,
+            &mut CodexStateCache::default(),
+        )
+        .expect("snapshot");
         assert_eq!(snapshot["selected_task_id"], "thread");
         let task = &snapshot["tasks"][0];
         assert_eq!(task["task_id"], "thread");

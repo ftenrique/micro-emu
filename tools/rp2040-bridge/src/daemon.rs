@@ -1,5 +1,5 @@
 //! Daemon mode: TCP loopback server that multiplexes multiple MCP sessions
-//! (Codex and Hermes) over a single hardware-owning bridge process.
+//! (Codex, ZCode, and Hermes) over a single hardware-owning bridge process.
 //!
 //! See `run_daemon` for the entry point invoked from `main.rs` when the
 //! `--daemon` flag is set.
@@ -31,14 +31,18 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:48360";
 /// fluctuations; this prevents LCD churn.
 const REPARTITION_DEBOUNCE: Duration = Duration::from_millis(750);
 
-/// How often to refresh the auto-derived display context (which includes
-/// a live usage API call). 5 minutes balances freshness with API load.
-const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+/// How often to refresh cached usage snapshots (one provider API call per
+/// active agent). Defined alongside the usage fetchers in `usage`.
+use crate::usage::USAGE_REFRESH_INTERVAL;
 
 /// How often the daemon polls ZCode's session database to mirror live
 /// activity on the task board. One second keeps the Stream Deck responsive
 /// without hammering the SQLite file.
 const ZCODE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the daemon probes for the ZCode desktop app's window. While the
+/// app runs, ZCode keeps its deck half and auto-fed cards even without a
+/// live MCP proxy; the probe is a window enumeration, so it stays cheap.
+const ZCODE_DESKTOP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// Hermes' canonical SQLite state is local and WAL-backed. One second keeps
 /// cards responsive while avoiding contention with the running agent.
 const HERMES_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -157,13 +161,48 @@ fn retry_serial_connection(
 
 /// Computes the effective active set: agents with live MCP sessions, plus
 /// Codex if the RP2040 serial link is up (ChatGPT drives Codex over HID
-/// without an MCP session).
-fn effective_active_set(session_agents: ActiveSet, codex_hardware_active: bool) -> ActiveSet {
+/// without an MCP session), plus ZCode while its desktop app is running
+/// (the task feed mirrors the app's database directly and must survive MCP
+/// proxy blips and daemon restarts).
+fn effective_active_set(
+    session_agents: ActiveSet,
+    codex_hardware_active: bool,
+    zcode_desktop_active: bool,
+) -> ActiveSet {
     let mut set = session_agents;
     if codex_hardware_active {
         set.insert(AgentId::Codex);
     }
+    if zcode_desktop_active {
+        set.insert(AgentId::ZCode);
+    }
     set
+}
+
+/// Refreshes the usage snapshots the current setup may display: the selected
+/// source always; other agents while their sessions are live or while a
+/// plugin deck is connected (its strips can render either agent). Returns
+/// whether anything was refreshed.
+fn refresh_wanted_usage(
+    bridge: &mut crate::BridgeRuntime,
+    session_agents: &ActiveSet,
+    plugin_connected: bool,
+) -> bool {
+    use crate::usage::UsageAgent;
+    let selected = bridge.usage_agent;
+    let codex_wanted =
+        selected == UsageAgent::Codex || session_agents.contains(AgentId::Codex) || plugin_connected;
+    let zcode_wanted =
+        selected == UsageAgent::ZCode || session_agents.contains(AgentId::ZCode) || plugin_connected;
+    if codex_wanted {
+        let snapshot = crate::usage::fetch_usage(UsageAgent::Codex);
+        bridge.usage_cache.store(UsageAgent::Codex, snapshot);
+    }
+    if zcode_wanted {
+        let snapshot = crate::usage::fetch_usage(UsageAgent::ZCode);
+        bridge.usage_cache.store(UsageAgent::ZCode, snapshot);
+    }
+    codex_wanted || zcode_wanted
 }
 
 /// Runs the daemon: owns the hardware via a single `BridgeRuntime` and
@@ -177,6 +216,12 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         options.bridge_options.controller.as_str(),
         options.bridge_options.controller_serial
     );
+    crate::diaglog::log(&format!(
+        "daemon starting bind={} port={} controller={}",
+        options.bind,
+        options.bridge_options.port,
+        options.bridge_options.controller.as_str()
+    ));
     let listener = TcpListener::bind(&options.bind)
         .map_err(|error| format!("failed to bind {}: {error}", options.bind))?;
     let local = listener
@@ -187,7 +232,9 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     let mut bridge = crate::open_runtime(&options.bridge_options)?;
     bridge.task_mode = true;
     let mut codex_snapshot_available = false;
-    if let Some(snapshot) = crate::codex_state::read_codex_snapshot() {
+    if let Some(snapshot) =
+        crate::codex_state::read_codex_snapshot(crate::tasks::CODEX_TASK_SLOTS)
+    {
         match bridge
             .task_board
             .publish_codex_snapshot(&snapshot, now_ms())
@@ -203,10 +250,17 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     // A connected RP2040 alone does not claim a share of the deck.
     let mut session_agents = ActiveSet::new();
     let mut codex_hardware_active = false;
+    // Probed periodically: while the ZCode desktop app runs, ZCode keeps its
+    // half of the deck and its auto-fed cards even without a live MCP proxy.
+    let mut zcode_desktop_active = crate::zcode_window::desktop_running();
+    if zcode_desktop_active {
+        crate::diaglog::log("zcode desktop app detected at daemon start");
+    }
+    let mut next_zcode_desktop_probe_at = Instant::now() + ZCODE_DESKTOP_PROBE_INTERVAL;
     let mut pending_repartition_at: Option<Instant> = None;
     let mut next_usage_refresh_at: Option<Instant> = None;
     {
-        let active = effective_active_set(session_agents, codex_hardware_active);
+        let active = effective_active_set(session_agents, codex_hardware_active, zcode_desktop_active);
         bridge.partition = Partition::compute(active);
         bridge.task_board.set_slot_owners(
             bridge.task_device_id.clone(),
@@ -233,10 +287,10 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     // PluginController registered in aux_controllers.
     let mut plugin_sessions: Vec<(usize, String)> = Vec::new();
 
-    // ZCode auto-feed bookkeeping.  The daemon periodically polls ZCode's
-    // on-disk session database and publishes active sessions as task cards,
-    // mirroring how Codex activity arrives via `v.oai.thstatus`.
     let mut last_thstatus_at: Option<Instant> = None;
+    // ZCode and Hermes auto-feed bookkeeping.  The daemon periodically polls
+    // their on-disk session databases and publishes active sessions as task
+    // cards, mirroring how Codex activity arrives via `v.oai.thstatus`.
     let mut next_zcode_poll_at: Option<Instant> = None;
     let mut next_hermes_poll_at: Option<Instant> = None;
 
@@ -278,8 +332,14 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     handle_hello(&mut sessions, session_id, info);
                     session_agents.insert(agent);
                     pending_repartition_at = Some(Instant::now() + REPARTITION_DEBOUNCE);
-                    // Only Codex owns the local CLI/session-derived context.
-                    if agent == AgentId::Codex {
+                    // Codex owns the CLI/session-derived fallback context; a
+                    // ZCode hello also warrants re-derivation so a ZCode-only
+                    // machine still populates the strip (and its usage data).
+                    if matches!(agent, AgentId::Codex | AgentId::ZCode) {
+                        if let Some(usage_agent) = crate::usage::UsageAgent::from_agent(agent) {
+                            let snapshot = crate::usage::fetch_usage(usage_agent);
+                            bridge.usage_cache.store(usage_agent, snapshot);
+                        }
                         crate::auto_derive_display_context(&mut bridge);
                         let _ = crate::refresh_task_board(&mut bridge);
                     }
@@ -367,6 +427,15 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                         .aux_controllers
                         .push((device_id.clone(), Box::new(controller), slots));
                     plugin_sessions.push((session_id, device_id.clone()));
+                    // Bootstrap usage data for the deck right away (both
+                    // agents) instead of waiting for the first periodic tick.
+                    if refresh_wanted_usage(&mut bridge, &session_agents, true) {
+                        if bridge.has_explicit_display_context {
+                            crate::patch_display_context_usage(&mut bridge);
+                        } else {
+                            crate::auto_derive_display_context(&mut bridge);
+                        }
+                    }
                     let _ = crate::refresh_task_board(&mut bridge);
                 }
                 SessionMessage::Disconnected { session_id } => {
@@ -572,7 +641,12 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         // and exact timer timestamps independently of LCD presentation frames.
         if now >= next_codex_poll_at {
             next_codex_poll_at = now + CODEX_TASK_POLL_INTERVAL;
-            if let Some(snapshot) = crate::codex_state::read_codex_snapshot() {
+            // Match the ZCode/Hermes feeds: publish only as many recent
+            // threads as Codex can display on its partition slots.
+            let codex_slots = bridge.partition.slots_for(AgentId::Codex).len();
+            if let Some(snapshot) =
+                crate::codex_state::read_codex_snapshot(codex_slots)
+            {
                 match bridge
                     .task_board
                     .publish_codex_snapshot(&snapshot, now_ms())
@@ -643,7 +717,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         // Clear phantom Codex HID cards when the RP2040 link is gone.  The
         // synthetic session 0 cards published from `v.oai.thstatus` never
         // expire on their own; without this they keep hogging slots 0-5 and
-        // starve the ZCode auto-feed below.
+        // starve the ZCode and Hermes auto-feeds below.
         // Status is event-driven, not a heartbeat. Do not clear active task
         // cards simply because no new status frame arrived while the serial
         // link remains healthy.
@@ -662,21 +736,36 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             let _ = crate::refresh_task_board(&mut bridge);
         }
 
-        // ZCode auto-feed mirrors its on-disk state only while a ZCode proxy
-        // is live. ZCode retains historical sessions in its database, so an
-        // unconditional poll resurrects old tasks and can take over the board.
-        let zcode_active = sessions
+        // ZCode auto-feed mirrors its on-disk state while a ZCode proxy is
+        // live or the desktop app is running. ZCode retains historical
+        // sessions in its database, so polling with neither present
+        // resurrects old tasks and can take over the board. An explicit
+        // ZCode publication is authoritative and suppresses this synthetic
+        // owner until those manual cards disconnect and expire.
+        let zcode_proxy_active = sessions
             .iter()
             .any(|session| session.agent == Some(AgentId::ZCode));
-        if !zcode_active {
+        let zcode_active = zcode_proxy_active || zcode_desktop_active;
+        let zcode_has_manual_tasks = bridge
+            .task_board
+            .has_agent_tasks_except(AgentId::ZCode, ZCODE_POLL_SESSION);
+        if !zcode_active || zcode_has_manual_tasks {
             if bridge.task_board.has_session_tasks(ZCODE_POLL_SESSION) {
                 bridge.task_board.clear_session(ZCODE_POLL_SESSION);
+                crate::diaglog::log(&format!(
+                    "zcode auto-feed cleared (proxy={}, desktop={}, manual={})",
+                    zcode_proxy_active, zcode_desktop_active, zcode_has_manual_tasks
+                ));
                 let _ = crate::refresh_task_board(&mut bridge);
             }
             next_zcode_poll_at = None;
         } else {
             if next_zcode_poll_at.is_none() {
                 next_zcode_poll_at = Some(now + ZCODE_POLL_INTERVAL);
+                crate::diaglog::log(&format!(
+                    "zcode auto-feed active (proxy={}, desktop={})",
+                    zcode_proxy_active, zcode_desktop_active
+                ));
             }
             if let Some(poll_at) = next_zcode_poll_at {
                 if now >= poll_at {
@@ -702,6 +791,9 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                             }
                             Err(error) => {
                                 eprintln!("zcode poll publish failed: {error}");
+                                crate::diaglog::log(&format!(
+                                    "zcode auto-feed publish failed: {error}"
+                                ));
                             }
                         }
                     }
@@ -758,17 +850,42 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             pending_repartition_at = Some(now + REPARTITION_DEBOUNCE);
         }
 
+        // The ZCode desktop app running is itself an activity signal: the
+        // auto-feed mirrors its database directly, so cards must not blink
+        // out just because the MCP proxy reconnected or the daemon restarted.
+        if now >= next_zcode_desktop_probe_at {
+            next_zcode_desktop_probe_at = now + ZCODE_DESKTOP_PROBE_INTERVAL;
+            let running = crate::zcode_window::desktop_running();
+            if running != zcode_desktop_active {
+                zcode_desktop_active = running;
+                crate::diaglog::log(&format!(
+                    "zcode desktop app {}",
+                    if running { "detected" } else { "no longer running" }
+                ));
+                pending_repartition_at = Some(now + REPARTITION_DEBOUNCE);
+            }
+        }
+
         // Apply a debounced repartition if the active set has changed.
         if let Some(repartition_at) = pending_repartition_at {
             if now >= repartition_at {
                 pending_repartition_at = None;
-                let active = effective_active_set(session_agents, codex_hardware_active);
+                let active = effective_active_set(
+                    session_agents,
+                    codex_hardware_active,
+                    zcode_desktop_active,
+                );
                 let new_partition = Partition::compute(active);
                 eprintln!(
                     "repartition: active={:?} owners={:?}",
                     active.iter(),
                     new_partition.owners_json()
                 );
+                crate::diaglog::log(&format!(
+                    "repartition applied: active={:?} owners={:?}",
+                    active.iter(),
+                    new_partition.owners_json()
+                ));
                 bridge.partition = new_partition.clone();
                 bridge.task_board.set_slot_owners(
                     bridge.task_device_id.clone(),
@@ -801,16 +918,24 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         // Resolve pending long-polls that have events or have timed out.
         resolve_pending_polls(&mut pending_polls, &mut sessions, &mut bridge, now);
 
-        // Periodically refresh the auto-derived display context to keep
-        // usage data (5-hour / weekly remaining) current.
+        // Periodically refresh cached usage snapshots so the 5-hour and
+        // weekly remaining figures stay current. The selected agent is
+        // always refreshed; other agents while their sessions are live or
+        // while a plugin deck is attached (its strips can render either
+        // agent), which keeps later source switches instant.
         if next_usage_refresh_at.is_none() {
             next_usage_refresh_at = Some(now + USAGE_REFRESH_INTERVAL);
         }
         if let Some(refresh_at) = next_usage_refresh_at {
             if now >= refresh_at {
                 next_usage_refresh_at = Some(now + USAGE_REFRESH_INTERVAL);
-                if !bridge.has_explicit_display_context && session_agents.contains(AgentId::Codex) {
-                    crate::auto_derive_display_context(&mut bridge);
+                let plugin_connected = !plugin_sessions.is_empty();
+                if refresh_wanted_usage(&mut bridge, &session_agents, plugin_connected) {
+                    if bridge.has_explicit_display_context {
+                        crate::patch_display_context_usage(&mut bridge);
+                    } else {
+                        crate::auto_derive_display_context(&mut bridge);
+                    }
                     let _ = crate::refresh_task_board(&mut bridge);
                 }
             }
@@ -1132,10 +1257,25 @@ fn handle_hello(sessions: &mut Vec<SessionHandle>, session_id: usize, info: Hell
             session.instance_id.as_deref().unwrap_or("unknown"),
             session.focus_capable
         );
+        crate::diaglog::log(&format!(
+            "agent session {} registered: {} (instance {}, focus={})",
+            session_id,
+            info.agent.as_str(),
+            session.instance_id.as_deref().unwrap_or("unknown"),
+            session.focus_capable
+        ));
     }
 }
 
 fn remove_session(sessions: &mut Vec<SessionHandle>, session_id: usize) {
+    if let Some(session) = sessions.iter().find(|s| s.id == session_id) {
+        crate::diaglog::log(&format!(
+            "agent session {} removed: {} (instance {})",
+            session_id,
+            session.agent.as_ref().map_or("none", |a| a.as_str()),
+            session.instance_id.as_deref().unwrap_or("unknown")
+        ));
+    }
     sessions.retain(|s| s.id != session_id);
 }
 
@@ -1252,7 +1392,7 @@ fn handle_request(
             let slots = bridge.partition.slots_for(a);
             format!(
                 "{} agent. Use bridge_status first. Your keys: {:?}, LCD slots: {:?}. \
-                 Use poll_events to receive key presses and partition change notifications. \
+                 Use poll_events to receive key presses, partition changes, and task-card events. \
                  The colored numbered LCD cards and READY dashboard shown before an explicit update are standby indicators only. \
                  Publish live task state with publish_tasks or set_thread_status. {}",
                 a.as_str(),
@@ -1292,7 +1432,12 @@ fn handle_request(
             return Ok(());
         }
     };
-    send_to_session(sessions, session_id, mcp::response(id, result));
+    // `Value::Null` is the deferred-response sentinel used by long polls:
+    // `resolve_pending_polls` answers that request id later, so replying now
+    // would leak a null result and later duplicate the response.
+    if !result.is_null() {
+        send_to_session(sessions, session_id, mcp::response(id, result));
+    }
     Ok(())
 }
 
@@ -1329,10 +1474,15 @@ fn call_tool_for(
         "set_thread_status" => call_set_thread_status(bridge, arguments, agent, session_id),
         "publish_tasks" => {
             let agent_id = agent.unwrap_or(AgentId::Codex);
-            if agent_id == AgentId::Hermes && session_id != HERMES_POLL_SESSION {
-                // Avoid duplicate stable IDs when the first explicit Hermes
-                // snapshot takes ownership from the read-only auto-feed.
-                bridge.task_board.clear_session(HERMES_POLL_SESSION);
+            let auto_feed_session = match agent_id {
+                AgentId::ZCode => Some(ZCODE_POLL_SESSION),
+                AgentId::Hermes => Some(HERMES_POLL_SESSION),
+                AgentId::Codex => None,
+            };
+            if let Some(poll_session) = auto_feed_session.filter(|&s| s != session_id) {
+                // Avoid duplicate stable IDs when the first explicit snapshot
+                // takes ownership from the read-only auto-feed.
+                bridge.task_board.clear_session(poll_session);
             }
             match bridge
                 .task_board
@@ -1364,30 +1514,36 @@ fn call_tool_for(
                 .unwrap_or(0)
                 .min(25_000);
             let agent = agent.unwrap_or(AgentId::Codex);
-            let session_events = drain_session_events(sessions, session_id);
-            if !session_events.is_empty() {
-                mcp::text_result(json!({"events": session_events}))
+            // Drain both sources in one poll: session events (task-card and
+            // layout notifications) and the agent's routing queue (physical
+            // key presses and partition changes). Returning only one leaves
+            // the other buffered and can starve key events.
+            let mut events = drain_session_events(sessions, session_id);
+            events.extend(
+                bridge
+                    .routing
+                    .queue_mut(agent)
+                    .drain()
+                    .into_iter()
+                    .map(|event| event.to_json()),
+            );
+            if !events.is_empty() {
+                mcp::text_result(json!({"events": events}))
+            } else if timeout_ms > 0 {
+                // Defer the response: register a pending poll.
+                // Cancel any previous pending poll for this session.
+                pending_polls.retain(|p| p.session_id != session_id);
+                pending_polls.push(PendingPoll {
+                    session_id,
+                    agent,
+                    deadline: Instant::now() + Duration::from_millis(timeout_ms),
+                    request_id: id,
+                });
+                // Null sentinel: `handle_request` must not answer this id;
+                // `resolve_pending_polls` replies for it later.
+                Value::Null
             } else {
-                let queue = bridge.routing.queue_mut(agent);
-                if !queue.is_empty() {
-                    let events: Vec<Value> =
-                        queue.drain().into_iter().map(|e| e.to_json()).collect();
-                    mcp::text_result(json!({"events": events}))
-                } else if timeout_ms > 0 {
-                    // Defer the response: register a pending poll.
-                    // Cancel any previous pending poll for this session.
-                    pending_polls.retain(|p| p.session_id != session_id);
-                    pending_polls.push(PendingPoll {
-                        session_id,
-                        agent,
-                        deadline: Instant::now() + Duration::from_millis(timeout_ms),
-                        request_id: id,
-                    });
-                    // Return a sentinel that the caller should not send.
-                    Value::Null
-                } else {
-                    mcp::text_result(json!({"events": []}))
-                }
+                mcp::text_result(json!({"events": []}))
             }
         }
         _ => mcp::tool_error(format!("unknown MCP tool: {name}")),
@@ -1440,7 +1596,8 @@ fn call_set_thread_status(
     }
     // If we have a serial connection, also forward the thstatus to ChatGPT
     // so the HID side stays in sync. Only Codex's set_thread_status is
-    // forwarded (Hermes slots are not part of the Codex Micro protocol).
+    // forwarded (ZCode and Hermes slots are not part of the Codex Micro
+    // protocol).
     if agent == AgentId::Codex && bridge.has_serial() {
         let message = json!({"m": "v.oai.thstatus", "p": status});
         let _ = bridge.send_codex(&message);
@@ -1465,6 +1622,7 @@ fn daemon_bridge_status(bridge: &crate::BridgeRuntime, sessions: &[SessionHandle
     if let Some(object) = status.as_object_mut() {
         object.insert("sessions".to_owned(), json!(session_values));
         object.insert("sessionCount".to_owned(), json!(session_values.len()));
+        object.insert("usageAgent".to_owned(), json!(bridge.usage_agent.as_str()));
     }
     status
 }
@@ -1505,16 +1663,18 @@ fn resolve_pending_polls(
             .find(|session| session.id == poll.session_id)
             .is_some_and(|session| !session.events.is_empty());
         if session_has_events || !queue.is_empty() || now >= poll.deadline {
+            // Merge both event sources so neither starves the other
+            // (mirrors the immediate poll_events path).
             let mut events = drain_session_events(sessions, poll.session_id);
-            if events.is_empty() {
-                events = bridge
+            events.extend(
+                bridge
                     .routing
                     .queue_mut(poll.agent)
                     .drain()
                     .into_iter()
                     .map(|e| e.to_json())
-                    .collect();
-            }
+                    .collect::<Vec<_>>(),
+            );
             let result = mcp::text_result(json!({"events": events}));
             send_to_session(
                 sessions,
@@ -1573,7 +1733,7 @@ mod tests {
         sessions.insert(AgentId::ZCode);
         sessions.insert(AgentId::Hermes);
 
-        let active = effective_active_set(sessions, false);
+        let active = effective_active_set(sessions, false, false);
         assert!(!active.contains(AgentId::Codex));
         assert_eq!(
             Partition::compute(active).owners_json(),

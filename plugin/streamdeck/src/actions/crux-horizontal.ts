@@ -11,14 +11,20 @@
 } from "@elgato/streamdeck";
 import { PluginContext } from "../context";
 import { renderCruxHStrip, renderStripOffline } from "../images";
-import { clickLabel, sendClick, type CruxDialSettings } from "./dial-common";
+import {
+    clickLabel,
+    handleDialDown,
+    resolveClick,
+    sendClick,
+    type CruxDialSettings,
+} from "./dial-common";
 
 /**
  * Crux Horizontal dial — emulates the left/right axis of the original
  * Codex Micro crux. Rotation sends `EncoderTurn` index 0 (radial X);
- * press sends an assignable click action (default: the native encoder-0
- * press, ACT12 / Send). The touch strip shows the model and effort of
- * the currently selected task.
+ * press sends an assignable action from the shared action catalog
+ * (default: the native encoder-0 press, ACT12 / Send). The touch strip
+ * shows the model and effort of the currently selected task.
  */
 @action({ UUID: "com.micro-emu.codex.crux-h" })
 export class CruxHorizontalAction extends SingletonAction<CruxDialSettings> {
@@ -51,16 +57,13 @@ export class CruxHorizontalAction extends SingletonAction<CruxDialSettings> {
         this.ctx.daemon.sendEncoderTurn(0, delta);
     }
 
-    onDialDown(ev: DialDownEvent<CruxDialSettings>): void {
-        if (!this.ctx.isConnected()) {
-            ev.action.showAlert();
-            return;
-        }
-        sendClick(this.ctx, ev.payload.settings.click, 0, true);
+    onDialDown(ev: DialDownEvent<CruxDialSettings>): Promise<void> {
+        return handleDialDown(this.ctx, ev.action as DialAction<CruxDialSettings>,
+            ev.payload.settings.click, 0);
     }
 
     onDialUp(ev: DialUpEvent<CruxDialSettings>): void {
-        sendClick(this.ctx, ev.payload.settings.click, 0, false);
+        void sendClick(this.ctx, resolveClick(ev.payload.settings.click, 0), false);
     }
 
     onTouchTap(ev: TouchTapEvent<CruxDialSettings>): void {

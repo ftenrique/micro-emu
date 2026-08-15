@@ -36,9 +36,12 @@ El mapeo mantiene el contrato Codex existente: teclas 0-5 a `AG00`-`AG05`, tecla
 
 El servidor MCP existente expone set_display_context; no se añade un segundo
 servidor MCP ni se modifica el protocolo Codex Micro. La herramienta acepta
-project, task, model, effort, status y progress (0-100). El bridge guarda el
-último contexto y lo vuelve a pintar cuando el Stream Deck se reconecta. La
-franja táctil permanece inerte en esta versión.
+project, task, model, effort, status, progress (0-100), task_id, los campos
+de uso weekly_remaining, five_hour_remaining, weekly_reset_at y
+five_hour_reset_at, y los campos de interaccion wait_reason, prompt,
+interaction_id, short_action, long_action y pending_wait_count. El bridge
+guarda el ultimo contexto y lo vuelve a pintar cuando el Stream Deck se
+reconecta.
 
 Ejemplo de argumentos:
 
@@ -246,22 +249,22 @@ AJAZZ / Stream Deck --HID-- daemon --CDC-- RP2040 --HID-- ChatGPT
                 Codex CLI           Hermes Desktop Agent
 ``
 
-### Particion dinamica de teclas y slots LCD
+### Particion de teclas y slots LCD
 
-La particion de las 6 teclas LCD y 6 slots se ajusta dinamicamente segun
-cuantos agentes estan activos. Prioridad: **Codex > ZCode > Hermes**.
-
-- **1 agente activo**: posee las 6 teclas y los 6 slots.
-- **2 agentes activos**: el de mayor prioridad toma `AG00`-`AG02` / slots 1-3;
-  el otro toma `AG03`-`AG05` / slots 4-6.
-- **3 agentes activos**: particion por **columnas**: Codex `AG00`+`AG03`
-  (slots 1,4), ZCode `AG01`+`AG04` (slots 2,5), Hermes `AG02`+`AG05`
-  (slots 3,6).
+La particion de las 6 teclas LCD y 6 slots usa **mitades fijas** segun
+cuales agentes estan activos: Codex siempre posee la primera mitad
+(`AG00`-`AG02` / slots 0-2) mientras esta activo; ZCode tiene prioridad por
+la segunda mitad (`AG03`-`AG05` / slots 3-5); Hermes usa esa segunda mitad
+solo cuando ZCode esta ausente. Las mitades sin dueno quedan sin asignar:
+sus pulsaciones se descartan y sus tarjetas no se pintan.
 
 "Activo" significa: tiene una sesion MCP viva en el daemon, o (solo Codex)
-el RP2040 esta conectado. Cuando el conjunto activo cambia, el daemon espera
-750 ms (debounce) y reparticiona. Cada agente activo recibe un evento de
-particion via `poll_events`. El estado LCD se conserva durante los cambios.
+el RP2040 esta conectado **y** ha reenviado un frame de estado de Codex
+(`v.oai.thstatus`) en los ultimos 60 segundos. Un RP2040 conectado en
+silencio no reclama mitad alguna. Cuando el conjunto activo cambia, el
+daemon espera 750 ms (debounce) y reparticiona. Cada agente activo recibe un
+evento de particion via `poll_events`. El estado LCD se conserva durante los
+cambios.
 
 Ver `docs/ZCode_integration.md` para la matriz completa de particiones.
 
@@ -304,17 +307,19 @@ daemon solo escucha en `127.0.0.1:48360` (configurable con `--bind`).
 
 ### Tools por agente
 
-Hermes ve un conjunto filtrado de tools:
+Hermes y ZCode ven el mismo conjunto filtrado de tools:
 
 - `bridge_status` - estado del daemon, firmware, controlador y agentes.
 - `poll_events` - drena las pulsaciones fisicas bufferizadas para sus teclas.
   Con `timeout_ms > 0` espera hasta ese numero de milisegundos. Tambien
-  entrega eventos de cambio de particion.
-- `set_thread_status` - actualiza los slots LCD asignados a Hermes.
-- `set_rgb_config` - envia `v.oai.rgbcfg`.
+  entrega eventos de cambio de particion y de tareas (`task_selected`,
+  `layout_changed`).
+- `set_thread_status` - actualiza los slots LCD asignados al agente.
+- `publish_tasks` - publica una fotografia completa de tarjetas de tarea.
+- `set_display_context` - panel de contexto del Stream Deck +.
 
-ZCode ve las mismas tools que Hermes mas `set_display_context` (panel de
-contexto del Stream Deck +).
+La configuracion RGB es gestionada por el daemon; no existe una tool
+`set_rgb_config` en modo daemon.
 
 Codex conserva todas las tools existentes mas `poll_events`.
 

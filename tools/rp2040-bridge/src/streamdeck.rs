@@ -779,9 +779,15 @@ fn render_usage_image(
 ) -> Result<Vec<u8>, String> {
     let mut image: RgbImage = ImageBuffer::from_pixel(width, height, Rgb([5, 8, 15]));
     let task = context.task.as_deref().unwrap_or("ACTIVE TASK");
+    // The font is ASCII-only, so the agent tag uses plain words.
+    let limits_label = match context.usage_agent.as_deref() {
+        Some("zcode") => "LIMITS ZCODE",
+        Some("codex") => "LIMITS CODEX",
+        _ => "LIMITS",
+    };
     draw_text(
         &mut image,
-        &format!("LIMITS  |  {task}"),
+        &format!("{limits_label}  |  {task}"),
         16,
         6,
         2,
@@ -1732,6 +1738,8 @@ mod tests {
             five_hour_remaining: None,
             weekly_reset_at: None,
             five_hour_reset_at: None,
+            usage_agent: None,
+            agents_usage: None,
             wait_reason: None,
             prompt: None,
             interaction_id: None,

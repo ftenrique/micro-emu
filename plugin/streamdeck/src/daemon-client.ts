@@ -19,6 +19,14 @@ export interface RenderState {
     rgbConfig?: unknown;
 }
 
+/** Usage fields for a single agent, mirroring the Rust `UsageSnapshot`. */
+export interface AgentUsageFields {
+    five_hour_remaining?: number | null;
+    weekly_remaining?: number | null;
+    five_hour_reset_at?: number | null;
+    weekly_reset_at?: number | null;
+}
+
 /** Display context fields, mirroring the Rust `DisplayContext`. */
 export interface DisplayContext {
     project?: string | null;
@@ -32,6 +40,11 @@ export interface DisplayContext {
     five_hour_remaining?: number | null;
     weekly_reset_at?: number | null;
     five_hour_reset_at?: number | null;
+    /** Agent the usage fields belong to ("codex" | "zcode"); bridge-derived. */
+    usage_agent?: string | null;
+    /** Per-agent usage snapshots pushed by the bridge so displays can render
+     * either agent regardless of the globally selected source. */
+    agents_usage?: Record<string, AgentUsageFields | null> | null;
     wait_reason?: string | null;
     prompt?: string | null;
     interaction_id?: string | null;
@@ -191,6 +204,11 @@ export class DaemonClient extends EventEmitter {
     /** Asks the daemon to advance the selected Codex task to the next featured model. */
     sendModelCycle(): void {
         this.send({ type: "event", kind: "model-cycle" });
+    }
+
+    /** Selects which agent's usage limits feed the usage displays. */
+    sendUsageAgent(agent: "codex" | "zcode"): void {
+        this.send({ type: "event", kind: "usage-agent", agent });
     }
 
     /** Sends a raw JSON line to the daemon. */

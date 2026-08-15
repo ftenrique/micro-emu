@@ -91,12 +91,17 @@ const LEGACY_BY_ID = new Map(LEGACY_AGENT_ACTIONS.map((item) => [item.id, item])
 
 export const DEFAULT_ACTION_ID = "micro.act06";
 
+/** Looks up a catalog id (including retired and legacy entries) without
+ * falling back to the default action. */
+export function findCatalogAction(actionId: unknown): ActionCatalogItem | undefined {
+    if (typeof actionId !== "string") return undefined;
+    return ACTIONS_BY_ID.get(actionId) ?? RETIRED_BY_ID.get(actionId) ?? LEGACY_BY_ID.get(actionId);
+}
+
 /** Resolves persisted settings, including the pre-catalog numeric format. */
 export function resolveCatalogAction(actionId: unknown, legacyIndex?: unknown): ActionCatalogItem {
-    if (typeof actionId === "string") {
-        const item = ACTIONS_BY_ID.get(actionId) ?? RETIRED_BY_ID.get(actionId) ?? LEGACY_BY_ID.get(actionId);
-        if (item) return item;
-    }
+    const item = findCatalogAction(actionId);
+    if (item) return item;
     const index = Number(legacyIndex);
     if (Number.isInteger(index) && index >= 0 && index <= 5) {
         return LEGACY_AGENT_ACTIONS[index];

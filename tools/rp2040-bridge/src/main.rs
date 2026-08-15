@@ -4,6 +4,7 @@ mod codex_state;
 mod codex_window;
 mod controller;
 mod daemon;
+mod diaglog;
 mod hermes_state;
 mod hermes_window;
 mod mcp;
@@ -13,6 +14,7 @@ mod routing;
 mod serial;
 mod streamdeck;
 mod tasks;
+mod usage;
 mod wire;
 mod zcode_state;
 mod zcode_window;
@@ -446,6 +448,12 @@ pub struct BridgeRuntime {
     /// data (false). Auto-derived context is overwritten by the next
     /// thstatus update; explicit context persists until the next call.
     pub has_explicit_display_context: bool,
+    /// Agent whose usage limits feed the usage displays. Selected from the
+    /// Stream Deck Context key (usage mode); Codex by default.
+    pub usage_agent: crate::usage::UsageAgent,
+    /// Last fetched usage snapshot per agent, refreshed on the daemon's
+    /// usage tick (see `crate::usage`).
+    pub usage_cache: crate::usage::UsageCache,
     pub firmware: String,
     pub port: String,
     pub codex_decoder: CodexDecoder,
@@ -529,6 +537,8 @@ fn connection_default_context() -> DisplayContext {
         five_hour_remaining: None,
         weekly_reset_at: None,
         five_hour_reset_at: None,
+        usage_agent: None,
+            agents_usage: None,
         wait_reason: None,
         prompt: None,
         interaction_id: None,
@@ -565,12 +575,16 @@ fn display_context_for_controller(
     context: &DisplayContext,
     device_id: &str,
 ) -> DisplayContext {
-    bridge
+    let mut resolved = bridge
         .task_board
         .selected_display_context(device_id)
         .and_then(|value| DisplayContext::from_value(&value).ok())
         .map(|selected| overlay_display_context(context, selected))
-        .unwrap_or_else(|| context.clone())
+        .unwrap_or_else(|| context.clone());
+    // Per-agent snapshots ride along so plugin displays can render codex and
+    // zcode usage side by side, independent of the selected source.
+    resolved.agents_usage = Some(bridge.usage_cache.usage_map());
+    resolved
 }
 
 fn desired_context(bridge: &BridgeRuntime) -> Option<DisplayContext> {
@@ -578,15 +592,20 @@ fn desired_context(bridge: &BridgeRuntime) -> Option<DisplayContext> {
 }
 
 /// Auto-derives a display context from the Codex CLI config and session
-/// files, combined with thstatus slot data and live usage from the
-/// ChatGPT backend API.
+/// files, combined with thstatus slot data and the cached usage snapshot of
+/// the selected usage agent (see [`crate::usage`]). Callers own refreshing
+/// the cache; this only reads it.
 pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
     if bridge.has_explicit_display_context {
         return;
     }
     let (fallback_model, fallback_effort) = read_codex_config();
     let fallback_project = read_latest_codex_session_cwd();
-    let usage = fetch_codex_usage();
+    let usage = bridge
+        .usage_cache
+        .snapshot(bridge.usage_agent)
+        .unwrap_or_default();
+    let usage_agent = Some(bridge.usage_agent.as_str().to_owned());
 
     let selected = bridge.task_board.selected_task().or_else(|| {
         bridge
@@ -615,6 +634,8 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
             five_hour_remaining: usage.five_hour_remaining,
             weekly_reset_at: usage.weekly_reset_at,
             five_hour_reset_at: usage.five_hour_reset_at,
+            usage_agent,
+            agents_usage: None,
             wait_reason: None,
             prompt: None,
             interaction_id: None,
@@ -635,6 +656,8 @@ pub(crate) fn auto_derive_display_context(bridge: &mut BridgeRuntime) {
             five_hour_remaining: usage.five_hour_remaining,
             weekly_reset_at: usage.weekly_reset_at,
             five_hour_reset_at: usage.five_hour_reset_at,
+            usage_agent,
+            agents_usage: None,
             wait_reason: None,
             prompt: None,
             interaction_id: None,
@@ -753,101 +776,6 @@ fn find_latest_session_file(dir: &std::path::Path) -> Option<std::path::PathBuf>
     latest.map(|(p, _)| p)
 }
 
-/// Fetches live Codex usage (5-hour and weekly remaining percentages) from
-/// the ChatGPT backend API, using the auth tokens from `~/.codex/auth.json`.
-/// Returns live 5-hour and weekly usage percentages and reset timestamps.
-#[derive(Clone, Copy, Debug, Default)]
-struct CodexUsage {
-    five_hour_remaining: Option<u8>,
-    weekly_remaining: Option<u8>,
-    five_hour_reset_at: Option<u64>,
-    weekly_reset_at: Option<u64>,
-}
-
-fn fetch_codex_usage() -> CodexUsage {
-    let unavailable = CodexUsage::default();
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
-    let auth_path = std::path::Path::new(&home).join(".codex").join("auth.json");
-    let Ok(auth_content) = std::fs::read_to_string(&auth_path) else {
-        return unavailable;
-    };
-    let Ok(auth) = serde_json::from_str::<Value>(&auth_content) else {
-        return unavailable;
-    };
-    let tokens = match auth.get("tokens") {
-        Some(t) => t,
-        None => return unavailable,
-    };
-    let access_token = tokens.get("access_token").and_then(Value::as_str);
-    let account_id = tokens.get("account_id").and_then(Value::as_str);
-    let (Some(access_token), Some(account_id)) = (access_token, account_id) else {
-        return unavailable;
-    };
-
-    let url = "https://chatgpt.com/backend-api/wham/usage";
-    let response = match ureq::get(url)
-        .set("Authorization", &format!("Bearer {access_token}"))
-        .set("ChatGPT-Account-Id", account_id)
-        .set("User-Agent", "codex-cli")
-        .set("Accept", "application/json")
-        .timeout(std::time::Duration::from_secs(10))
-        .call()
-    {
-        Ok(response) => response,
-        Err(_) => return unavailable,
-    };
-    let body: Value = match response.into_json() {
-        Ok(body) => body,
-        Err(_) => return unavailable,
-    };
-
-    // Parse rate_limit windows. The API may return 5-hour and/or weekly
-    // windows in either primary_window or secondary_window.
-    let rate_limit = match body.get("rate_limit") {
-        Some(rl) => rl,
-        None => return unavailable,
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    let mut usage = CodexUsage::default();
-    for key in &["primary_window", "secondary_window"] {
-        let Some(window) = rate_limit.get(key) else {
-            continue;
-        };
-        let Some(seconds) = window.get("limit_window_seconds").and_then(Value::as_u64) else {
-            continue;
-        };
-        if seconds == 0 {
-            continue;
-        }
-        let Some(used_percent) = window.get("used_percent").and_then(Value::as_f64) else {
-            continue;
-        };
-        let remaining = (100.0 - used_percent).round().clamp(0.0, 100.0) as u8;
-        let reset_at = window
-            .get("reset_at")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                window
-                    .get("reset_after_seconds")
-                    .and_then(Value::as_u64)
-                    .map(|after| now.saturating_add(after))
-            });
-        // <= 24 hours = 5-hour window; >= 3 days = weekly window.
-        if seconds <= 24 * 60 * 60 && usage.five_hour_remaining.is_none() {
-            usage.five_hour_remaining = Some(remaining);
-            usage.five_hour_reset_at = reset_at;
-        } else if seconds >= 3 * 24 * 60 * 60 && usage.weekly_remaining.is_none() {
-            usage.weekly_remaining = Some(remaining);
-            usage.weekly_reset_at = reset_at;
-        }
-    }
-    usage
-}
 /// Computes the display context for a specific controller device, looking
 /// up the selected task on that device rather than the primary controller.
 fn desired_context_for_device(bridge: &BridgeRuntime, device_id: &str) -> Option<DisplayContext> {
@@ -871,6 +799,8 @@ fn overlay_display_context(base: &DisplayContext, selected: DisplayContext) -> D
         five_hour_remaining: selected.five_hour_remaining.or(base.five_hour_remaining),
         weekly_reset_at: selected.weekly_reset_at.or(base.weekly_reset_at),
         five_hour_reset_at: selected.five_hour_reset_at.or(base.five_hour_reset_at),
+        usage_agent: selected.usage_agent.or_else(|| base.usage_agent.clone()),
+        agents_usage: base.agents_usage.clone(),
         wait_reason: selected.wait_reason.or_else(|| base.wait_reason.clone()),
         prompt: selected.prompt.or_else(|| base.prompt.clone()),
         interaction_id: selected.interaction_id.or_else(|| base.interaction_id.clone()),
@@ -1109,6 +1039,8 @@ pub(crate) fn open_runtime(options: &Options) -> Result<BridgeRuntime, String> {
         last_rgb_config: None,
         last_display_context: None,
         has_explicit_display_context: false,
+        usage_agent: crate::usage::UsageAgent::Codex,
+        usage_cache: crate::usage::UsageCache::default(),
         firmware,
         port,
         codex_decoder: CodexDecoder::default(),
@@ -1328,6 +1260,15 @@ fn route_task_button(
                 .pending_task_events
                 .push((task.owner_session, selection));
         }
+        // Auto-fed ZCode cards have no MCP session that could act on the
+        // selection event, so switch the desktop app to the pressed session
+        // directly through UI automation. The request is queued and runs off
+        // the daemon loop.
+        if task.owner_agent == crate::routing::AgentId::ZCode
+            && task.owner_session == crate::daemon::ZCODE_POLL_SESSION
+        {
+            crate::zcode_window::request_session_selection(&task.title);
+        }
     }
 
     if let Some(legacy_key) = task.legacy_key.as_deref() {
@@ -1406,8 +1347,9 @@ fn route_task_toggle(
                 }
             }
             Ok(false) | Err(_) => {
-                // ZCode has no task deep link. Deliver its task-selection event
-                // before raising the window so the connected plugin can apply it.
+                // Select first (the press edge also drives the ZCode desktop
+                // app to the session via UI automation), then raise the window
+                // so the requested task is already active when it arrives.
                 route_task_button(bridge, device_id, slot_count, index, true, Some(&task.task_id), now_ms);
                 route_task_button(bridge, device_id, slot_count, index, false, Some(&task.task_id), now_ms);
                 if let Err(error) = crate::zcode_window::show_and_focus() {
@@ -1442,7 +1384,13 @@ fn catalog_target_session(
         .map(|task| task.owner_agent)
         .unwrap_or(crate::routing::AgentId::Codex);
     let session = match task.map(|task| task.owner_session) {
-        Some(session) if session != 0 && session != crate::daemon::ZCODE_POLL_SESSION => session,
+        Some(session)
+            if session != 0
+                && session != crate::daemon::ZCODE_POLL_SESSION
+                && session != crate::daemon::HERMES_POLL_SESSION =>
+        {
+            session
+        }
         _ => crate::daemon::catalog_action_session(agent),
     };
     (session, agent)
@@ -1543,6 +1491,48 @@ fn route_catalog_action(
     ));
 }
 
+/// Applies a usage-source selection from the Stream Deck plugin: switches
+/// the reported agent, fetches its snapshot when stale, and recomposes the
+/// display context so keys and strips update immediately.
+fn route_usage_select(bridge: &mut BridgeRuntime, agent: crate::usage::UsageAgent) {
+    let selection_changed = bridge.usage_agent != agent;
+    bridge.usage_agent = agent;
+    if selection_changed
+        || !bridge
+            .usage_cache
+            .refreshed_within(agent, crate::usage::USAGE_REFRESH_INTERVAL)
+    {
+        let snapshot = crate::usage::fetch_usage(agent);
+        bridge.usage_cache.store(agent, snapshot);
+    }
+    crate::auto_derive_display_context(bridge);
+    patch_display_context_usage(bridge);
+    let _ = refresh_task_board(bridge);
+}
+
+/// Rewrites the usage fields of an explicit `set_display_context` push with
+/// the selected agent's snapshot. Usage reporting is bridge-owned: an agent
+/// pushing its own limits must not pin a different agent's numbers to the
+/// strip after the user switches source. A failed fetch clears the fields
+/// (showing "not published") rather than leaving stale wrong-agent data.
+pub(crate) fn patch_display_context_usage(bridge: &mut BridgeRuntime) {
+    if !bridge.has_explicit_display_context {
+        return; // auto-derived contexts pick the snapshot up themselves
+    }
+    let Some(context) = bridge.last_display_context.as_mut() else {
+        return;
+    };
+    let snapshot = bridge
+        .usage_cache
+        .snapshot(bridge.usage_agent)
+        .unwrap_or_default();
+    context.weekly_remaining = snapshot.weekly_remaining;
+    context.five_hour_remaining = snapshot.five_hour_remaining;
+    context.weekly_reset_at = snapshot.weekly_reset_at;
+    context.five_hour_reset_at = snapshot.five_hour_reset_at;
+    context.usage_agent = Some(bridge.usage_agent.as_str().to_owned());
+}
+
 fn route_model_cycle(bridge: &mut BridgeRuntime) {
     let task = bridge.task_board.selected_task().cloned();
     if let Some(task) = task
@@ -1606,6 +1596,10 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
                 }
                 if matches!(&event, crate::codex::PhysicalEvent::ModelCycle) {
                     route_model_cycle(bridge);
+                    continue;
+                }
+                if let crate::codex::PhysicalEvent::UsageSelect { agent } = event.clone() {
+                    route_usage_select(bridge, agent);
                     continue;
                 }
                 if let crate::codex::PhysicalEvent::TaskAction { index, gesture, task_id } = event.clone() {
@@ -1747,6 +1741,10 @@ fn route_task_device_events(
         }
         if matches!(&event, crate::codex::PhysicalEvent::ModelCycle) {
             route_model_cycle(bridge);
+            continue;
+        }
+        if let crate::codex::PhysicalEvent::UsageSelect { agent } = event.clone() {
+            route_usage_select(bridge, agent);
             continue;
         }
         if let crate::codex::PhysicalEvent::TaskToggle { index, task_id } = event.clone() {
@@ -1939,10 +1937,15 @@ pub(crate) fn call_send_codex_message(bridge: &mut BridgeRuntime, arguments: &Va
 
 /// Helper for the daemon: set_display_context tool.
 pub(crate) fn call_set_display_context(bridge: &mut BridgeRuntime, arguments: &Value) -> Value {
-    let context = match DisplayContext::from_value(arguments) {
+    let mut context = match DisplayContext::from_value(arguments) {
         Ok(context) => context,
         Err(error) => return mcp::tool_error(error),
     };
+    // Usage fields pushed by an agent still describe the agent the bridge
+    // is reporting on; keep the strip's source label consistent.
+    if context.weekly_remaining.is_some() || context.five_hour_remaining.is_some() {
+        context.usage_agent = Some(bridge.usage_agent.as_str().to_owned());
+    }
     bridge.last_display_context = Some(context.clone());
     bridge.has_explicit_display_context = true;
 
@@ -2201,7 +2204,7 @@ fn handle_mcp_request(request: Value, bridge: &mut BridgeRuntime) -> Result<(), 
         "initialize" => json!({
             "protocolVersion": mcp::PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": "micro-emu-rp2040-bridge", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {"name": "micro-emu-bridge", "version": env!("CARGO_PKG_VERSION")},
             "instructions": format!(
                 "Use bridge_status first. The colored numbered LCD cards and READY dashboard are standby indicators until you publish live state. Publish task cards with set_thread_status or publish_tasks. {} Hardware actions target the RP2040 on the configured serial port.",
                 mcp::DISPLAY_CONTEXT_INSTRUCTIONS
@@ -2492,6 +2495,8 @@ mod tests {
             last_rgb_config: None,
             last_display_context: None,
             has_explicit_display_context: false,
+            usage_agent: crate::usage::UsageAgent::Codex,
+            usage_cache: crate::usage::UsageCache::default(),
             firmware: "test".to_owned(),
             port: "none".to_owned(),
             codex_decoder: CodexDecoder::default(),
@@ -2508,6 +2513,71 @@ mod tests {
             task_slot_count: crate::tasks::CODEX_TASK_SLOTS,
             pending_task_events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn usage_selection_feeds_display_context() {
+        let rendered = Arc::new(Mutex::new(None));
+        let mut bridge = test_bridge(rendered);
+        let snapshot = crate::usage::UsageSnapshot {
+            five_hour_remaining: Some(62),
+            weekly_remaining: Some(98),
+            five_hour_reset_at: Some(1_786_726_948),
+            weekly_reset_at: Some(1_787_506_025),
+        };
+        // Seed a fresh cache so the selection path performs no network fetch.
+        bridge
+            .usage_cache
+            .store(crate::usage::UsageAgent::ZCode, snapshot);
+        bridge.usage_agent = crate::usage::UsageAgent::ZCode;
+        auto_derive_display_context(&mut bridge);
+        let context = bridge.last_display_context.clone().unwrap();
+        assert_eq!(context.five_hour_remaining, Some(62));
+        assert_eq!(context.weekly_remaining, Some(98));
+        assert_eq!(context.five_hour_reset_at, Some(1_786_726_948));
+        assert_eq!(context.usage_agent.as_deref(), Some("zcode"));
+    }
+
+    #[test]
+    fn usage_selection_overrides_explicit_context() {
+        let rendered = Arc::new(Mutex::new(None));
+        let mut bridge = test_bridge(rendered);
+        let snapshot = crate::usage::UsageSnapshot {
+            five_hour_remaining: Some(62),
+            weekly_remaining: Some(98),
+            ..crate::usage::UsageSnapshot::default()
+        };
+        bridge
+            .usage_cache
+            .store(crate::usage::UsageAgent::ZCode, snapshot);
+        // An agent pushed its own explicit context with codex-flavored usage.
+        call_set_display_context(
+            &mut bridge,
+            &json!({"project": "micro-emu", "five_hour_remaining": 11, "weekly_remaining": 22}),
+        );
+        assert!(bridge.has_explicit_display_context);
+        let context = bridge.last_display_context.clone().unwrap();
+        assert_eq!(context.five_hour_remaining, Some(11));
+        // The user selects zcode: the explicit context's usage fields are
+        // rewritten with the bridge-owned snapshot.
+        bridge.usage_agent = crate::usage::UsageAgent::ZCode;
+        patch_display_context_usage(&mut bridge);
+        let context = bridge.last_display_context.clone().unwrap();
+        assert_eq!(context.five_hour_remaining, Some(62));
+        assert_eq!(context.weekly_remaining, Some(98));
+        assert_eq!(context.usage_agent.as_deref(), Some("zcode"));
+        assert_eq!(context.project.as_deref(), Some("micro-emu"));
+        // Auto-derived contexts are left to auto_derive instead.
+        bridge.has_explicit_display_context = false;
+        patch_display_context_usage(&mut bridge);
+        assert_eq!(
+            bridge
+                .last_display_context
+                .clone()
+                .unwrap()
+                .five_hour_remaining,
+            Some(62)
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ test("Context is a Keypad action with fixed task/model/usage modes", () => {
 test("Context actions dispatch task search/model cycle and toggle usage reset details", () => {
   assert.match(action, /mode === "usage"/);
   assert.match(action, /showResetTimes\.set/);
-  assert.match(action, /renderContextKeyImage\(mode, this\.ctx\.getSelectedDisplayContext\(\), this\.ctx\.isConnected\(\),/);
+  assert.match(action, /renderContextKeyImage\(mode, ctx, this\.ctx\.isConnected\(\),/);
   assert.match(action, /sendCatalogAction\("agent\.search"\)/);
   assert.match(action, /sendModelCycle\(\)/);
   assert.match(action, /value === "model" \|\| value === "usage"/);

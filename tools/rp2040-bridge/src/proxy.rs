@@ -1,5 +1,5 @@
-//! STDIO-to-TCP proxy: each agent (Codex CLI, Hermes Desktop) launches a
-//! proxy as its MCP stdio server. The proxy connects to the daemon over TCP
+//! STDIO-to-TCP proxy: each agent (Codex CLI, ZCode, Hermes Desktop) launches
+//! a proxy as its MCP stdio server. The proxy connects to the daemon over TCP
 //! loopback, sends a hello line identifying the agent, and pumps lines
 //! bidirectionally. With `--autostart` it spawns the daemon if it is not
 //! already running.

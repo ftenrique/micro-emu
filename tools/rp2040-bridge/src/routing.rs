@@ -124,10 +124,11 @@ impl Partition {
 
     /// Computes the partition for the given active set.
     ///
-    /// Codex always owns the fixed first half (keys 0-2 / slots 1-3).
-    /// ZCode has priority for the fixed second half (keys 3-5 / slots 4-6);
-    /// Hermes uses that same second half only while ZCode is absent. Unused
-    /// halves remain unowned so presses are dropped and cards render off.
+    /// Codex always owns the fixed first half (keys AG00-AG02 / slots 0-2).
+    /// ZCode has priority for the fixed second half (keys AG03-AG05 /
+    /// slots 3-5); Hermes uses that same second half only while ZCode is
+    /// absent. Unused halves remain unowned so presses are dropped and cards
+    /// render off.
     pub fn compute(active: ActiveSet) -> Self {
         let mut owners = [None; LCD_SLOTS];
 

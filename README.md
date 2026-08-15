@@ -52,7 +52,7 @@ For a distributable plugin package, run `npm run plugin:pack`; it writes a `.str
 | Action Button | Choose a direct Micro control, daemon task-navigation command, or extended agent workflow action |
 | Task Card | Render an assigned task; tap to select, or hold to show/minimize Codex |
 | Knob | Codex Micro encoder turn and press |
-| Crux Horizontal / Vertical | Radial controls with assignable dial presses; tap the horizontal strip to cycle Sol, Terra, and Luna |
+| Crux Horizontal / Vertical | Radial controls whose dial press picks any Action Button catalog action (default: native encoder press); tap the horizontal strip to cycle Sol, Terra, and Luna |
 | Mic / Send | `ACT10` microphone and `ACT12` send controls |
 | Arrow Key | Keypad-only directional or virtual-rotor control |
 
@@ -112,11 +112,11 @@ args = ["--mcp-proxy", "--agent", "codex", "--autostart"]
 cwd = "D:\\Programming\\micro-emu"
 ```
 
-The proxy starts or attaches to the loopback-only daemon. Key tools include `bridge_status`, `poll_events`, `publish_tasks`, `set_thread_status`, `set_display_context`, and `set_rgb_config`. Hardware-specific commands are unavailable when the daemon runs in standalone mode (`--port none`).
+The proxy starts or attaches to the loopback-only daemon. Key tools include `bridge_status`, `poll_events`, `publish_tasks`, `set_thread_status`, and `set_display_context`. RGB configuration is daemon-managed (there is no `set_rgb_config` tool in daemon mode; it only exists in legacy single-agent `--mcp` mode). Hardware-specific commands are unavailable when the daemon runs in standalone mode (`--port none`).
 
 ## Multi-controller task board
 
-The daemon combines task slots across active controllers and assigns published tasks using stable IDs. An AKP03E supplies six physical slots; Stream Deck + and XL controllers expose nine logical task slots by default, with any hardware-only tail remaining disabled. It also supports dynamic key and LCD-slot partitioning for Codex, ZCode, and Hermes sessions.
+The daemon combines task slots across active controllers and assigns published tasks using stable IDs. An AKP03E supplies six physical slots; direct-HID Stream Deck + and XL controllers expose eight logical task slots by default (nine when driven through the Stream Deck plugin), with any hardware-only tail remaining disabled. It also supports fixed-half key and LCD-slot partitioning for Codex, ZCode, and Hermes sessions.
 
 See [the multi-agent guide](docs/multi-agent-coexistence.md) for the session and partitioning model.
 

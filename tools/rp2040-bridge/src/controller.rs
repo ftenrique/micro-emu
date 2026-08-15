@@ -14,6 +14,12 @@ pub struct DisplayContext {
     pub five_hour_remaining: Option<u8>,
     pub weekly_reset_at: Option<u64>,
     pub five_hour_reset_at: Option<u64>,
+    /// Which agent the usage fields above belong to ("codex" or "zcode").
+    /// Bridge-derived only: `set_display_context` does not accept it.
+    pub usage_agent: Option<String>,
+    /// Per-agent usage snapshots ({"codex": {...}, "zcode": {...}}) so
+    /// plugin displays can show both agents at once. Bridge-derived only.
+    pub agents_usage: Option<Value>,
     pub wait_reason: Option<String>,
     pub prompt: Option<String>,
     pub interaction_id: Option<String>,
@@ -28,6 +34,11 @@ impl DisplayContext {
             .as_object()
             .ok_or_else(|| "display context must be an object".to_owned())?;
         for key in object.keys() {
+            // Bridge-derived labels; accepted so callers forwarding a context
+            // back are not rejected, but never read from agent input.
+            if matches!(key.as_str(), "usage_agent" | "agents_usage") {
+                continue;
+            }
             if !matches!(
                 key.as_str(),
                 "project"
@@ -141,6 +152,8 @@ impl DisplayContext {
             five_hour_remaining,
             weekly_reset_at,
             five_hour_reset_at,
+            usage_agent: None,
+            agents_usage: None,
             wait_reason: string_field(object, "wait_reason")?,
             prompt: string_field(object, "prompt")?,
             interaction_id: string_field(object, "interaction_id")?,
@@ -163,6 +176,8 @@ impl DisplayContext {
             "five_hour_remaining": self.five_hour_remaining,
             "weekly_reset_at": self.weekly_reset_at,
             "five_hour_reset_at": self.five_hour_reset_at,
+            "usage_agent": self.usage_agent,
+            "agents_usage": self.agents_usage,
             "wait_reason": self.wait_reason,
             "prompt": self.prompt,
             "interaction_id": self.interaction_id,
@@ -347,5 +362,28 @@ mod tests {
         assert_eq!(context.to_value()["model"], "gpt-5");
         assert!(DisplayContext::from_value(&serde_json::json!({"progress": 101})).is_err());
         assert_eq!(DisplayContext::from_value(&serde_json::json!({"prompt": "secret"})).unwrap().prompt.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn usage_agent_is_bridge_derived_only() {
+        // set_display_context cannot set it...
+        let context = DisplayContext::from_value(&serde_json::json!({
+            "usage_agent": "zcode",
+            "agents_usage": {"zcode": {"five_hour_remaining": 1}}
+        }))
+        .unwrap();
+        assert_eq!(context.usage_agent, None);
+        assert!(context.agents_usage.is_none());
+        // ...but the bridge serializes it for the plugin and strip renderers.
+        let context = DisplayContext {
+            usage_agent: Some("zcode".to_owned()),
+            agents_usage: Some(serde_json::json!({"zcode": {"five_hour_remaining": 1}})),
+            ..DisplayContext::default()
+        };
+        assert_eq!(context.to_value()["usage_agent"], "zcode");
+        assert_eq!(
+            context.to_value()["agents_usage"]["zcode"]["five_hour_remaining"],
+            1
+        );
     }
 }
