@@ -46,7 +46,8 @@ Navigation wraps across occupied Task Cards and never emits a Micro key.
 
 ### Codex workflow
 
-- agent.new-task: open the new-task screen
+- agent.new-task: start a new task while the ZCode or Hermes desktop app is
+  the foreground window; otherwise open the Codex new-task screen
 - agent.search: focus Codex and open task search
 - agent.review-changes: start an inline review of uncommitted changes
 - agent.run-tests: start a turn that runs and diagnoses relevant tests

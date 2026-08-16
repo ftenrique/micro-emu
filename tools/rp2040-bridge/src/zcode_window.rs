@@ -15,6 +15,10 @@ mod native {
 
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const GWL_EXSTYLE: i32 = -20;
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const VK_LWIN: u8 = 0x5B;
+    const VK_H: u8 = 0x48;
+    const VK_ESCAPE: u8 = 0x1B;
     const WS_EX_TOOLWINDOW: i32 = 0x0000_0080;
     const SW_MINIMIZE: i32 = 6;
     const SW_RESTORE: i32 = 9;
@@ -30,6 +34,7 @@ mod native {
     const RELAUNCH_FOCUS_TIMEOUT_MS: u64 = 4_000;
 
     const SELECT_SESSION_SCRIPT: &str = include_str!("select_zcode_session.ps1");
+    const NEW_TASK_SCRIPT: &str = include_str!("new_zcode_task.ps1");
 
     #[repr(C)]
     #[derive(Default)]
@@ -47,6 +52,7 @@ mod native {
             lparam: Lparam,
         ) -> Bool;
         fn GetForegroundWindow() -> Hwnd;
+        fn keybd_event(virtual_key: u8, scan_code: u8, flags: u32, extra_info: usize);
         fn GetWindowThreadProcessId(window: Hwnd, process_id: *mut u32) -> u32;
         fn GetWindowLongW(window: Hwnd, index: i32) -> i32;
         fn GetWindowRect(window: Hwnd, rect: *mut Rect) -> Bool;
@@ -86,16 +92,37 @@ mod native {
         score: u64,
     }
 
-    /// Latest-wins queue feeding the single session-selection worker. UIA can
+    /// One queued ZCode sidebar automation request.
+    enum AutomationRequest {
+        /// Switch the desktop app to the session with this title.
+        SelectSession(String),
+        /// Click the sidebar's project-neutral New task button.
+        NewTask,
+    }
+
+    impl AutomationRequest {
+        fn describe(&self) -> String {
+            match self {
+                Self::SelectSession(title) => format!("session selection for {title:?}"),
+                Self::NewTask => "new task creation".to_owned(),
+            }
+        }
+    }
+
+    /// Latest-wins queue feeding the single sidebar-automation worker. UIA can
     /// take seconds per request, so the daemon loop never blocks on it and a
     /// burst of presses collapses into the most recent request.
-    struct SelectionQueue {
-        pending: Mutex<Option<String>>,
+    struct AutomationQueue {
+        pending: Mutex<Option<AutomationRequest>>,
         signaled: Condvar,
         started: std::sync::atomic::AtomicBool,
     }
 
-    static SELECTION_QUEUE: OnceLock<SelectionQueue> = OnceLock::new();
+    static AUTOMATION_QUEUE: OnceLock<AutomationQueue> = OnceLock::new();
+
+    /// Whether the last press opened the Windows dictation bar in ZCode.
+    static DICTATION_ACTIVE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     pub fn is_foreground() -> Result<bool, String> {
         let target = find_zcode_window()?;
@@ -106,6 +133,40 @@ mod native {
     /// uses this to keep the ZCode task feed alive across MCP proxy blips.
     pub fn desktop_running() -> bool {
         find_zcode_window().is_ok()
+    }
+
+    /// True between a handled press and its release, so the release reaches
+    /// `set_microphone` even if the dictation bar itself took the foreground
+    /// or the user switched windows while holding the key.
+    pub fn microphone_active() -> bool {
+        DICTATION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// ZCode has no voice input of its own. A press opens Windows dictation
+    /// (Win+H), which transcribes into ZCode's focused composer; the release
+    /// closes the dictation bar with Escape, mirroring the Codex action's
+    /// hold-to-talk semantics. The caller has already verified that ZCode is
+    /// the foreground window; the press re-checks because the chord must
+    /// never land in another app.
+    pub fn set_microphone(pressed: bool) -> Result<(), String> {
+        if pressed {
+            let target = find_zcode_window()?;
+            if unsafe { GetForegroundWindow() } != target {
+                DICTATION_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err("the ZCode window is no longer focused".to_owned());
+            }
+            unsafe {
+                key_down(VK_LWIN);
+                tap_key(VK_H);
+                key_up(VK_LWIN);
+            }
+            DICTATION_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+        } else if DICTATION_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            unsafe {
+                tap_key(VK_ESCAPE);
+            }
+        }
+        Ok(())
     }
 
     pub fn minimize() -> Result<(), String> {
@@ -180,6 +241,21 @@ mod native {
         Ok(())
     }
 
+    unsafe fn key_down(key: u8) {
+        unsafe { keybd_event(key, 0, 0, 0) };
+    }
+
+    unsafe fn key_up(key: u8) {
+        unsafe { keybd_event(key, 0, KEYEVENTF_KEYUP, 0) };
+    }
+
+    unsafe fn tap_key(key: u8) {
+        unsafe {
+            key_down(key);
+            key_up(key);
+        }
+    }
+
     fn relaunch_and_wait_for_focus(target: Hwnd, exe: String) {
         let spawned = Command::new(&exe)
             .creation_flags(CREATE_NO_WINDOW)
@@ -191,8 +267,8 @@ mod native {
             eprintln!("ZCode focus relaunch failed: {error}");
             return;
         }
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(RELAUNCH_FOCUS_TIMEOUT_MS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(RELAUNCH_FOCUS_TIMEOUT_MS);
         while std::time::Instant::now() < deadline {
             if unsafe { GetForegroundWindow() } == target {
                 return;
@@ -209,7 +285,18 @@ mod native {
         if title.trim().is_empty() {
             return;
         }
-        let queue: &'static SelectionQueue = SELECTION_QUEUE.get_or_init(|| SelectionQueue {
+        queue_request(AutomationRequest::SelectSession(title.trim().to_owned()));
+    }
+
+    /// Asks the running ZCode desktop app to start a new task by clicking
+    /// the sidebar's New task button. Returns as soon as the request is
+    /// queued; the UIA work happens on a worker thread.
+    pub fn request_new_task() {
+        queue_request(AutomationRequest::NewTask);
+    }
+
+    fn queue_request(request: AutomationRequest) {
+        let queue: &'static AutomationQueue = AUTOMATION_QUEUE.get_or_init(|| AutomationQueue {
             pending: Mutex::new(None),
             signaled: Condvar::new(),
             started: std::sync::atomic::AtomicBool::new(false),
@@ -219,22 +306,22 @@ mod native {
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             let _ = std::thread::Builder::new()
-                .name("zcode-session-select".to_owned())
+                .name("zcode-sidebar-automation".to_owned())
                 .spawn(move || loop {
-                    let title = {
+                    let request = {
                         let mut guard = queue
                             .pending
                             .lock()
-                            .expect("zcode selection queue lock poisoned");
+                            .expect("zcode automation queue lock poisoned");
                         while guard.is_none() {
                             guard = queue
                                 .signaled
                                 .wait(guard)
-                                .expect("zcode selection queue lock poisoned");
+                                .expect("zcode automation queue lock poisoned");
                         }
                         guard.take()
                     };
-                    if let Some(title) = title {
+                    if let Some(request) = request {
                         // A cold Chromium accessibility tree can outlive the
                         // script's own warm-up window, especially right after
                         // ZCode starts. Retry a bounded number of times so a
@@ -242,18 +329,20 @@ mod native {
                         // the tree still materializing.
                         const MAX_ATTEMPTS: u8 = 3;
                         for attempt in 1..=MAX_ATTEMPTS {
-                            match select_session_sync(&title) {
+                            match run_request(&request) {
                                 Ok(()) => {
                                     if attempt > 1 {
                                         crate::diaglog::log(&format!(
-                                            "zcode session selection for {title:?} succeeded on attempt {attempt}"
+                                            "zcode {} succeeded on attempt {attempt}",
+                                            request.describe()
                                         ));
                                     }
                                     break;
                                 }
                                 Err(error) if attempt < MAX_ATTEMPTS => {
                                     eprintln!(
-                                        "ZCode session selection failed (attempt {attempt}/{MAX_ATTEMPTS}): {error}"
+                                        "ZCode {} failed (attempt {attempt}/{MAX_ATTEMPTS}): {error}",
+                                        request.describe()
                                     );
                                     std::thread::sleep(std::time::Duration::from_millis(
                                         u64::from(attempt) * 4_000,
@@ -269,9 +358,10 @@ mod native {
                                     }
                                 }
                                 Err(error) => {
-                                    eprintln!("ZCode session selection failed: {error}");
+                                    eprintln!("ZCode {} failed: {error}", request.describe());
                                     crate::diaglog::log(&format!(
-                                        "zcode session selection for {title:?} failed after {MAX_ATTEMPTS} attempts: {error}"
+                                        "zcode {} failed after {MAX_ATTEMPTS} attempts: {error}",
+                                        request.describe()
                                     ));
                                 }
                             }
@@ -282,13 +372,30 @@ mod native {
         let mut pending = queue
             .pending
             .lock()
-            .expect("zcode selection queue lock poisoned");
-        *pending = Some(title.to_owned());
+            .expect("zcode automation queue lock poisoned");
+        *pending = Some(request);
         queue.signaled.notify_one();
     }
 
-    fn select_session_sync(title: &str) -> Result<(), String> {
+    fn run_request(request: &AutomationRequest) -> Result<(), String> {
         let window = find_zcode_window()?;
+        let script = match request {
+            AutomationRequest::SelectSession(title) => format!(
+                "$WindowHandle = {window}\n$TargetTitle = '{}'\n{SELECT_SESSION_SCRIPT}",
+                escape_powershell_single_quoted(title)
+            ),
+            AutomationRequest::NewTask => {
+                format!("$WindowHandle = {window}\n{NEW_TASK_SCRIPT}")
+            }
+        };
+        let success_marker = match request {
+            AutomationRequest::SelectSession(_) => "selected",
+            AutomationRequest::NewTask => "created",
+        };
+        run_automation(&script, success_marker)
+    }
+
+    fn run_automation(script: &str, success_marker: &str) -> Result<(), String> {
         let mut child = Command::new("powershell.exe")
             .args([
                 "-NoProfile",
@@ -303,35 +410,28 @@ mod native {
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
-            .map_err(|error| format!("could not start ZCode session automation: {error}"))?;
+            .map_err(|error| format!("could not start ZCode sidebar automation: {error}"))?;
 
-        let script = format!(
-            "$WindowHandle = {window}\n$TargetTitle = '{}'\n{SELECT_SESSION_SCRIPT}",
-            escape_powershell_single_quoted(title)
-        );
         child
             .stdin
             .take()
-            .ok_or_else(|| "could not open ZCode session automation input".to_owned())?
+            .ok_or_else(|| "could not open ZCode sidebar automation input".to_owned())?
             .write_all(script.as_bytes())
-            .map_err(|error| format!("could not send ZCode session automation: {error}"))?;
+            .map_err(|error| format!("could not send ZCode sidebar automation: {error}"))?;
 
         let output = child
             .wait_with_output()
-            .map_err(|error| format!("ZCode session automation did not finish: {error}"))?;
+            .map_err(|error| format!("ZCode sidebar automation did not finish: {error}"))?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "ZCode session automation failed: {}",
-                error.trim()
-            ));
+            return Err(format!("ZCode sidebar automation failed: {}", error.trim()));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.lines().any(|line| line.trim() == "selected") {
+        if stdout.lines().any(|line| line.trim() == success_marker) {
             Ok(())
         } else {
             Err(format!(
-                "ZCode session automation returned an unexpected result: {}",
+                "ZCode sidebar automation returned an unexpected result: {}",
                 stdout.trim()
             ))
         }
@@ -431,7 +531,10 @@ mod native {
 
         #[test]
         fn escapes_single_quotes_for_powershell_literals() {
-            assert_eq!(escape_powershell_single_quoted("plain title"), "plain title");
+            assert_eq!(
+                escape_powershell_single_quoted("plain title"),
+                "plain title"
+            );
             assert_eq!(
                 escape_powershell_single_quoted("it's a task's title"),
                 "it''s a task''s title"
@@ -441,7 +544,10 @@ mod native {
 }
 
 #[cfg(windows)]
-pub use native::{desktop_running, is_foreground, minimize, request_session_selection, show_and_focus};
+pub use native::{
+    desktop_running, is_foreground, microphone_active, minimize, request_new_task,
+    request_session_selection, set_microphone, show_and_focus,
+};
 
 #[cfg(not(windows))]
 pub fn is_foreground() -> Result<bool, String> {
@@ -460,6 +566,19 @@ pub fn show_and_focus() -> Result<(), String> {
 
 #[cfg(not(windows))]
 pub fn request_session_selection(_title: &str) {}
+
+#[cfg(not(windows))]
+pub fn request_new_task() {}
+
+#[cfg(not(windows))]
+pub fn microphone_active() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn set_microphone(_pressed: bool) -> Result<(), String> {
+    Err("ZCode window control is only available on Windows".to_owned())
+}
 
 #[cfg(not(windows))]
 pub fn desktop_running() -> bool {

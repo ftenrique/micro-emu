@@ -153,9 +153,9 @@ fn read_codex_snapshot_from(
         logs_dir
             .and_then(|logs| refresh_focused_task(&mut cache.focus, logs))
             .filter(|selected| {
-                tasks.iter().any(|task| {
-                    task.get("task_id").and_then(Value::as_str) == Some(selected)
-                })
+                tasks
+                    .iter()
+                    .any(|task| task.get("task_id").and_then(Value::as_str) == Some(selected))
             })
     };
     Some(json!({

@@ -8,9 +8,6 @@ trap {
 if ($null -eq $WindowHandle) {
     throw "ZCode window handle was not supplied"
 }
-if ($null -eq $TargetTitle -or [string]::IsNullOrWhiteSpace($TargetTitle)) {
-    throw "ZCode session title was not supplied"
-}
 
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -35,7 +32,7 @@ Add-Type -TypeDefinition $msaaTap
 $descendants = [System.Windows.Automation.TreeScope]::Descendants
 $allElements = [System.Windows.Automation.Condition]::TrueCondition
 $invokePatternId = [System.Windows.Automation.InvokePattern]::Pattern
-$selectionPatternId = [System.Windows.Automation.SelectionItemPattern]::Pattern
+$controlView = [System.Windows.Automation.TreeWalker]::ControlViewWalker
 
 function Invoke-AccessibilityPoke {
     param([IntPtr]$Window)
@@ -82,16 +79,23 @@ function Find-Element {
     return $null
 }
 
-# Session rows expose "<title><relative time>" as their accessible name (for
-# example "Refactor auth4h"), so a prefix match also distinguishes rows whose
-# titles are prefixes of each other.
-function Find-SessionItem {
+# The sidebar exposes several "New task" buttons: every project row carries
+# one, and the Tasks section has its own. Only the section-level button starts
+# a project-neutral task, so it is identified structurally: it is the "New
+# task" button whose control-view parent is the group named "Tasks".
+function Find-NewTaskButton {
     param([System.Windows.Automation.AutomationElement]$SearchRoot)
 
     return Find-Element $SearchRoot {
         param($element)
-        $element.Current.ControlType -eq [System.Windows.Automation.ControlType]::ListItem -and
-            $element.Current.Name.StartsWith($TargetTitle, [System.StringComparison]::Ordinal)
+        if ($element.Current.ControlType -ne [System.Windows.Automation.ControlType]::Button) {
+            return $false
+        }
+        if ($element.Current.Name -ne "New task") {
+            return $false
+        }
+        $parent = $controlView.GetParent($element)
+        return $null -ne $parent -and $parent.Current.Name -eq "Tasks"
     }
 }
 
@@ -105,27 +109,12 @@ function Find-ToggleSidebar {
     }
 }
 
-function Find-ShowMore {
-    param([System.Windows.Automation.AutomationElement]$SearchRoot)
-
-    return Find-Element $SearchRoot {
-        param($element)
-        $element.Current.ControlType -eq [System.Windows.Automation.ControlType]::ListItem -and
-            $element.Current.Name -eq "Show more"
-    }
-}
-
 function Invoke-Element {
     param([System.Windows.Automation.AutomationElement]$Element)
 
     $invokePattern = Get-Pattern $Element $invokePatternId
     if ($null -ne $invokePattern) {
         $invokePattern.Invoke()
-        return $true
-    }
-    $selectionPattern = Get-Pattern $Element $selectionPatternId
-    if ($null -ne $selectionPattern) {
-        $selectionPattern.Select()
         return $true
     }
     return $false
@@ -153,81 +142,55 @@ if ($null -eq $root) {
     throw "ZCode window is not available to Windows UI Automation"
 }
 
-# Keep polling until the session list materializes. A ZCode that has been
-# running for a while without any automation client tears its accessibility
-# tree down, and rebuilding it for a large conversation can take many seconds,
-# so the budget here is deliberately generous.
-$sessionItem = $null
+# Keep polling until the button materializes. A ZCode that has been running
+# for a while without any automation client tears its accessibility tree
+# down, and rebuilding it can take many seconds, so the budget is generous.
+# The sidebar toggle bounds the wait: once it is visible the tree is warm,
+# so a still-missing button means the sidebar is collapsed rather than the
+# tree being cold.
+$newTaskButton = $null
 $warmup = [System.Diagnostics.Stopwatch]::StartNew()
-while ($null -eq $sessionItem) {
-    $sessionItem = Find-SessionItem $root
-    if ($null -ne $sessionItem) {
+while ($null -eq $newTaskButton) {
+    $newTaskButton = Find-NewTaskButton $root
+    if ($null -ne $newTaskButton) {
         break
     }
     if ($warmup.ElapsedMilliseconds -ge 20000) {
+        break
+    }
+    if ($warmup.ElapsedMilliseconds -ge 1500 -and $null -ne (Find-ToggleSidebar $root)) {
         break
     }
     Invoke-AccessibilityPoke ([IntPtr]$WindowHandle)
     Start-Sleep -Milliseconds 250
 }
 
-# The session list lives in the collapsible sidebar. When the user keeps it
-# collapsed the rows are not rendered at all, so open it for the selection
-# and restore the collapsed state afterwards.
+# The Tasks section lives in the collapsible sidebar. When the user keeps it
+# collapsed the button is not rendered at all, so open it for the click and
+# restore the collapsed state afterwards.
 $sidebarOpened = $false
-if ($null -eq $sessionItem) {
+if ($null -eq $newTaskButton) {
     $toggle = Find-ToggleSidebar $root
     if ($null -eq $toggle) {
-        throw "Could not find a ZCode session titled '$TargetTitle'"
+        throw "Could not find the ZCode new task button"
     }
     if (-not (Invoke-Element $toggle)) {
         throw "The ZCode sidebar toggle has no invoke pattern"
     }
     $sidebarOpened = $true
-    $sessionItem = Wait-For { Find-SessionItem $root } 4000
-    if ($null -eq $sessionItem) {
-        # Older sessions are hidden behind a Show more expander.
-        $showMore = Find-ShowMore $root
-        if ($null -ne $showMore) {
-            $null = Invoke-Element $showMore
-            $sessionItem = Wait-For { Find-SessionItem $root } 4000
-        }
-    }
-    if ($null -eq $sessionItem) {
+    $newTaskButton = Wait-For { Find-NewTaskButton $root } 4000
+    if ($null -eq $newTaskButton) {
         # Undo the sidebar toggle so the user's layout is left unchanged.
         $undo = Find-ToggleSidebar $root
         if ($null -ne $undo) {
             $null = Invoke-Element $undo
         }
-        throw "Could not find a ZCode session titled '$TargetTitle'"
+        throw "Could not find the ZCode new task button"
     }
 }
 
-if (-not (Invoke-Element $sessionItem)) {
-    throw "The ZCode session row for '$TargetTitle' has no invoke or selection pattern"
-}
-
-# Confirm the app actually activated the session: while it is merely listed,
-# the exact title appears once (the sidebar row); once active it also appears
-# as the conversation header. Waiting here keeps racing observers (and users)
-# from turning a slow switch into a false negative.
-$activated = $false
-$timer = [System.Diagnostics.Stopwatch]::StartNew()
-while ($timer.ElapsedMilliseconds -lt 5000) {
-    $exact = 0
-    $elements = $root.FindAll($descendants, $allElements)
-    for ($index = 0; $index -lt $elements.Count; $index++) {
-        $element = $elements.Item($index)
-        if ($element.Current.ControlType -eq [System.Windows.Automation.ControlType]::Text -and
-            $element.Current.Name -eq $TargetTitle) {
-            $exact++
-        }
-    }
-    if ($exact -ge 2) {
-        $activated = $true
-        break
-    }
-    Start-Sleep -Milliseconds 200
+if (-not (Invoke-Element $newTaskButton)) {
+    throw "The ZCode new task button has no invoke pattern"
 }
 
 if ($sidebarOpened) {
@@ -238,8 +201,4 @@ if ($sidebarOpened) {
     }
 }
 
-if (-not $activated) {
-    throw "The ZCode session '$TargetTitle' did not activate after selection"
-}
-
-[Console]::Out.WriteLine("selected")
+[Console]::Out.WriteLine("created")

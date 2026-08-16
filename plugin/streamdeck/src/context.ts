@@ -158,6 +158,18 @@ export class PluginContext {
     async executeSelectedAgentAction(actionId: string): Promise<void> {
         const selectedTask = this.getSelectedTaskCard();
         const taskId = this.displayContext?.task_id;
+        if (actionId === "agent.new-task") {
+            // ZCode has no deep link for starting a task: when its window is
+            // the foreground app the daemon drives the desktop app directly.
+            // Every other case (ZCode unfocused, no daemon, timeout) falls
+            // back to the Codex new-task screen, regardless of which task
+            // card is selected.
+            if (this.isConnected() && await this.daemon.requestZcodeNewTask()) {
+                return;
+            }
+            await this.codex.execute(actionId, { selectedTask, taskId });
+            return;
+        }
         const owner = selectedTask?.agent
             ?? (taskId?.startsWith("zcode:") ? "zcode"
                 : taskId?.startsWith("hermes:") ? "hermes" : undefined);

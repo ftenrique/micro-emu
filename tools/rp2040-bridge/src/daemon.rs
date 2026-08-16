@@ -46,6 +46,10 @@ const ZCODE_DESKTOP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// Hermes' canonical SQLite state is local and WAL-backed. One second keeps
 /// cards responsive while avoiding contention with the running agent.
 const HERMES_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the daemon probes for the Hermes desktop app's window. While the
+/// app runs, Hermes keeps its deck half and auto-fed cards even without a
+/// live MCP proxy, mirroring the ZCode probe.
+const HERMES_DESKTOP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// Codex desktop state is local and cheap to poll. A 250 ms interval keeps
 /// focus and lifecycle responsive without reading SQLite in the 10 ms loop.
 const CODEX_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -161,13 +165,14 @@ fn retry_serial_connection(
 
 /// Computes the effective active set: agents with live MCP sessions, plus
 /// Codex if the RP2040 serial link is up (ChatGPT drives Codex over HID
-/// without an MCP session), plus ZCode while its desktop app is running
-/// (the task feed mirrors the app's database directly and must survive MCP
-/// proxy blips and daemon restarts).
+/// without an MCP session), plus ZCode and Hermes while their desktop apps
+/// are running (the task feeds mirror the apps' databases directly and must
+/// survive MCP proxy blips and daemon restarts).
 fn effective_active_set(
     session_agents: ActiveSet,
     codex_hardware_active: bool,
     zcode_desktop_active: bool,
+    hermes_desktop_active: bool,
 ) -> ActiveSet {
     let mut set = session_agents;
     if codex_hardware_active {
@@ -175,6 +180,9 @@ fn effective_active_set(
     }
     if zcode_desktop_active {
         set.insert(AgentId::ZCode);
+    }
+    if hermes_desktop_active {
+        set.insert(AgentId::Hermes);
     }
     set
 }
@@ -190,10 +198,12 @@ fn refresh_wanted_usage(
 ) -> bool {
     use crate::usage::UsageAgent;
     let selected = bridge.usage_agent;
-    let codex_wanted =
-        selected == UsageAgent::Codex || session_agents.contains(AgentId::Codex) || plugin_connected;
-    let zcode_wanted =
-        selected == UsageAgent::ZCode || session_agents.contains(AgentId::ZCode) || plugin_connected;
+    let codex_wanted = selected == UsageAgent::Codex
+        || session_agents.contains(AgentId::Codex)
+        || plugin_connected;
+    let zcode_wanted = selected == UsageAgent::ZCode
+        || session_agents.contains(AgentId::ZCode)
+        || plugin_connected;
     if codex_wanted {
         let snapshot = crate::usage::fetch_usage(UsageAgent::Codex);
         bridge.usage_cache.store(UsageAgent::Codex, snapshot);
@@ -232,8 +242,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     let mut bridge = crate::open_runtime(&options.bridge_options)?;
     bridge.task_mode = true;
     let mut codex_snapshot_available = false;
-    if let Some(snapshot) =
-        crate::codex_state::read_codex_snapshot(crate::tasks::CODEX_TASK_SLOTS)
+    if let Some(snapshot) = crate::codex_state::read_codex_snapshot(crate::tasks::CODEX_TASK_SLOTS)
     {
         match bridge
             .task_board
@@ -257,10 +266,22 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         crate::diaglog::log("zcode desktop app detected at daemon start");
     }
     let mut next_zcode_desktop_probe_at = Instant::now() + ZCODE_DESKTOP_PROBE_INTERVAL;
+    // Same liveness probe for the Hermes desktop app: its auto-feed mirrors
+    // the app's state.db directly and must survive MCP proxy blips.
+    let mut hermes_desktop_active = crate::hermes_window::desktop_running();
+    if hermes_desktop_active {
+        crate::diaglog::log("hermes desktop app detected at daemon start");
+    }
+    let mut next_hermes_desktop_probe_at = Instant::now() + HERMES_DESKTOP_PROBE_INTERVAL;
     let mut pending_repartition_at: Option<Instant> = None;
     let mut next_usage_refresh_at: Option<Instant> = None;
     {
-        let active = effective_active_set(session_agents, codex_hardware_active, zcode_desktop_active);
+        let active = effective_active_set(
+            session_agents,
+            codex_hardware_active,
+            zcode_desktop_active,
+            hermes_desktop_active,
+        );
         bridge.partition = Partition::compute(active);
         bridge.task_board.set_slot_owners(
             bridge.task_device_id.clone(),
@@ -644,9 +665,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             // Match the ZCode/Hermes feeds: publish only as many recent
             // threads as Codex can display on its partition slots.
             let codex_slots = bridge.partition.slots_for(AgentId::Codex).len();
-            if let Some(snapshot) =
-                crate::codex_state::read_codex_snapshot(codex_slots)
-            {
+            if let Some(snapshot) = crate::codex_state::read_codex_snapshot(codex_slots) {
                 match bridge
                     .task_board
                     .publish_codex_snapshot(&snapshot, now_ms())
@@ -801,24 +820,34 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             }
         }
 
-        // Mirror Hermes' canonical state only while its proxy is live. An
+        // Mirror Hermes' canonical state while its proxy is live or the
+        // desktop app is running, mirroring the ZCode gating above. An
         // explicit Hermes publication is authoritative and suppresses this
         // synthetic owner until those manual cards disconnect and expire.
-        let hermes_active = sessions
+        let hermes_proxy_active = sessions
             .iter()
             .any(|session| session.agent == Some(AgentId::Hermes));
+        let hermes_active = hermes_proxy_active || hermes_desktop_active;
         let hermes_has_manual_tasks = bridge
             .task_board
             .has_agent_tasks_except(AgentId::Hermes, HERMES_POLL_SESSION);
         if !hermes_active || hermes_has_manual_tasks {
             if bridge.task_board.has_session_tasks(HERMES_POLL_SESSION) {
                 bridge.task_board.clear_session(HERMES_POLL_SESSION);
+                crate::diaglog::log(&format!(
+                    "hermes auto-feed cleared (proxy={}, desktop={}, manual={})",
+                    hermes_proxy_active, hermes_desktop_active, hermes_has_manual_tasks
+                ));
                 let _ = crate::refresh_task_board(&mut bridge);
             }
             next_hermes_poll_at = None;
         } else {
             if next_hermes_poll_at.is_none() {
                 next_hermes_poll_at = Some(now);
+                crate::diaglog::log(&format!(
+                    "hermes auto-feed active (proxy={}, desktop={})",
+                    hermes_proxy_active, hermes_desktop_active
+                ));
             }
             if next_hermes_poll_at.is_some_and(|poll_at| now >= poll_at) {
                 next_hermes_poll_at = Some(now + HERMES_POLL_INTERVAL);
@@ -836,7 +865,12 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                             bridge.has_explicit_task_state = true;
                             let _ = crate::refresh_task_board(&mut bridge);
                         }
-                        Err(error) => eprintln!("hermes poll publish failed: {error}"),
+                        Err(error) => {
+                            eprintln!("hermes poll publish failed: {error}");
+                            crate::diaglog::log(&format!(
+                                "hermes auto-feed publish failed: {error}"
+                            ));
+                        }
                     }
                 }
             }
@@ -860,7 +894,31 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                 zcode_desktop_active = running;
                 crate::diaglog::log(&format!(
                     "zcode desktop app {}",
-                    if running { "detected" } else { "no longer running" }
+                    if running {
+                        "detected"
+                    } else {
+                        "no longer running"
+                    }
+                ));
+                pending_repartition_at = Some(now + REPARTITION_DEBOUNCE);
+            }
+        }
+
+        // The Hermes desktop app gets the same liveness treatment as ZCode:
+        // its auto-feed mirrors state.db directly, so cards survive proxy
+        // blips while the app stays open.
+        if now >= next_hermes_desktop_probe_at {
+            next_hermes_desktop_probe_at = now + HERMES_DESKTOP_PROBE_INTERVAL;
+            let running = crate::hermes_window::desktop_running();
+            if running != hermes_desktop_active {
+                hermes_desktop_active = running;
+                crate::diaglog::log(&format!(
+                    "hermes desktop app {}",
+                    if running {
+                        "detected"
+                    } else {
+                        "no longer running"
+                    }
                 ));
                 pending_repartition_at = Some(now + REPARTITION_DEBOUNCE);
             }
@@ -874,6 +932,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     session_agents,
                     codex_hardware_active,
                     zcode_desktop_active,
+                    hermes_desktop_active,
                 );
                 let new_partition = Partition::compute(active);
                 eprintln!(
@@ -1137,6 +1196,8 @@ fn handle_plugin_session(
 
     let (events_tx, events_rx) = mpsc::channel::<Value>();
     let (plugin_writer_tx, plugin_writer_rx) = mpsc::channel::<Value>();
+    // Heartbeats bypass the daemon main loop so slow refresh work cannot starve liveness.
+    let heartbeat_writer = plugin_writer_tx.clone();
 
     // Plugin writer thread: drains outbound render lines and writes them to
     // the socket as newline-delimited JSON.
@@ -1185,6 +1246,10 @@ fn handle_plugin_session(
             Ok(line) => {
                 match serde_json::from_str::<Value>(&line) {
                     Ok(value) => {
+                        if let Some(pong) = plugin_heartbeat_response(&value) {
+                            let _ = heartbeat_writer.send(pong);
+                            continue;
+                        }
                         if events_tx.send(value).is_err() {
                             // Controller was dropped (daemon detach); stop reading.
                             return;
@@ -1209,6 +1274,17 @@ fn handle_plugin_session(
         log_context()
     );
     let _ = tx.send(SessionMessage::Disconnected { session_id: id });
+}
+
+/// Builds the heartbeat response without involving the daemon main loop.
+fn plugin_heartbeat_response(message: &Value) -> Option<Value> {
+    if message.get("type").and_then(Value::as_str) != Some("ping") {
+        return None;
+    }
+    Some(json!({
+        "type": "pong",
+        "timestamp": message.get("timestamp").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 fn parse_hello_info(line: &str) -> Option<HelloInfo> {
@@ -1695,6 +1771,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plugin_heartbeat_response_preserves_timestamp_without_main_loop() {
+        let response = plugin_heartbeat_response(&json!({"type": "ping", "timestamp": 42}))
+            .expect("ping should produce an immediate response");
+        assert_eq!(response, json!({"type": "pong", "timestamp": 42}));
+        assert!(plugin_heartbeat_response(&json!({"type": "event"})).is_none());
+    }
+
+    #[test]
     fn reconnect_removes_only_stale_device_sessions() {
         let mut mappings = vec![
             (10, "deck:a".to_owned()),
@@ -1733,7 +1817,7 @@ mod tests {
         sessions.insert(AgentId::ZCode);
         sessions.insert(AgentId::Hermes);
 
-        let active = effective_active_set(sessions, false, false);
+        let active = effective_active_set(sessions, false, false, false);
         assert!(!active.contains(AgentId::Codex));
         assert_eq!(
             Partition::compute(active).owners_json(),
@@ -1747,6 +1831,38 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn hermes_desktop_probe_claims_the_shared_half_without_zcode() {
+        let active = effective_active_set(ActiveSet::new(), false, false, true);
+        assert!(active.contains(AgentId::Hermes));
+        assert_eq!(
+            Partition::compute(active).owners_json(),
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                json!("hermes"),
+                json!("hermes"),
+                json!("hermes")
+            ]
+        );
+        // ZCode keeps priority on the shared half when both desktops run.
+        let mut sessions = ActiveSet::new();
+        sessions.insert(AgentId::ZCode);
+        let active = effective_active_set(sessions, false, false, true);
+        assert_eq!(
+            Partition::compute(active).owners_json(),
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                json!("zcode"),
+                json!("zcode"),
+                json!("zcode")
+            ]
+        );
+    }
+
     #[test]
     fn controller_hello_is_distinguished_from_agent_hello() {
         let controller_line = r#"{"bridge":"hello","version":1,"role":"controller","controller":"streamdeck-plugin","instance_id":"p-1","taskSlots":6}"#;

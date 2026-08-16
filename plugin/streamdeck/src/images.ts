@@ -198,7 +198,7 @@ function renderContextUsageBody(ctx: StripContext, showResetTimes: boolean): str
     const hasResetTimes = ctx.five_hour_reset_at != null || ctx.weekly_reset_at != null;
     if (showResetTimes && hasResetTimes) {
         return `<text x="12" y="47" font-family="sans-serif" font-size="9" fill="#607d8b">5H RESET</text>
-  <text x="12" y="70" font-family="monospace" font-size="16" font-weight="bold" fill="#90caf9">${escapeXml(formatResetAt(ctx.five_hour_reset_at))}</text>
+  <text x="12" y="70" font-family="monospace" font-size="19" font-weight="bold" fill="#90caf9">${escapeXml(formatResetClock(ctx.five_hour_reset_at))}</text>
   <text x="12" y="93" font-family="sans-serif" font-size="9" fill="#607d8b">WEEKLY RESET</text>
   <text x="12" y="116" font-family="monospace" font-size="16" font-weight="bold" fill="#a5d6a7">${escapeXml(formatResetAt(ctx.weekly_reset_at))}</text>`;
     }
@@ -309,7 +309,7 @@ export function renderCruxVStrip(ctx: StripContext, clickLabel: string, showRese
     if (showResetTimes && hasResetTimes) {
         return stripSvg(`${agentTag}
   <text x="10" y="28" font-family="sans-serif" font-size="9" fill="#666">5H RESET</text>
-  <text x="${STRIP_W / 2}" y="47" font-family="monospace" font-size="14" font-weight="bold" fill="#90caf9" text-anchor="middle">${escapeXml(formatResetAt(ctx.five_hour_reset_at))}</text>
+  <text x="${STRIP_W / 2}" y="47" font-family="monospace" font-size="17" font-weight="bold" fill="#90caf9" text-anchor="middle">${escapeXml(formatResetClock(ctx.five_hour_reset_at))}</text>
   <text x="10" y="65" font-family="sans-serif" font-size="9" fill="#666">WEEKLY RESET</text>
   <text x="${STRIP_W / 2}" y="84" font-family="monospace" font-size="14" font-weight="bold" fill="#a5d6a7" text-anchor="middle">${escapeXml(formatResetAt(ctx.weekly_reset_at))}</text>
   <text x="${STRIP_W - 8}" y="16" font-family="monospace" font-size="9" fill="#546e7a" text-anchor="end">â–²â–¼ ${escapeXml(clickLabel)}</text>`);
@@ -341,6 +341,15 @@ function formatResetAt(resetAt: number | null | undefined): string {
         hour: "numeric",
         minute: "2-digit",
     }).format(new Date(resetAt * 1_000));
+}
+
+/** Formats a reset timestamp as 24-hour HH:MM in the local timezone. The
+ * 5-hour window always resets within hours, so the clock time alone is
+ * enough and stays compact at larger font sizes. */
+function formatResetClock(resetAt: number | null | undefined): string {
+    if (resetAt == null || !Number.isFinite(resetAt)) return "\u2014";
+    const date = new Date(resetAt * 1_000);
+    return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
 /** Renders a labelled usage bar (remaining percentage) at the given y. */

@@ -26,8 +26,6 @@ pub struct TaskInteraction {
     pub short: Option<TaskAction>,
     pub long: Option<TaskAction>,
     pub expires_at_ms: Option<u128>,
-
-
 }
 use std::time::Duration;
 
@@ -616,10 +614,7 @@ impl TaskBoard {
         } else {
             TaskState::parse(None)?
         };
-        let priority_value = object
-            .get("priority")
-            .and_then(Value::as_u64)
-            .unwrap_or(50);
+        let priority_value = object.get("priority").and_then(Value::as_u64).unwrap_or(50);
         if priority_value > 100 {
             return Err("priority must be from 0 to 100".to_owned());
         }
@@ -1051,13 +1046,39 @@ impl TaskBoard {
             .collect()
     }
     pub fn auto_select_waiting(&mut self, device_id: &str, now_ms: u128) -> Option<Value> {
-        let task_id = self.tasks.values().filter(|task| task.state == TaskState::Waiting && task.interaction.as_ref().is_some_and(|i| i.expires_at_ms.is_none_or(|expires| expires > now_ms))).filter_map(|task| { let assignment = self.assignment(&task.task_id)?; (assignment.slot.device_id == device_id).then_some(task) }).max_by(|a, b| b.priority.cmp(&a.priority).then(a.updated_at_ms.cmp(&b.updated_at_ms)).then(b.task_id.cmp(&a.task_id)))?.task_id.clone();
-        if self.selected.as_deref() == Some(task_id.as_str()) { return None; }
+        let task_id = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.state == TaskState::Waiting
+                    && task
+                        .interaction
+                        .as_ref()
+                        .is_some_and(|i| i.expires_at_ms.is_none_or(|expires| expires > now_ms))
+            })
+            .filter_map(|task| {
+                let assignment = self.assignment(&task.task_id)?;
+                (assignment.slot.device_id == device_id).then_some(task)
+            })
+            .max_by(|a, b| {
+                b.priority
+                    .cmp(&a.priority)
+                    .then(a.updated_at_ms.cmp(&b.updated_at_ms))
+                    .then(b.task_id.cmp(&a.task_id))
+            })?
+            .task_id
+            .clone();
+        if self.selected.as_deref() == Some(task_id.as_str()) {
+            return None;
+        }
         let assignment = self.assignment(&task_id)?.slot.clone();
         let task = self.tasks.get(&task_id)?;
         self.selected = Some(task_id.clone());
-        self.pending_selection = (task.owner_agent == AgentId::Codex).then(|| (task_id.clone(), now_ms.saturating_add(2_000)));
-        Some(json!({"type":"task_selected","task_id":task_id,"device_id":assignment.device_id,"slot":assignment.slot,"owner_session":task.owner_session,"legacy_key":Value::Null,"automatic":true,"ts":now_ms}))
+        self.pending_selection = (task.owner_agent == AgentId::Codex)
+            .then(|| (task_id.clone(), now_ms.saturating_add(2_000)));
+        Some(
+            json!({"type":"task_selected","task_id":task_id,"device_id":assignment.device_id,"slot":assignment.slot,"owner_session":task.owner_session,"legacy_key":Value::Null,"automatic":true,"ts":now_ms}),
+        )
     }
 
     pub fn status_json(&self) -> Value {
@@ -1272,24 +1293,55 @@ fn interaction_value(interaction: &TaskInteraction) -> Value {
 }
 
 fn parse_interaction(value: Option<&Value>) -> Result<Option<TaskInteraction>, String> {
-    let Some(value) = value else { return Ok(None); };
-    let object = value.as_object().ok_or_else(|| "interaction must be an object".to_owned())?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "interaction must be an object".to_owned())?;
     let text = |key: &str, required: bool| -> Result<Option<String>, String> {
         match object.get(key) {
-            Some(Value::String(value)) if value.chars().count() <= 160 && !value.trim().is_empty() => Ok(Some(value.clone())),
+            Some(Value::String(value))
+                if value.chars().count() <= 160 && !value.trim().is_empty() =>
+            {
+                Ok(Some(value.clone()))
+            }
             None if !required => Ok(None),
             None => Err(format!("interaction field {key} is required")),
-            Some(Value::String(_)) => Err(format!("interaction field {key} must be non-empty and at most 160 characters")),
+            Some(Value::String(_)) => Err(format!(
+                "interaction field {key} must be non-empty and at most 160 characters"
+            )),
             Some(_) => Err(format!("interaction field {key} must be a string")),
         }
     };
     let action = |key: &str| -> Result<Option<TaskAction>, String> {
-        let Some(value) = object.get(key) else { return Ok(None); };
-        let item = value.as_object().ok_or_else(|| format!("interaction action {key} must be an object"))?;
-        let id = item.get("id").and_then(Value::as_str).ok_or_else(|| format!("interaction action {key}.id is required"))?.to_owned();
-        let label = item.get("label").and_then(Value::as_str).ok_or_else(|| format!("interaction action {key}.label is required"))?.to_owned();
-        let action = item.get("action").and_then(Value::as_str).ok_or_else(|| format!("interaction action {key}.action is required"))?.to_owned();
-        Ok(Some(TaskAction { id, label, action, payload: item.get("payload").cloned().unwrap_or(Value::Null) }))
+        let Some(value) = object.get(key) else {
+            return Ok(None);
+        };
+        let item = value
+            .as_object()
+            .ok_or_else(|| format!("interaction action {key} must be an object"))?;
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("interaction action {key}.id is required"))?
+            .to_owned();
+        let label = item
+            .get("label")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("interaction action {key}.label is required"))?
+            .to_owned();
+        let action = item
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("interaction action {key}.action is required"))?
+            .to_owned();
+        Ok(Some(TaskAction {
+            id,
+            label,
+            action,
+            payload: item.get("payload").cloned().unwrap_or(Value::Null),
+        }))
     };
     let id = text("id", true)?.unwrap();
     let kind = text("kind", true)?.unwrap();
@@ -1298,10 +1350,31 @@ fn parse_interaction(value: Option<&Value>) -> Result<Option<TaskInteraction>, S
     let mut short = action("short")?;
     let mut long = action("long")?;
     if kind == "approval" {
-        short = short.or_else(|| Some(TaskAction { id: "approve".to_owned(), label: "Approve".to_owned(), action: "approve".to_owned(), payload: Value::Null }));
-        long = long.or_else(|| Some(TaskAction { id: "reject".to_owned(), label: "Reject".to_owned(), action: "reject".to_owned(), payload: Value::Null }));
+        short = short.or_else(|| {
+            Some(TaskAction {
+                id: "approve".to_owned(),
+                label: "Approve".to_owned(),
+                action: "approve".to_owned(),
+                payload: Value::Null,
+            })
+        });
+        long = long.or_else(|| {
+            Some(TaskAction {
+                id: "reject".to_owned(),
+                label: "Reject".to_owned(),
+                action: "reject".to_owned(),
+                payload: Value::Null,
+            })
+        });
     }
-    Ok(Some(TaskInteraction { id, kind, prompt, short, long, expires_at_ms }))
+    Ok(Some(TaskInteraction {
+        id,
+        kind,
+        prompt,
+        short,
+        long,
+        expires_at_ms,
+    }))
 }
 
 fn parse_timestamp_ms(value: Option<&Value>) -> Result<Option<u128>, String> {
@@ -1479,7 +1552,10 @@ mod tests {
             display_task_title(0, "6 \u{2014} Existing label"),
             "1 \u{2014} Existing label"
         );
-        assert_eq!(display_task_title(6, "Build bridge"), "7 \u{2014} Build bridge");
+        assert_eq!(
+            display_task_title(6, "Build bridge"),
+            "7 \u{2014} Build bridge"
+        );
     }
 
     #[test]
@@ -2389,7 +2465,9 @@ mod tests {
         assert_eq!(cards[0]["recently_finished"], true);
         assert_eq!(cards[0]["c"], 0x1b5e20);
 
-        board.select("deck", 0, 30_201).expect("select completed task");
+        board
+            .select("deck", 0, 30_201)
+            .expect("select completed task");
         let reviewed = board.rendered_slots("deck", 1);
         assert_eq!(reviewed[0]["status"], "queued");
         assert_eq!(reviewed[0]["c"], 0x37474f);
@@ -2413,7 +2491,9 @@ mod tests {
         assert_eq!(cards[0]["recently_finished"], true);
         assert_eq!(cards[0]["c"], 0x1b5e20);
 
-        board.select("deck", 0, 30_201).expect("select completed task");
+        board
+            .select("deck", 0, 30_201)
+            .expect("select completed task");
         let reviewed = board.rendered_slots("deck", 1);
         assert_eq!(reviewed[0]["status"], "queued");
         assert_eq!(reviewed[0]["c"], 0x37474f);
@@ -2469,7 +2549,9 @@ mod tests {
         let persistent = board.rendered_slots("deck", 2);
         assert_eq!(persistent[0]["c"], 0x1b5e20);
         assert_eq!(persistent[1]["c"], 0x1b5e20);
-        board.select("deck", 0, 30_202).expect("select completed task");
+        board
+            .select("deck", 0, 30_202)
+            .expect("select completed task");
         let reviewed = board.rendered_slots("deck", 2);
         assert_eq!(reviewed[0]["status"], "queued");
         assert_eq!(reviewed[0]["c"], 0x37474f);
@@ -2581,7 +2663,9 @@ mod tests {
         let mut board = TaskBoard::new();
         board.set_device("deck", 2, true);
         board.publish_tasks(7, AgentId::Hermes, &json!({"tasks":[{"task_id":"approval","title":"Deploy","state":"waiting","priority":90,"interaction":{"id":"ask-1","kind":"approval","prompt":"Deploy now?"}}]}), 100).unwrap();
-        let selection = board.auto_select_waiting("deck", 100).expect("automatic selection");
+        let selection = board
+            .auto_select_waiting("deck", 100)
+            .expect("automatic selection");
         assert_eq!(selection["task_id"], "approval");
         let rendered = board.rendered_slots("deck", 2);
         assert_eq!(rendered[0]["interaction"]["short"]["action"], "approve");

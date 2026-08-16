@@ -40,12 +40,16 @@ absent. Auxiliary task devices remain available to the shared scheduler.
 | zcode + hermes           | —                | AG03–AG05 / 3–5  | —                |
 | codex + zcode + hermes   | AG00–AG02 / 0–2  | AG03–AG05 / 3–5  | —                |
 
-"Active" means the agent has a live MCP session on the daemon, or — for Codex
-only — the RP2040 serial link is up **and** has forwarded a Codex status
-frame (`v.oai.thstatus`) within the last 60 seconds. When the active set
-changes, the daemon debounces for 750 ms and then recomputes the partition.
-Each active agent receives a **partition event** via `poll_events` notifying
-it of its new keys and slots. LCD state is retained through repartitions.
+"Active" means the agent has a live MCP session on the daemon, or — for
+Codex only — the RP2040 serial link is up **and** has forwarded a Codex
+status frame (`v.oai.thstatus`) within the last 60 seconds, or — for Hermes —
+the Hermes desktop app is running (the bridge mirrors the app's session
+database directly, so Hermes keeps its cards and its half of the deck across
+MCP proxy reconnects and daemon restarts; closing the app releases them).
+When the active set changes, the daemon debounces for 750 ms and then
+recomputes the partition. Each active agent receives a **partition event**
+via `poll_events` notifying it of its new keys and slots. LCD state is
+retained through repartitions.
 
 See the [ZCode integration guide](./ZCode_integration.md) for the full
 partition matrix with all three agents.
@@ -122,7 +126,7 @@ The daemon prints a `bridge-ready` line and listens on `127.0.0.1:48360`:
 
 ### 2. Register the proxy with Hermes
 
-Edit `~/.hermes/config.yaml` (create it if it does not exist):
+Edit `~/.hermes/config.yaml` (on Windows: `%LOCALAPPDATA%\hermes\config.yaml`; create it if it does not exist):
 
 ```yaml
 mcp_servers:
@@ -268,18 +272,63 @@ Verify with `codex mcp list` and `/mcp` in the Codex TUI.
 
 ### Automatic session state
 
-While a Hermes proxy is connected, the daemon opens Hermes' canonical
-`state.db` read-only and mirrors the most recent non-archived sessions as task
-cards. On Windows the default is `%LOCALAPPDATA%\hermes\state.db`; elsewhere
-it is `$HERMES_HOME/state.db` or `~/.hermes/state.db`. The adapter publishes
-stable `hermes:<session-id>` IDs, title, workspace, model, lifecycle, and exact
-turn timestamps. Missing, locked, or older databases are ignored without
-clearing manually published cards.
+While a Hermes proxy is connected **or the Hermes desktop app is running**,
+the daemon opens Hermes' canonical `state.db` read-only and mirrors the most
+recent non-archived sessions as task cards. The desktop app is probed every
+two seconds, so the feed survives MCP proxy blips and daemon restarts for as
+long as the app stays open. On Windows the default is
+`%LOCALAPPDATA%\hermes\state.db`; elsewhere it is `$HERMES_HOME/state.db` or
+`~/.hermes/state.db`. The adapter publishes stable `hermes:<session-id>` IDs,
+title, workspace, model, lifecycle, and exact turn timestamps. Missing,
+locked, or older databases are ignored without clearing manually published
+cards.
 
 An explicit `publish_tasks` call from Hermes immediately takes precedence over
 the auto-feed and remains authoritative through the normal reconnect lease.
 Use `set_display_context` when Hermes has live usage or effort metadata that is
 not present in the session database.
+
+### Selecting sessions from the deck (Windows)
+
+Pressing an auto-fed Hermes card selects it on the board **and switches the
+Hermes desktop app to that session** through Windows UI Automation, so the
+press works even with no Hermes proxy connected. The automation clicks the
+sidebar row for the session; if the sidebar is collapsed it is opened for the
+selection and collapsed again afterwards, and if the row sits behind the
+sidebar's pagination the search box surfaces it (the filter is cleared
+afterwards). Selections are queued on a worker thread — UIA can take seconds
+on a cold accessibility tree — with a burst of presses collapsing into the
+most recent one and failed attempts retried up to three times. Activation is
+confirmed by watching the session's editor tab become active, so a slow
+switch is never reported as success before it happened.
+
+Long-pressing a Hermes card shows or focuses the Hermes window and minimizes
+it when it is already foreground. If Windows refuses the foreground
+activation, the bridge falls back to relaunching `Hermes.exe`: Electron's
+single-instance handshake asks the running app to raise its own window.
+
+### New task and Mic keys (Windows)
+
+The Stream Deck **New task** action (`agent.new-task`) is Hermes-aware. On
+press, the plugin asks the daemon whether a desktop agent is the foreground
+window; when it is the Hermes window, the daemon sends Hermes'
+**Ctrl+N** accelerator — the shortcut carried by the sidebar's
+*New session* button — so a new session starts immediately, without the
+UIA warm-up the ZCode path needs. With anything else focused (or no daemon
+connection) the action opens the Codex new-task screen as before. The daemon
+replies over the controller socket (`new-task-result`), so the key keeps its
+OK/alert feedback, and an older bridge simply times out into the Codex
+fallback.
+
+The **Mic** action (Codex Micro ACT10, `encoder-button` index 2) is
+Hermes-aware too. Hermes has no voice input of its own, so while its window
+is the foreground app the mic key drives Windows' built-in dictation
+instead: **press** sends `Win+H` and dictation transcribes into Hermes'
+focused composer; **release** sends `Escape`, closing the dictation bar
+(hold-to-talk semantics). With anything else focused the mic key keeps its
+original ChatGPT/Codex behavior. The bridge remembers that it opened the
+dictation bar, so the release always closes it even if the dictation UI
+itself grabbed the foreground or you switched windows mid-hold.
 
 ### `poll_events`
 
@@ -432,7 +481,7 @@ Hermes.
 
 ### Hermes cannot connect to the bridge
 
-- Verify the `command` path in `~/.hermes/config.yaml` points to the correct
+- Verify the `command` path in the Hermes `config.yaml` points to the correct
   `.exe` location. Use backslashes doubled in YAML.
 - Run `/reload-mcp` in Hermes after editing the config.
 - Check Hermes logs in `~/.hermes/logs/` for MCP connection errors.
@@ -503,4 +552,4 @@ Configure combined capacity with repeatable daemon options, for example `--devic
 
 Selections arrive through `poll_events` as `task_selected`, and reallocation is reported with `layout_changed`. `bridge_status` version 2 includes sessions, device health, assignments/overflow, per-device selection, queue depth, and the 30-second reconnect lease. RGB is centrally configured by the daemon, not individual agents.
 
-Long-pressing a Hermes task card shows or focuses Hermes Desktop, and minimizes it when it is already foreground. Search, terminal, and model-cycle actions for Hermes tasks are queued as agent events; they are never sent to Codex. Workspace-path copying works locally. Copy-prompt, copy-response, and fork use Hermes' Sessions REST API only when MICRO_EMU_HERMES_API_URL and MICRO_EMU_HERMES_API_KEY are configured. Unsupported Hermes actions fail closed instead of falling through to the Codex executor.
+Long-pressing a Hermes task card shows or focuses Hermes Desktop, and minimizes it when it is already foreground. Pressing a card selects it and switches the Hermes desktop app to that session through UI automation (see *Selecting sessions from the deck* above). Search, terminal, and model-cycle actions for Hermes tasks are queued as agent events; they are never sent to Codex. Workspace-path copying works locally. Copy-prompt, copy-response, and fork use Hermes' Sessions REST API only when MICRO_EMU_HERMES_API_URL and MICRO_EMU_HERMES_API_KEY are configured. Unsupported Hermes actions fail closed instead of falling through to the Codex executor.

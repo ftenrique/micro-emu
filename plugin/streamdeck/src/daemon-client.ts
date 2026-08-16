@@ -88,6 +88,8 @@ export class DaemonClient extends EventEmitter {
     private lastInboundAt = 0;
     private taskSlots = 0;
     private instanceId: string;
+    /** Pending new-task round trips, resolved in request order. */
+    private newTaskWaiters: Array<(handled: boolean) => void> = [];
     private options: Required<Pick<DaemonClientOptions, "host" | "port">> & DaemonClientOptions;
 
     constructor(options: DaemonClientOptions = {}) {
@@ -160,6 +162,7 @@ export class DaemonClient extends EventEmitter {
         }
         this.connected = false;
         this.connecting = false;
+        this.failNewTaskWaiters();
     }
 
     /** Sends a legacy physical button event to the daemon. */
@@ -209,6 +212,28 @@ export class DaemonClient extends EventEmitter {
     /** Selects which agent's usage limits feed the usage displays. */
     sendUsageAgent(agent: "codex" | "zcode"): void {
         this.send({ type: "event", kind: "usage-agent", agent });
+    }
+
+    /** Asks the daemon to start a new task in the ZCode desktop app.
+     * Resolves true when ZCode is the foreground app and the daemon queued
+     * the creation; resolves false when ZCode is not focused, the daemon is
+     * unreachable, or the reply times out (older bridges never answer). */
+    requestZcodeNewTask(timeoutMs = 3_000): Promise<boolean> {
+        if (!this.connected) {
+            return Promise.resolve(false);
+        }
+        return new Promise<boolean>((resolve) => {
+            let settled = false;
+            const finish = (handled: boolean): void => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(handled);
+            };
+            const timer = setTimeout(() => finish(false), timeoutMs);
+            this.newTaskWaiters.push(finish);
+            this.send({ type: "new-task" });
+        });
     }
 
     /** Sends a raw JSON line to the daemon. */
@@ -288,6 +313,7 @@ export class DaemonClient extends EventEmitter {
             this.buffer = "";
             this.connected = false;
             this.socket = null;
+            this.failNewTaskWaiters();
             if (wasConnected) {
                 this.emit("log", "daemon connection closed; reconnecting");
                 this.emit("disconnect");
@@ -407,6 +433,18 @@ export class DaemonClient extends EventEmitter {
             // A goodbye means this controller was detached. Do not wait for
             // TCP teardown to become observable before entering reconnect.
             this.socket?.destroy();
+        } else if (type === "new-task-result") {
+            // Replies pair with requests in order; a waiter that already
+            // timed out stays settled and swallows its late reply.
+            this.newTaskWaiters.shift()?.(message.handled === true);
+        }
+    }
+
+    /** Resolves every pending new-task round trip so callers fall back to
+     * the Codex screen instead of waiting out their timeouts. */
+    private failNewTaskWaiters(): void {
+        for (const waiter of this.newTaskWaiters.splice(0)) {
+            waiter(false);
         }
     }
 }

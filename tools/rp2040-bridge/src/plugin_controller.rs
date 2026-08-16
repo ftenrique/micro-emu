@@ -101,6 +101,34 @@ impl PluginController {
                 }
                 None
             }
+            // New task request from the plugin: when the ZCode or Hermes
+            // desktop app is the foreground window the new task is created
+            // there (ZCode through the sidebar automation, Hermes through
+            // its Ctrl+N accelerator); anything else is declined so the
+            // plugin falls back to the Codex new-task screen.
+            "new-task" => {
+                let handled = if crate::zcode_window::is_foreground().unwrap_or(false) {
+                    crate::zcode_window::request_new_task();
+                    true
+                } else if crate::hermes_window::is_foreground().unwrap_or(false) {
+                    match crate::hermes_window::start_new_session() {
+                        Ok(()) => true,
+                        Err(error) => {
+                            eprintln!("Hermes new session shortcut failed: {error}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if self
+                    .send(json!({"type":"new-task-result", "handled": handled}))
+                    .is_err()
+                {
+                    self.disconnected = true;
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -109,9 +137,7 @@ impl PluginController {
 fn event_task_id(message: &Value) -> Option<Option<String>> {
     match message.get("task_id") {
         None => Some(None),
-        Some(Value::String(task_id))
-            if !task_id.is_empty() && task_id.chars().count() <= 160 =>
-        {
+        Some(Value::String(task_id)) if !task_id.is_empty() && task_id.chars().count() <= 160 => {
             Some(Some(task_id.clone()))
         }
         _ => None,

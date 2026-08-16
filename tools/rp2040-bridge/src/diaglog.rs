@@ -22,7 +22,11 @@ pub fn log(message: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     rotate_if_large(&path);
-    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
         return;
     };
     let timestamp = std::time::SystemTime::now()

@@ -22,7 +22,7 @@
 //! leave the existing board untouched rather than blanking it.
 
 use rusqlite::{Connection, OpenFlags};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::tasks::{TASK_PRIORITY_ACTIVE, TASK_PRIORITY_IDLE};
 
@@ -567,8 +567,14 @@ mod tests {
             completed_at: Some(10_000),
         };
 
-        assert_eq!(derive_state(Some(&latest), None, 10_000, 25_000), "completed");
-        assert_eq!(derive_state(Some(&latest), None, 10_000, 45_000), "completed");
+        assert_eq!(
+            derive_state(Some(&latest), None, 10_000, 25_000),
+            "completed"
+        );
+        assert_eq!(
+            derive_state(Some(&latest), None, 10_000, 45_000),
+            "completed"
+        );
     }
 
     #[test]
@@ -652,9 +658,24 @@ mod tests {
         // still generating.
         let connection = fixture_db();
         insert_session(&connection, "sess_stream", 10_000);
-        insert_usage(&connection, "mu1", "sess_stream", "completed", 9_000, Some(9_500));
+        insert_usage(
+            &connection,
+            "mu1",
+            "sess_stream",
+            "completed",
+            9_000,
+            Some(9_500),
+        );
         insert_message(&connection, "sess_stream", 1, 9_600, "user", None, None);
-        insert_message(&connection, "sess_stream", 2, 10_500, "assistant", None, None);
+        insert_message(
+            &connection,
+            "sess_stream",
+            2,
+            10_500,
+            "assistant",
+            None,
+            None,
+        );
 
         let snapshot = read_zcode_snapshot_from_connection(&connection, 11_000, 6).unwrap();
         let task = &snapshot["tasks"][0];
@@ -669,9 +690,24 @@ mod tests {
         // tools are executing and the turn is still in flight.
         let connection = fixture_db();
         insert_session(&connection, "sess_tools", 10_000);
-        insert_usage(&connection, "mu1", "sess_tools", "completed", 9_000, Some(10_400));
+        insert_usage(
+            &connection,
+            "mu1",
+            "sess_tools",
+            "completed",
+            9_000,
+            Some(10_400),
+        );
         insert_message(&connection, "sess_tools", 1, 9_000, "user", None, None);
-        insert_message(&connection, "sess_tools", 2, 10_500, "assistant", Some("tool-calls"), Some(10_480));
+        insert_message(
+            &connection,
+            "sess_tools",
+            2,
+            10_500,
+            "assistant",
+            Some("tool-calls"),
+            Some(10_480),
+        );
 
         let snapshot = read_zcode_snapshot_from_connection(&connection, 11_000, 6).unwrap();
         assert_eq!(snapshot["tasks"][0]["state"], "running");
@@ -683,9 +719,24 @@ mod tests {
         // so the terminal model-usage status decides.
         let connection = fixture_db();
         insert_session(&connection, "sess_done", 10_000);
-        insert_usage(&connection, "mu1", "sess_done", "completed", 9_000, Some(10_400));
+        insert_usage(
+            &connection,
+            "mu1",
+            "sess_done",
+            "completed",
+            9_000,
+            Some(10_400),
+        );
         insert_message(&connection, "sess_done", 1, 9_000, "user", None, None);
-        insert_message(&connection, "sess_done", 2, 10_500, "assistant", Some("stop"), Some(10_480));
+        insert_message(
+            &connection,
+            "sess_done",
+            2,
+            10_500,
+            "assistant",
+            Some("stop"),
+            Some(10_480),
+        );
 
         let snapshot = read_zcode_snapshot_from_connection(&connection, 11_000, 6).unwrap();
         assert_eq!(snapshot["tasks"][0]["state"], "completed");
@@ -697,8 +748,23 @@ mod tests {
         // Past the recency window the terminal status wins again.
         let connection = fixture_db();
         insert_session(&connection, "sess_stale", 10_000);
-        insert_usage(&connection, "mu1", "sess_stale", "completed", 9_000, Some(9_500));
-        insert_message(&connection, "sess_stale", 1, 10_500, "assistant", None, None);
+        insert_usage(
+            &connection,
+            "mu1",
+            "sess_stale",
+            "completed",
+            9_000,
+            Some(9_500),
+        );
+        insert_message(
+            &connection,
+            "sess_stale",
+            1,
+            10_500,
+            "assistant",
+            None,
+            None,
+        );
 
         let snapshot =
             read_zcode_snapshot_from_connection(&connection, 10_000 + RUNNING_WINDOW_MS + 1, 6)

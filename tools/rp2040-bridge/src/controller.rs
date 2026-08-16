@@ -361,7 +361,13 @@ mod tests {
         assert_eq!(context.five_hour_reset_at, Some(1760001800));
         assert_eq!(context.to_value()["model"], "gpt-5");
         assert!(DisplayContext::from_value(&serde_json::json!({"progress": 101})).is_err());
-        assert_eq!(DisplayContext::from_value(&serde_json::json!({"prompt": "secret"})).unwrap().prompt.as_deref(), Some("secret"));
+        assert_eq!(
+            DisplayContext::from_value(&serde_json::json!({"prompt": "secret"}))
+                .unwrap()
+                .prompt
+                .as_deref(),
+            Some("secret")
+        );
     }
 
     #[test]

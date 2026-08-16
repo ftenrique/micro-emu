@@ -606,3 +606,40 @@ The daemon also appends lifecycle events (agent sessions, repartitions,
 auto-feed gaps, selection failures) to
 `%LOCALAPPDATA%\micro-emu\logs\bridge-daemon.log` — check it first when the
 deck appears to disconnect.
+
+### Starting a new task from the deck (Windows)
+
+The Stream Deck **New task** action (`agent.new-task`) is ZCode-aware. On
+press, the plugin asks the daemon whether the ZCode desktop app is the
+foreground window:
+
+- **ZCode focused** → the daemon clicks the sidebar's **Tasks → New task**
+  button through the same UI Automation path as session selection (same
+  warm-up, retry, and collapsed-sidebar handling). A new empty ZCode task
+  opens and its card appears on the deck through the auto-feed.
+- **Anything else focused** (or no daemon connection) → the action keeps its
+  original behavior and opens the Codex new-task screen, regardless of which
+  task card is currently selected.
+
+The daemon replies to the plugin over the controller socket
+(`new-task-result`), so the key still shows its OK/alert feedback, and an
+older bridge without the handler simply times out into the Codex fallback.
+
+### Mic key: Windows dictation into ZCode
+
+The Stream Deck **Mic** action (Codex Micro ACT10, `encoder-button` index 2)
+is ZCode-aware too. ZCode has no voice input of its own, so while the ZCode
+desktop app is the foreground window the mic key drives Windows' built-in
+dictation instead:
+
+- **Press** → the bridge sends `Win+H`, and Windows dictation transcribes
+  into ZCode's focused composer.
+- **Release** → the bridge sends `Escape`, closing the dictation bar. This
+  mirrors the Codex action's hold-to-talk semantics.
+
+With anything else focused, the mic key keeps its original behavior (the
+ChatGPT/Codex Micro push-to-talk; Hermes gets the same dictation treatment
+through its own guide). The bridge remembers that it opened the
+dictation bar, so the release always closes it even if the dictation UI
+itself grabbed the foreground or you switched windows mid-hold; a daemon
+restart while holding the key is the only way to leave the bar open.
