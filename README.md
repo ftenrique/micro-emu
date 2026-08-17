@@ -20,7 +20,7 @@ The Stream Deck plugin is the recommended Stream Deck integration. Direct HID su
 
 ## Install the Windows release
 
-Download `micro-emu-v1.1.0-windows-x64.zip` from the GitHub release, extract it, and double-click `Install.cmd`. The installer does not need administrator access. It installs the bridge under `%LOCALAPPDATA%\micro-emu`, starts it automatically when you sign in, and opens the bundled Stream Deck plugin for confirmation in the Stream Deck app.
+Download `micro-emu-v1.2.0-windows-x64.zip` from the GitHub release, extract it, and double-click `Install.cmd`. The installer does not need administrator access. It installs the bridge under `%LOCALAPPDATA%\micro-emu`, starts it automatically when you sign in, and opens the bundled Stream Deck plugin for confirmation in the Stream Deck app.
 
 To remove it, double-click `Uninstall.cmd` from the same extracted folder. The standalone `.streamDeckPlugin` release asset is also available for users who only want to install or update the plugin.
 

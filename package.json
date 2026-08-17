@@ -1,6 +1,6 @@
 {
   "name": "codex-micro-ajazz",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": false,
   "type": "module",
   "description": "Codex Micro protocol core, AJAZZ and Stream Deck adapters with an RP2040 USB bridge.",

@@ -38,6 +38,6 @@ catch {
 }
 
 Write-Host ""
-Write-Host "Codex Micro 1.1.0 is installed."
+Write-Host "Codex Micro 1.2.0 is installed."
 Write-Host "Bridge: $installedBridge"
 Write-Host "Automatic startup: $startupCommand"
