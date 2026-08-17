@@ -37,6 +37,7 @@ mod native {
     const RELAUNCH_FOCUS_TIMEOUT_MS: u64 = 4_000;
 
     const SELECT_SESSION_SCRIPT: &str = include_str!("hermes_select_session.ps1");
+    const FOCUS_COMPOSER_SCRIPT: &str = include_str!("focus_agent_composer.ps1");
 
     #[repr(C)]
     #[derive(Default)]
@@ -166,6 +167,11 @@ mod native {
                 DICTATION_ACTIVE.store(false, Ordering::SeqCst);
                 return Err("the Hermes window is no longer focused".to_owned());
             }
+            focus_composer(target)?;
+            if unsafe { GetForegroundWindow() } != target {
+                DICTATION_ACTIVE.store(false, Ordering::SeqCst);
+                return Err("the Hermes window lost focus while selecting its composer".to_owned());
+            }
             unsafe {
                 key_down(VK_LWIN);
                 tap_key(VK_H);
@@ -178,6 +184,12 @@ mod native {
             }
         }
         Ok(())
+    }
+
+    fn focus_composer(window: Hwnd) -> Result<(), String> {
+        let script =
+            format!("$WindowHandle = {window}\n$AgentName = 'Hermes'\n{FOCUS_COMPOSER_SCRIPT}");
+        run_automation(&script, "focused")
     }
 
     unsafe fn key_down(key: u8) {

@@ -35,6 +35,7 @@ mod native {
 
     const SELECT_SESSION_SCRIPT: &str = include_str!("select_zcode_session.ps1");
     const NEW_TASK_SCRIPT: &str = include_str!("new_zcode_task.ps1");
+    const FOCUS_COMPOSER_SCRIPT: &str = include_str!("focus_agent_composer.ps1");
 
     #[repr(C)]
     #[derive(Default)]
@@ -155,6 +156,11 @@ mod native {
                 DICTATION_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
                 return Err("the ZCode window is no longer focused".to_owned());
             }
+            focus_composer(target)?;
+            if unsafe { GetForegroundWindow() } != target {
+                DICTATION_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err("the ZCode window lost focus while selecting its composer".to_owned());
+            }
             unsafe {
                 key_down(VK_LWIN);
                 tap_key(VK_H);
@@ -167,6 +173,12 @@ mod native {
             }
         }
         Ok(())
+    }
+
+    fn focus_composer(window: Hwnd) -> Result<(), String> {
+        let script =
+            format!("$WindowHandle = {window}\n$AgentName = 'ZCode'\n{FOCUS_COMPOSER_SCRIPT}");
+        run_automation(&script, "focused")
     }
 
     pub fn minimize() -> Result<(), String> {

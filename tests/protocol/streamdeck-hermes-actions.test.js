@@ -48,6 +48,8 @@ test("the Hermes mic action mirrors the ZCode dictation semantics", () => {
     /pub fn set_microphone[\s\S]*\} else if DICTATION_ACTIVE[\s\S]*swap\(false[\s\S]*tap_key\(VK_ESCAPE\)/,
   );
   assert.match(hermesWindowSource, /pub fn microphone_active\(\) -> bool/);
+  assert.match(hermesWindowSource, /const FOCUS_COMPOSER_SCRIPT: &str = include_str!\("focus_agent_composer\.ps1"\)/);
+  assert.match(hermesWindowSource, /focus_composer\(target\)\?/);
 });
 
 test("the daemon new-task handler serves Hermes after ZCode", () => {

@@ -632,8 +632,9 @@ is ZCode-aware too. ZCode has no voice input of its own, so while the ZCode
 desktop app is the foreground window the mic key drives Windows' built-in
 dictation instead:
 
-- **Press** → the bridge sends `Win+H`, and Windows dictation transcribes
-  into ZCode's focused composer.
+- **Press** → the bridge first selects ZCode's message composer through
+  Windows UI Automation, then sends `Win+H`; dictation transcribes into that
+  composer without requiring a manual click.
 - **Release** → the bridge sends `Escape`, closing the dictation bar. This
   mirrors the Codex action's hold-to-talk semantics.
 

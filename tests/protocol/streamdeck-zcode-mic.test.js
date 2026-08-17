@@ -28,6 +28,8 @@ test("the ZCode mic action opens Windows dictation on press and closes it on rel
     /pub fn set_microphone[\s\S]*\} else if DICTATION_ACTIVE[\s\S]*swap\(false[\s\S]*tap_key\(VK_ESCAPE\)/,
   );
   assert.match(zcodeWindowSource, /pub fn microphone_active\(\) -> bool/);
+  assert.match(zcodeWindowSource, /const FOCUS_COMPOSER_SCRIPT: &str = include_str!\("focus_agent_composer\.ps1"\)/);
+  assert.match(zcodeWindowSource, /focus_composer\(target\)\?/);
 });
 
 test("every encoder-button mic route offers the ZCode dictation branch first", () => {

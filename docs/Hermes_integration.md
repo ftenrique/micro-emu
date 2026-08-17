@@ -323,8 +323,9 @@ fallback.
 The **Mic** action (Codex Micro ACT10, `encoder-button` index 2) is
 Hermes-aware too. Hermes has no voice input of its own, so while its window
 is the foreground app the mic key drives Windows' built-in dictation
-instead: **press** sends `Win+H` and dictation transcribes into Hermes'
-focused composer; **release** sends `Escape`, closing the dictation bar
+instead: **press** first selects Hermes' message composer through Windows UI
+Automation, then sends `Win+H`; dictation transcribes into that composer
+without requiring a manual click; **release** sends `Escape`, closing the dictation bar
 (hold-to-talk semantics). With anything else focused the mic key keeps its
 original ChatGPT/Codex behavior. The bridge remembers that it opened the
 dictation bar, so the release always closes it even if the dictation UI
