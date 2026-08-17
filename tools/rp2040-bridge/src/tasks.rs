@@ -1220,7 +1220,10 @@ impl TaskBoard {
         // The partition describes the six Micro positions. A larger primary
         // controller may have additional task-only slots; keep those slots
         // unrestricted instead of reserving them as unowned.
-        self.slot_owners.get(slot.slot).copied()
+        match self.slot_owners.get(slot.slot).copied() {
+            Some(None) if slot.slot >= crate::routing::LCD_SLOTS => None,
+            owner => owner,
+        }
     }
 
     /// Codex HID task IDs are logical hardware positions, not scheduler work

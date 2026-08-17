@@ -1293,7 +1293,7 @@ fn route_task_button(
         if task.owner_agent == crate::routing::AgentId::Hermes
             && task.owner_session == crate::daemon::HERMES_POLL_SESSION
         {
-            crate::hermes_window::request_session_selection(&task.title);
+            crate::hermes_window::request_session_selection(&task.task_id, &task.title);
         }
     }
 

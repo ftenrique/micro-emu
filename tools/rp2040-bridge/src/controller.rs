@@ -289,6 +289,10 @@ pub trait PhysicalController {
             ControllerKind::None => 0,
         }
     }
+    /// Optional per-slot ownership requested by a virtual controller.
+    fn task_slot_agent_overrides(&self) -> Option<Vec<(usize, crate::routing::AgentId)>> {
+        None
+    }
     fn device_id(&self) -> String {
         self.serial()
             .map(|serial| format!("{}:{serial}", self.kind().as_str()))

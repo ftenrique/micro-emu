@@ -15,9 +15,16 @@
             <option value="5">Slot 6</option>
             <option value="6">Slot 7</option>
             <option value="7">Slot 8</option>
-            <option value="8">Slot 9</option>
         </sdpi-select>
     </sdpi-item>
-    <p>Slots 1-6 mirror Codex Micro positions. Slots 7-9 are desktop-only Codex task cards and open their selected thread through Codex.</p>
+    <sdpi-item label="Agent">
+        <sdpi-select setting="agent">
+            <option value="auto">Auto</option>
+            <option value="codex">Codex</option>
+            <option value="zcode">ZCode</option>
+            <option value="hermes">Hermes</option>
+        </sdpi-select>
+    </sdpi-item>
+    <p>Slots 1-6 mirror the shared agent positions. Slots 7-8 are overflow task cards.</p>
 </body>
 </html>

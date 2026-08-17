@@ -3,10 +3,10 @@
 #[cfg(windows)]
 mod native {
     use std::ffi::c_void;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
 
     type Bool = i32;
@@ -97,14 +97,22 @@ mod native {
     /// Whether the last press opened the Windows dictation bar in Hermes.
     static DICTATION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-    /// Latest-wins queue of pending session-selection titles, feeding the
-    /// single sidebar-automation worker. UIA can take seconds per request,
-    /// so the daemon loop never blocks on it and a burst of presses collapses
-    /// into the most recent request.
+    #[derive(Clone)]
+    struct AutomationRequest {
+        generation: u64,
+        session_id: String,
+        title: String,
+    }
+
+    /// Latest-wins queue of pending session selections, feeding the single
+    /// sidebar-automation worker. A generation also cancels an already-running
+    /// PowerShell request, so an old slow UIA lookup cannot win after a newer
+    /// card press.
     struct AutomationQueue {
-        pending: Mutex<Option<String>>,
+        pending: Mutex<Option<AutomationRequest>>,
         signaled: Condvar,
         started: AtomicBool,
+        generation: AtomicU64,
     }
 
     static AUTOMATION_QUEUE: OnceLock<AutomationQueue> = OnceLock::new();
@@ -209,27 +217,33 @@ mod native {
         eprintln!("Hermes window focus failed: relaunch did not raise the window");
     }
 
-    /// Asks the running Hermes desktop app to make the session with `title`
-    /// the active one. Returns as soon as the request is queued; the UIA
-    /// work happens on a worker thread.
-    pub fn request_session_selection(title: &str) {
-        if title.trim().is_empty() {
+    /// Asks the running Hermes desktop app to make `session_id` active. The
+    /// stable id is used to filter Hermes' own session list; `title` is only
+    /// used to verify the resulting active tab and as a compatibility fallback.
+    pub fn request_session_selection(session_id: &str, title: &str) {
+        let session_id = session_id
+            .trim()
+            .strip_prefix("hermes:")
+            .unwrap_or(session_id.trim());
+        if session_id.is_empty() || title.trim().is_empty() {
             return;
         }
-        queue_request(title.trim().to_owned());
+        queue_request(session_id.to_owned(), title.trim().to_owned());
     }
 
-    fn queue_request(title: String) {
+    fn queue_request(session_id: String, title: String) {
         let queue: &'static AutomationQueue = AUTOMATION_QUEUE.get_or_init(|| AutomationQueue {
             pending: Mutex::new(None),
             signaled: Condvar::new(),
             started: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
         });
+        let generation = queue.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if !queue.started.swap(true, Ordering::SeqCst) {
             let _ = std::thread::Builder::new()
                 .name("hermes-sidebar-automation".to_owned())
                 .spawn(move || loop {
-                    let title = {
+                    let request = {
                         let mut guard = queue
                             .pending
                             .lock()
@@ -242,7 +256,7 @@ mod native {
                         }
                         guard.take()
                     };
-                    if let Some(title) = title {
+                    if let Some(request) = request {
                         // A cold Chromium accessibility tree can outlive the
                         // script's own warm-up window, especially right after
                         // Hermes starts. Retry a bounded number of times so a
@@ -250,22 +264,24 @@ mod native {
                         // the tree still materializing.
                         const MAX_ATTEMPTS: u8 = 3;
                         for attempt in 1..=MAX_ATTEMPTS {
-                            match run_request(&title) {
+                            if queue.generation.load(Ordering::SeqCst) != request.generation {
+                                break;
+                            }
+                            match run_request(&request, queue) {
                                 Ok(()) => {
                                     if attempt > 1 {
                                         crate::diaglog::log(&format!(
-                                            "hermes session selection for {title:?} succeeded on attempt {attempt}"
+                                            "hermes session selection for {:?} succeeded on attempt {attempt}", request.title
                                         ));
                                     }
                                     break;
                                 }
+                                Err(error) if error == "superseded" => break,
                                 Err(error) if attempt < MAX_ATTEMPTS => {
                                     eprintln!(
-                                        "Hermes session selection for {title:?} failed (attempt {attempt}/{MAX_ATTEMPTS}): {error}",
+                                        "Hermes session selection for {:?} failed (attempt {attempt}/{MAX_ATTEMPTS}): {error}", request.title,
                                     );
-                                    std::thread::sleep(std::time::Duration::from_millis(
-                                        u64::from(attempt) * 4_000,
-                                    ));
+                                    std::thread::sleep(std::time::Duration::from_millis(500));
                                     // A newer press supersedes this retry loop.
                                     let superseded = queue
                                         .pending
@@ -278,10 +294,10 @@ mod native {
                                 }
                                 Err(error) => {
                                     eprintln!(
-                                        "Hermes session selection for {title:?} failed: {error}"
+                                        "Hermes session selection for {:?} failed: {error}", request.title
                                     );
                                     crate::diaglog::log(&format!(
-                                        "hermes session selection for {title:?} failed after {MAX_ATTEMPTS} attempts: {error}"
+                                        "hermes session selection for {:?} failed after {MAX_ATTEMPTS} attempts: {error}", request.title
                                     ));
                                 }
                             }
@@ -293,20 +309,33 @@ mod native {
             .pending
             .lock()
             .expect("hermes automation queue lock poisoned");
-        *pending = Some(title);
+        *pending = Some(AutomationRequest {
+            generation,
+            session_id,
+            title,
+        });
         queue.signaled.notify_one();
     }
 
-    fn run_request(title: &str) -> Result<(), String> {
+    fn run_request(
+        request: &AutomationRequest,
+        queue: &'static AutomationQueue,
+    ) -> Result<(), String> {
         let window = find_hermes_window()?;
         let script = format!(
-            "$WindowHandle = {window}\n$TargetTitle = '{}'\n{SELECT_SESSION_SCRIPT}",
-            escape_powershell_single_quoted(title)
+            "$WindowHandle = {window}\n$TargetSessionId = '{}'\n$TargetTitle = '{}'\n{SELECT_SESSION_SCRIPT}",
+            escape_powershell_single_quoted(&request.session_id),
+            escape_powershell_single_quoted(&request.title)
         );
-        run_automation(&script, "selected")
+        run_automation(&script, "selected", request.generation, queue)
     }
 
-    fn run_automation(script: &str, success_marker: &str) -> Result<(), String> {
+    fn run_automation(
+        script: &str,
+        success_marker: &str,
+        generation: u64,
+        queue: &'static AutomationQueue,
+    ) -> Result<(), String> {
         let mut child = Command::new("powershell.exe")
             .args([
                 "-NoProfile",
@@ -330,14 +359,34 @@ mod native {
             .write_all(script.as_bytes())
             .map_err(|error| format!("could not send Hermes sidebar automation: {error}"))?;
 
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("Hermes sidebar automation did not finish: {error}"))?;
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Hermes sidebar automation failed: {}", error.trim()));
+        let status = loop {
+            if queue.generation.load(Ordering::SeqCst) != generation {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("superseded".to_owned());
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(error) => {
+                    return Err(format!("Hermes sidebar automation did not finish: {error}"));
+                }
+            }
+        };
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        if let Some(mut output) = child.stdout.take() {
+            let _ = output.read_to_string(&mut stdout);
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(mut error) = child.stderr.take() {
+            let _ = error.read_to_string(&mut stderr);
+        }
+        if !status.success() {
+            return Err(format!(
+                "Hermes sidebar automation failed: {}",
+                stderr.trim()
+            ));
+        }
         if stdout.lines().any(|line| line.trim() == success_marker) {
             Ok(())
         } else {
@@ -515,7 +564,10 @@ mod native {
 
         #[test]
         fn escapes_single_quotes_for_powershell_literals() {
-            assert_eq!(escape_powershell_single_quoted("plain title"), "plain title");
+            assert_eq!(
+                escape_powershell_single_quoted("plain title"),
+                "plain title"
+            );
             assert_eq!(
                 escape_powershell_single_quoted("it's a task's title"),
                 "it''s a task''s title"
@@ -547,7 +599,7 @@ pub fn start_new_session() -> Result<(), String> {
     Err("Hermes window control is only available on Windows".to_owned())
 }
 #[cfg(not(windows))]
-pub fn request_session_selection(_title: &str) {}
+pub fn request_session_selection(_session_id: &str, _title: &str) {}
 #[cfg(not(windows))]
 pub fn microphone_active() -> bool {
     false

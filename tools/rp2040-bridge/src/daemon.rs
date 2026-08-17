@@ -187,6 +187,82 @@ fn effective_active_set(
     set
 }
 
+/// Builds task-card ownership for the primary Stream Deck. Explicit Task Card
+/// preferences win per slot; missing preferences use the automatic layout.
+/// The first six slots keep the Micro-friendly three-agent layout, while slots
+/// 7-8 remain overflow slots and are intentionally left to the scheduler.
+fn task_slot_owners(
+    slot_count: usize,
+    active: ActiveSet,
+    overrides: Option<Vec<(usize, AgentId)>>,
+) -> Vec<Option<AgentId>> {
+    let mut owners = vec![None; slot_count];
+    let codex = active.contains(AgentId::Codex);
+    let zcode = active.contains(AgentId::ZCode);
+    let hermes = active.contains(AgentId::Hermes);
+    if codex && zcode && hermes {
+        for slot in [0, 1] {
+            if slot < slot_count {
+                owners[slot] = Some(AgentId::Codex);
+            }
+        }
+        for slot in [2, 5] {
+            if slot < slot_count {
+                owners[slot] = Some(AgentId::Hermes);
+            }
+        }
+        for slot in [3, 4] {
+            if slot < slot_count {
+                owners[slot] = Some(AgentId::ZCode);
+            }
+        }
+    } else {
+        let active_agents = [AgentId::Codex, AgentId::ZCode, AgentId::Hermes]
+            .into_iter()
+            .filter(|agent| active.contains(*agent))
+            .collect::<Vec<_>>();
+        if active_agents.len() == 1 {
+            owners
+                .iter_mut()
+                .for_each(|owner| *owner = Some(active_agents[0]));
+        } else if active_agents.len() >= 2 {
+            let split = slot_count / active_agents.len();
+            for (index, agent) in active_agents.iter().enumerate() {
+                let start = index * split;
+                let end = if index + 1 == active_agents.len() {
+                    slot_count
+                } else {
+                    (index + 1) * split
+                };
+                for owner in owners[start..end].iter_mut() {
+                    *owner = Some(*agent);
+                }
+            }
+        }
+    }
+    if let Some(overrides) = overrides {
+        for (slot, agent) in overrides {
+            if slot < owners.len() {
+                owners[slot] = Some(agent);
+            }
+        }
+    }
+    owners
+}
+
+fn task_slots_for_agent(
+    slot_count: usize,
+    active: ActiveSet,
+    overrides: Option<Vec<(usize, AgentId)>>,
+    agent: AgentId,
+) -> usize {
+    task_slot_owners(slot_count, active, overrides)
+        .into_iter()
+        .flatten()
+        .filter(|owner| *owner == agent)
+        .count()
+}
+
 /// Refreshes the usage snapshots the current setup may display: the selected
 /// source always; other agents while their sessions are live or while a
 /// plugin deck is connected (its strips can render either agent). Returns
@@ -285,9 +361,14 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         bridge.partition = Partition::compute(active);
         bridge.task_board.set_slot_owners(
             bridge.task_device_id.clone(),
-            (0..bridge.task_slot_count)
-                .map(|slot| bridge.partition.owner_of(slot as u8))
-                .collect(),
+            task_slot_owners(
+                bridge.task_slot_count,
+                active,
+                bridge
+                    .controller
+                    .as_ref()
+                    .and_then(|controller| controller.task_slot_agent_overrides()),
+            ),
         );
     }
     eprintln!("{}", crate::bridge_status(&bridge, "daemon"));
@@ -684,6 +765,26 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         bridge.task_board.expire(now_ms());
         let _ = crate::refresh_task_board(&mut bridge);
         crate::poll_controller(&mut bridge, false)?;
+        // Capacity messages from the Stream Deck carry Task Card ownership
+        // preferences. Apply them immediately, even when agent liveness did
+        // not change and therefore no repartition was scheduled.
+        let active = effective_active_set(
+            session_agents,
+            codex_hardware_active,
+            zcode_desktop_active,
+            hermes_desktop_active,
+        );
+        let owners = task_slot_owners(
+            bridge.task_slot_count,
+            active,
+            bridge
+                .controller
+                .as_ref()
+                .and_then(|controller| controller.task_slot_agent_overrides()),
+        );
+        bridge
+            .task_board
+            .set_slot_owners(bridge.task_device_id.clone(), owners);
         for (session_id, event) in bridge.pending_task_events.drain(..) {
             if let Some(agent) = catalog_action_agent(session_id) {
                 // Multiple proxies for one agent can briefly overlap during a
@@ -794,7 +895,21 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     // six-card snapshot while ZCode owns three slots leaves old
                     // sticky assignments in place and sends newly started tasks
                     // to overflow with no visible change on the device.
-                    let zcode_slots = bridge.partition.slots_for(AgentId::ZCode).len();
+                    let active = effective_active_set(
+                        session_agents,
+                        codex_hardware_active,
+                        zcode_desktop_active,
+                        hermes_desktop_active,
+                    );
+                    let zcode_slots = task_slots_for_agent(
+                        bridge.task_slot_count,
+                        active,
+                        bridge
+                            .controller
+                            .as_ref()
+                            .and_then(|controller| controller.task_slot_agent_overrides()),
+                        AgentId::ZCode,
+                    );
                     if let Some(snapshot) =
                         crate::zcode_state::read_zcode_snapshot(now_ms(), zcode_slots)
                     {
@@ -851,7 +966,21 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             }
             if next_hermes_poll_at.is_some_and(|poll_at| now >= poll_at) {
                 next_hermes_poll_at = Some(now + HERMES_POLL_INTERVAL);
-                let hermes_slots = bridge.partition.slots_for(AgentId::Hermes).len();
+                let active = effective_active_set(
+                    session_agents,
+                    codex_hardware_active,
+                    zcode_desktop_active,
+                    hermes_desktop_active,
+                );
+                let hermes_slots = task_slots_for_agent(
+                    bridge.task_slot_count,
+                    active,
+                    bridge
+                        .controller
+                        .as_ref()
+                        .and_then(|controller| controller.task_slot_agent_overrides()),
+                    AgentId::Hermes,
+                );
                 if let Some(snapshot) =
                     crate::hermes_state::read_hermes_snapshot(now_ms(), hermes_slots)
                 {
@@ -948,9 +1077,14 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                 bridge.partition = new_partition.clone();
                 bridge.task_board.set_slot_owners(
                     bridge.task_device_id.clone(),
-                    (0..bridge.task_slot_count)
-                        .map(|slot| new_partition.owner_of(slot as u8))
-                        .collect(),
+                    task_slot_owners(
+                        bridge.task_slot_count,
+                        active,
+                        bridge
+                            .controller
+                            .as_ref()
+                            .and_then(|controller| controller.task_slot_agent_overrides()),
+                    ),
                 );
                 // Re-render through the centralized desired-state path.  An
                 // empty fused buffer is not an explicit Codex update; sending
@@ -1861,6 +1995,33 @@ mod tests {
                 json!("zcode")
             ]
         );
+    }
+
+    #[test]
+    fn auto_task_slots_use_the_requested_three_agent_layout() {
+        let mut active = ActiveSet::new();
+        active.insert(AgentId::Codex);
+        active.insert(AgentId::ZCode);
+        active.insert(AgentId::Hermes);
+        assert_eq!(
+            task_slot_owners(8, active, None),
+            vec![
+                Some(AgentId::Codex),
+                Some(AgentId::Codex),
+                Some(AgentId::Hermes),
+                Some(AgentId::ZCode),
+                Some(AgentId::ZCode),
+                Some(AgentId::Hermes),
+                None,
+                None,
+            ]
+        );
+        assert_eq!(
+            task_slot_owners(8, active, Some(vec![(6, AgentId::Hermes)]))[6],
+            Some(AgentId::Hermes)
+        );
+        assert_eq!(task_slots_for_agent(8, active, None, AgentId::Hermes), 2);
+        assert_eq!(task_slots_for_agent(8, active, None, AgentId::ZCode), 2);
     }
 
     #[test]

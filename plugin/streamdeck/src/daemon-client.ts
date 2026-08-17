@@ -87,6 +87,7 @@ export class DaemonClient extends EventEmitter {
     private autostartAttempted = false;
     private lastInboundAt = 0;
     private taskSlots = 0;
+    private slotAgents: Record<string, string> = {};
     private instanceId: string;
     /** Pending new-task round trips, resolved in request order. */
     private newTaskWaiters: Array<(handled: boolean) => void> = [];
@@ -113,7 +114,15 @@ export class DaemonClient extends EventEmitter {
     setTaskSlots(slots: number): void {
         this.taskSlots = slots;
         if (this.connected) {
-            this.send({ type: "capacity", taskSlots: slots });
+            this.send({ type: "capacity", taskSlots: slots, slotAgents: this.slotAgents });
+        }
+    }
+
+    setTaskSlotAgent(slot: number, agent: string): void {
+        if (agent === "auto") delete this.slotAgents[String(slot)];
+        else this.slotAgents[String(slot)] = agent;
+        if (this.connected) {
+            this.send({ type: "capacity", taskSlots: this.taskSlots, slotAgents: this.slotAgents });
         }
     }
 
@@ -275,6 +284,7 @@ export class DaemonClient extends EventEmitter {
                 controller: "streamdeck-plugin",
                 instance_id: this.instanceId,
                 taskSlots: this.taskSlots,
+                slotAgents: this.slotAgents,
             };
             socket.write(JSON.stringify(hello) + "\n");
             this.emit("log", "daemon connected");

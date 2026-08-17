@@ -8,7 +8,9 @@
 
 use crate::codex::{CatalogAction, PhysicalEvent};
 use crate::controller::{ControllerKind, DisplayContext, PhysicalController};
+use crate::routing::AgentId;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 /// Maximum task slots a plugin may report. Matches the `DeviceSpec` cap.
@@ -34,6 +36,7 @@ pub struct PluginController {
     writer: PluginWriter,
     /// Current task-slot capacity reported by the plugin.
     task_slots: usize,
+    slot_agents: BTreeMap<usize, AgentId>,
     /// Set true when the session socket has closed.
     disconnected: bool,
     /// Last successfully transmitted state for each render channel. The daemon
@@ -60,6 +63,7 @@ impl PluginController {
             events,
             writer,
             task_slots: task_slots.min(MAX_PLUGIN_TASK_SLOTS),
+            slot_agents: BTreeMap::new(),
             disconnected: false,
             last_task_cards: None,
             last_thread_status: None,
@@ -88,6 +92,26 @@ impl PluginController {
             "capacity" => {
                 if let Some(slots) = message.get("taskSlots").and_then(Value::as_u64) {
                     self.task_slots = (slots as usize).min(MAX_PLUGIN_TASK_SLOTS);
+                }
+                if let Some(map) = message.get("slotAgents").and_then(Value::as_object) {
+                    self.slot_agents.clear();
+                    for (raw_slot, value) in map {
+                        let Ok(slot) = raw_slot.parse::<usize>() else {
+                            continue;
+                        };
+                        if slot >= self.task_slots {
+                            continue;
+                        }
+                        let Some(agent) = value.as_str().and_then(|value| match value {
+                            "codex" => Some(AgentId::Codex),
+                            "zcode" => Some(AgentId::ZCode),
+                            "hermes" => Some(AgentId::Hermes),
+                            _ => None,
+                        }) else {
+                            continue;
+                        };
+                        self.slot_agents.insert(slot, agent);
+                    }
                 }
                 None
             }
@@ -320,6 +344,15 @@ impl PhysicalController for PluginController {
     }
     fn task_slot_count(&self) -> usize {
         self.task_slots
+    }
+
+    fn task_slot_agent_overrides(&self) -> Option<Vec<(usize, AgentId)>> {
+        (!self.slot_agents.is_empty()).then(|| {
+            self.slot_agents
+                .iter()
+                .map(|(&slot, &agent)| (slot, agent))
+                .collect()
+        })
     }
 
     fn device_id(&self) -> String {

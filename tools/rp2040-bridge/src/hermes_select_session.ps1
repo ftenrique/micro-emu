@@ -11,6 +11,9 @@ if ($null -eq $WindowHandle) {
 if ($null -eq $TargetTitle -or [string]::IsNullOrWhiteSpace($TargetTitle)) {
     throw "Hermes session title was not supplied"
 }
+if ($null -eq $TargetSessionId -or [string]::IsNullOrWhiteSpace($TargetSessionId)) {
+    throw "Hermes session id was not supplied"
+}
 
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -122,6 +125,15 @@ function Find-SessionRow {
     return $best
 }
 
+function Find-AnySessionRow {
+    param([System.Windows.Automation.AutomationElement]$SearchRoot)
+
+    return Find-Element $SearchRoot {
+        param($element)
+        Test-SessionRow $element
+    }
+}
+
 function Find-SidebarToggle {
     param([System.Windows.Automation.AutomationElement]$SearchRoot)
 
@@ -189,49 +201,57 @@ if ($null -eq $root) {
     throw "Hermes window is not available to Windows UI Automation"
 }
 
-# Keep polling until the session list materializes. A Hermes that has been
-# running for a while without any automation client tears its accessibility
-# tree down, and rebuilding it for a large session list can take many seconds,
-# so the budget here is deliberately generous.
+# Warm Chromium's accessibility tree briefly. Selection below filters Hermes'
+# own session list by the stable session id, so it does not need to scan a large
+# sidebar or wait for a title that may be duplicated or stale.
 $sessionRow = $null
 $warmup = [System.Diagnostics.Stopwatch]::StartNew()
-while ($null -eq $sessionRow) {
-    $sessionRow = Find-SessionRow $root
-    if ($null -ne $sessionRow) {
+while ($true) {
+    $searchBox = Find-SearchBox $root
+    $toggle = Find-SidebarToggle $root
+    $sessionRow = Find-AnySessionRow $root
+    if ($null -ne $searchBox -or $null -ne $toggle -or $null -ne $sessionRow) {
         break
     }
-    if ($warmup.ElapsedMilliseconds -ge 20000) {
+    if ($warmup.ElapsedMilliseconds -ge 3000) {
         break
     }
     Invoke-AccessibilityPoke ([IntPtr]$WindowHandle)
-    Start-Sleep -Milliseconds 250
+    Start-Sleep -Milliseconds 150
 }
 
 # The session list lives in the collapsible sidebar. When the user keeps it
 # collapsed the rows are not rendered at all, so open it for the selection
 # and restore the collapsed state afterwards.
 $sidebarOpened = $false
-if ($null -eq $sessionRow) {
+if ($null -eq $toggle) {
     $toggle = Find-SidebarToggle $root
-    if ($null -ne $toggle -and $toggle.Current.Name -eq "Show sidebar") {
-        if (-not (Invoke-Element $toggle)) {
-            throw "The Hermes sidebar toggle has no invoke pattern"
-        }
-        $sidebarOpened = $true
-        $sessionRow = Wait-For { Find-SessionRow $root } 4000
+}
+if ($null -ne $toggle -and $toggle.Current.Name -eq "Show sidebar") {
+    if (-not (Invoke-Element $toggle)) {
+        throw "The Hermes sidebar toggle has no invoke pattern"
     }
+    $sidebarOpened = $true
+    $searchBox = Wait-For { Find-SearchBox $root } 2500
 }
 
-# Older sessions sit behind the sidebar's initial page. The search box
-# filters the whole list, so typing the title surfaces any row; the filter
-# is cleared afterwards to leave the user's view unchanged.
+# Hermes' command-center and sidebar search both index the stable session id.
+# Filtering by it makes duplicate titles unambiguous. Fall back to title only
+# for older Hermes builds that do not index ids in the sidebar search.
 $searchUsed = $false
-if ($null -eq $sessionRow) {
+if ($null -eq $searchBox) {
     $searchBox = Find-SearchBox $root
-    if ($null -ne $searchBox -and (Set-SearchText $searchBox $TargetTitle)) {
-        $searchUsed = $true
-        $sessionRow = Wait-For { Find-SessionRow $root } 4000
+}
+if ($null -ne $searchBox -and (Set-SearchText $searchBox $TargetSessionId)) {
+    $searchUsed = $true
+    Start-Sleep -Milliseconds 250
+    $sessionRow = Wait-For { Find-AnySessionRow $root } 3000
+    if ($null -eq $sessionRow -and (Set-SearchText $searchBox $TargetTitle)) {
+        Start-Sleep -Milliseconds 250
+        $sessionRow = Wait-For { Find-SessionRow $root } 3000
     }
+} else {
+    $sessionRow = Wait-For { Find-SessionRow $root } 2500
 }
 
 if ($null -eq $sessionRow) {
@@ -269,7 +289,7 @@ if ($searchUsed) {
 # negative.
 $activated = $false
 $timer = [System.Diagnostics.Stopwatch]::StartNew()
-while ($timer.ElapsedMilliseconds -lt 5000) {
+while ($timer.ElapsedMilliseconds -lt 2500) {
     $activeTab = Find-Element $root {
         param($element)
         $element.Current.ControlType -eq [System.Windows.Automation.ControlType]::TabItem -and

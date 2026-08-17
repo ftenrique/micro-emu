@@ -5,14 +5,16 @@ import { renderTaskCardImage, renderDisconnectedImage } from "../images";
 import { TASK_SLOT_COUNT } from "../task-slots";
 
 const TIMER_REFRESH_MS = 1_000;
-// The ninth card is desktop-only when the attached hardware has fewer keys.
+// Stream Deck exposes eight task-card positions.
 const LONG_PRESS_MS = 650;
 
 /** Settings for the Task Card action. */
 export interface TaskCardSettings {
     [key: string]: JsonValue;
     /** Task-board slot index (0-based). */
-    slot?: number;
+    slot?: number | string;
+    /** Fixed owner for this card, or auto for daemon-managed allocation. */
+    agent?: "auto" | "codex" | "zcode" | "hermes";
 }
 
 type TaskCardInstance = KeyAction<TaskCardSettings> | DialAction<TaskCardSettings>;
@@ -42,14 +44,41 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
 
     onWillAppear(ev: WillAppearEvent<TaskCardSettings>): void {
         const action = ev.action as TaskCardInstance;
-        this.actionSettings.set(action, ev.payload.settings);
-        this.enqueueRefresh(action, ev.payload.settings);
+        const settings = this.migrateLegacySlot(action, ev.payload.settings);
+        this.actionSettings.set(action, settings);
+        this.syncAgent(settings);
+        this.enqueueRefresh(action, settings);
     }
 
     onDidReceiveSettings(ev: DidReceiveSettingsEvent<TaskCardSettings>): void {
         const action = ev.action as TaskCardInstance;
         this.actionSettings.set(action, ev.payload.settings);
+        this.syncAgent(ev.payload.settings);
         this.enqueueRefresh(action, ev.payload.settings);
+    }
+
+    private syncAgent(settings: TaskCardSettings): void {
+        const slot = Number(settings.slot ?? 0);
+        const agent = settings.agent === "codex" || settings.agent === "zcode" || settings.agent === "hermes"
+            ? settings.agent : "auto";
+        if (Number.isInteger(slot) && slot >= 0 && slot < TASK_SLOT_COUNT) {
+            this.ctx.daemon.setTaskSlotAgent(slot, agent);
+        }
+    }
+
+    private migrateLegacySlot(action: TaskCardInstance, settings: TaskCardSettings): TaskCardSettings {
+        const slot = Number(settings.slot ?? 0);
+        // Profiles created while nine logical cards were exposed may retain
+        // the removed ninth slot. For a fixed Hermes block, move that final
+        // card to the newly available first position of the last three slots
+        // (legacy 7-9 becomes current 6-8) instead of leaving it blank.
+        if (slot !== TASK_SLOT_COUNT || settings.agent !== "hermes") return settings;
+        const migrated = { ...settings, slot: TASK_SLOT_COUNT - 3 };
+        void action.setSettings(migrated).catch((error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error);
+            streamDeck.logger.warn(`Task-card legacy slot migration failed: ${message}`);
+        });
+        return migrated;
     }
     onKeyDown(ev: KeyDownEvent<TaskCardSettings>): void {
         if (!this.ctx.isConnected()) {

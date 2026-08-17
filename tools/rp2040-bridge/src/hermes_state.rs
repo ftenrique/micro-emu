@@ -34,14 +34,193 @@ pub fn hermes_db_path() -> Option<PathBuf> {
 }
 
 pub fn read_hermes_snapshot(now_ms: u128, max_tasks: usize) -> Option<Value> {
-    let path = hermes_db_path()?;
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-    connection.busy_timeout(Duration::from_millis(100)).ok()?;
-    read_hermes_snapshot_from_connection(&connection, now_ms, max_tasks)
+    let local = hermes_db_path().and_then(|path| {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .ok()?;
+        connection.busy_timeout(Duration::from_millis(100)).ok()?;
+        read_hermes_snapshot_from_connection(&connection, now_ms, max_tasks)
+    });
+    if local
+        .as_ref()
+        .and_then(|snapshot| snapshot.get("tasks"))
+        .and_then(Value::as_array)
+        .is_some_and(|tasks| !tasks.is_empty())
+    {
+        return local;
+    }
+    read_remote_cache_snapshot(now_ms, max_tasks).or(local)
+}
+
+/// Hermes Desktop can point at an OAuth-protected remote backend. In that
+/// mode the local state.db is intentionally empty, but Electron caches the
+/// already-authenticated sidebar response as a plain JSON response body. Read
+/// that response as a credential-free fallback so remote sessions remain
+/// visible without duplicating Chromium's OAuth cookie handling in the bridge.
+fn read_remote_cache_snapshot(now_ms: u128, max_tasks: usize) -> Option<Value> {
+    if max_tasks == 0 {
+        return Some(json!({"tasks": []}));
+    }
+    let roaming = std::env::var("APPDATA").ok()?;
+    let cache_dir = Path::new(&roaming)
+        .join("Hermes")
+        .join("Partitions")
+        .join("hermes-remote-oauth")
+        .join("Cache")
+        .join("Cache_Data");
+    let mut candidates = std::fs::read_dir(cache_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("f_") {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() || metadata.len() > 2 * 1024 * 1024 {
+                return None;
+            }
+            Some((metadata.modified().ok()?, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(modified, _)| *modified);
+
+    for (_, path) in candidates.into_iter().rev().take(64) {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let Ok(response) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(sessions) = response
+            .get("recents")
+            .and_then(|recents| recents.get("sessions"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        let mut sessions = sessions.iter().collect::<Vec<_>>();
+        sessions.sort_by(|left, right| {
+            cached_session_active(right)
+                .cmp(&cached_session_active(left))
+                .then_with(|| {
+                    cached_session_activity(right)
+                        .partial_cmp(&cached_session_activity(left))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        let tasks = sessions
+            .into_iter()
+            .filter_map(|session| build_cached_task(session, now_ms))
+            .take(max_tasks)
+            .collect::<Vec<_>>();
+        return Some(json!({"tasks": tasks}));
+    }
+    None
+}
+
+fn cached_session_active(session: &Value) -> bool {
+    session
+        .get("is_active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn cached_session_activity(session: &Value) -> f64 {
+    session
+        .get("last_active")
+        .or_else(|| session.get("last_activity_at"))
+        .or_else(|| session.get("started_at"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+}
+
+fn build_cached_task(session: &Value, now_ms: u128) -> Option<Value> {
+    let id = session.get("id")?.as_str()?;
+    let source = session
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(source, "delegate" | "batch")
+        || session
+            .get("archived")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let title = ["title", "display_name", "preview"]
+        .into_iter()
+        .find_map(|key| {
+            session
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or(id);
+    let task_id = format!("hermes:{id}");
+    let cwd = session.get("cwd").and_then(Value::as_str);
+    let project = cwd.map(project_name).or_else(|| {
+        session
+            .get("profile")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    let model = session.get("model").and_then(Value::as_str);
+    let active = cached_session_active(session);
+    let end_reason = session
+        .get("end_reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let failed = end_reason.contains("error") || end_reason.contains("fail");
+    let ended_at = session.get("ended_at").and_then(Value::as_f64);
+    let state = if active {
+        "running"
+    } else if failed {
+        "error"
+    } else if ended_at.is_some() {
+        "completed"
+    } else {
+        "queued"
+    };
+    let activity_ms = seconds_to_ms(cached_session_activity(session));
+    let started_at_ms = session
+        .get("started_at")
+        .and_then(Value::as_f64)
+        .map(seconds_to_ms)
+        .or((state == "running").then_some(now_ms.min(activity_ms)));
+    let finished_at_ms = if active {
+        None
+    } else {
+        Some(ended_at.map(seconds_to_ms).unwrap_or(activity_ms))
+    };
+    let priority = if active {
+        TASK_PRIORITY_ACTIVE
+    } else {
+        TASK_PRIORITY_IDLE
+    };
+    Some(json!({
+        "task_id": task_id,
+        "title": title,
+        "project": project,
+        "workspace_path": cwd,
+        "model": model,
+        "state": state,
+        "priority": priority,
+        "started_at_ms": started_at_ms,
+        "finished_at_ms": finished_at_ms,
+        "timing_authoritative": true,
+        "context": {
+            "project": project,
+            "task": title,
+            "model": model,
+            "status": state,
+            "task_id": task_id,
+        }
+    }))
 }
 
 fn read_hermes_snapshot_from_connection(
@@ -323,5 +502,30 @@ mod tests {
         let tasks = snapshot["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0]["task_id"], "hermes:new");
+    }
+
+    #[test]
+    fn cached_remote_active_session_maps_to_running_task() {
+        let task = build_cached_task(
+            &json!({
+                "id": "remote-1",
+                "source": "desktop",
+                "title": "Remote work",
+                "model": "hermes-4",
+                "profile": "default",
+                "started_at": 10.0,
+                "last_active": 12.0,
+                "ended_at": null,
+                "archived": false,
+                "is_active": true
+            }),
+            13_000,
+        )
+        .unwrap();
+        assert_eq!(task["task_id"], "hermes:remote-1");
+        assert_eq!(task["state"], "running");
+        assert_eq!(task["project"], "default");
+        assert_eq!(task["started_at_ms"], 10_000);
+        assert!(task["finished_at_ms"].is_null());
     }
 }
