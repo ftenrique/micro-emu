@@ -1666,11 +1666,10 @@ fn route_model_cycle(bridge: &mut BridgeRuntime) {
     }
     match crate::codex_window::cycle_model() {
         Ok(model) => {
-            // Mirror the freshly written config into the display context so the
-            // strip reflects the cycled model immediately. A selected task with
-            // its own per-thread model still overlays this value (see
-            // `overlay_display_context`), so this is most visible when no task
-            // is selected or the task has no model of its own.
+            // The selected task takes precedence over the base display context.
+            // Update both layers so every display, including the Context key,
+            // immediately reflects the model selected in the Codex window.
+            bridge.task_board.set_selected_model(model);
             if let Some(context) = bridge.last_display_context.as_mut() {
                 context.model = Some(model.to_owned());
             }

@@ -893,6 +893,21 @@ impl TaskBoard {
             .and_then(|task_id| self.tasks.get(task_id))
     }
 
+    /// Updates the model shown for the currently selected task.  Local model
+    /// changes (for example, the Codex desktop model picker) do not emit a
+    /// task snapshot, so retain the new value until the next authoritative
+    /// task update arrives.
+    pub fn set_selected_model(&mut self, model: impl Into<String>) -> bool {
+        let Some(task_id) = self.selected.clone() else {
+            return false;
+        };
+        let Some(task) = self.tasks.get_mut(&task_id) else {
+            return false;
+        };
+        task.model = Some(model.into());
+        true
+    }
+
     pub fn selected(&self, device_id: &str) -> Option<&str> {
         let task_id = self.selected.as_deref()?;
         let assignment = self.assignments.get(task_id)?;
@@ -1539,6 +1554,31 @@ mod tests {
         assert_eq!(context["task"], "1 \u{2014} Build bridge");
         assert_eq!(context["status"], "running");
         assert_eq!(context["progress"], 42);
+    }
+
+    #[test]
+    fn selected_model_update_refreshes_the_selected_display_context() {
+        let mut board = TaskBoard::new();
+        board.set_device("plus", 8, true);
+        board
+            .publish_tasks(
+                1,
+                AgentId::Codex,
+                &json!({"tasks": [{
+                    "task_id": "build",
+                    "title": "Build bridge",
+                    "model": "gpt-5.6-sol",
+                    "state": "running"
+                }]}),
+                1,
+            )
+            .unwrap();
+        board.select("plus", 0, 2).expect("selected task");
+
+        assert!(board.set_selected_model("gpt-5.6-terra"));
+        let context = board.selected_display_context("plus").expect("context");
+        assert_eq!(context["model"], "gpt-5.6-terra");
+        assert_eq!(board.rendered_slots("plus", 1)[0]["model"], "gpt-5.6-terra");
     }
 
     #[test]
