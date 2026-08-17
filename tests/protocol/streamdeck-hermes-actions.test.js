@@ -78,14 +78,20 @@ test("pressing an auto-fed Hermes card drives the desktop app to that session", 
   // auto-fed cards, mirroring the ZCode branch.
   assert.match(
     bridgeSource,
-    /owner_agent == crate::routing::AgentId::Hermes[\s\S]*owner_session == crate::daemon::HERMES_POLL_SESSION[\s\S]*hermes_window::request_session_selection\(&task\.title\)/,
+    /owner_agent == crate::routing::AgentId::Hermes[\s\S]*owner_session == crate::daemon::HERMES_POLL_SESSION[\s\S]*hermes_window::request_session_selection\(&task\.task_id, &task\.title\)/,
   );
-  assert.match(hermesWindowSource, /pub fn request_session_selection\(title: &str\)/);
+  assert.match(
+    hermesWindowSource,
+    /pub fn request_session_selection\(session_id: &str, title: &str\)/,
+  );
   assert.match(
     hermesWindowSource,
     /const SELECT_SESSION_SCRIPT: &str = include_str!\("hermes_select_session\.ps1"\)/,
   );
-  assert.match(hermesWindowSource, /fn run_automation\(script: &str, success_marker: &str\)/);
+  assert.match(
+    hermesWindowSource,
+    /fn run_automation\(\s*script: &str,\s*success_marker: &str,\s*supersede: Option<\(u64, &'static AutomationQueue\)>,?\s*\)/,
+  );
 });
 
 test("the Hermes selection script targets sidebar rows, search, and tab activation", () => {

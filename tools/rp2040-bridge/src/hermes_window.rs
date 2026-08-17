@@ -189,7 +189,9 @@ mod native {
     fn focus_composer(window: Hwnd) -> Result<(), String> {
         let script =
             format!("$WindowHandle = {window}\n$AgentName = 'Hermes'\n{FOCUS_COMPOSER_SCRIPT}");
-        run_automation(&script, "focused")
+        // The composer focus is a synchronous step on the mic-press path, so
+        // it is never superseded by newer sidebar selections.
+        run_automation(&script, "focused", None)
     }
 
     unsafe fn key_down(key: u8) {
@@ -339,14 +341,13 @@ mod native {
             escape_powershell_single_quoted(&request.session_id),
             escape_powershell_single_quoted(&request.title)
         );
-        run_automation(&script, "selected", request.generation, queue)
+        run_automation(&script, "selected", Some((request.generation, queue)))
     }
 
     fn run_automation(
         script: &str,
         success_marker: &str,
-        generation: u64,
-        queue: &'static AutomationQueue,
+        supersede: Option<(u64, &'static AutomationQueue)>,
     ) -> Result<(), String> {
         let mut child = Command::new("powershell.exe")
             .args([
@@ -372,10 +373,12 @@ mod native {
             .map_err(|error| format!("could not send Hermes sidebar automation: {error}"))?;
 
         let status = loop {
-            if queue.generation.load(Ordering::SeqCst) != generation {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("superseded".to_owned());
+            if let Some((generation, queue)) = supersede {
+                if queue.generation.load(Ordering::SeqCst) != generation {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("superseded".to_owned());
+                }
             }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
