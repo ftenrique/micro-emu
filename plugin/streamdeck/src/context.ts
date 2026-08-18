@@ -139,6 +139,21 @@ export class PluginContext {
         merged.model = nonEmptyText(card.model) ?? merged.model;
         merged.effort = nonEmptyText(card.effort) ?? merged.effort;
         merged.status = nonEmptyText(card.status ?? card.state) ?? merged.status;
+        const interaction = card.interaction;
+        if (interaction != null && typeof interaction === "object") {
+            const details = interaction as Record<string, unknown>;
+            merged.wait_reason = nonEmptyText(details.kind) ?? merged.wait_reason;
+            merged.prompt = nonEmptyText(details.prompt) ?? merged.prompt;
+            merged.interaction_id = nonEmptyText(details.id) ?? merged.interaction_id;
+            const short = details.short;
+            const long = details.long;
+            if (short != null && typeof short === "object") {
+                merged.short_action = nonEmptyText((short as Record<string, unknown>).label) ?? merged.short_action;
+            }
+            if (long != null && typeof long === "object") {
+                merged.long_action = nonEmptyText((long as Record<string, unknown>).label) ?? merged.long_action;
+            }
+        }
         if (card.progress != null) {
             const progress = Number(card.progress);
             if (Number.isFinite(progress)) merged.progress = progress;

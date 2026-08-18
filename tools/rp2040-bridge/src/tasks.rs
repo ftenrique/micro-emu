@@ -1022,7 +1022,7 @@ impl TaskBoard {
                 // the completion in `select`, which changes the task back to queued
                 // and lets the next source snapshot retain that acknowledgement.
                 let completed = task.state == TaskState::Completed;
-                let color = if task.legacy_key.is_some() {
+                let color = if task.legacy_key.is_some() || task.state == TaskState::Waiting {
                     task.state.display_color()
                 } else {
                     match task.state {
@@ -2713,6 +2713,8 @@ mod tests {
         let rendered = board.rendered_slots("deck", 2);
         assert_eq!(rendered[0]["interaction"]["short"]["action"], "approve");
         assert_eq!(rendered[0]["interaction"]["long"]["action"], "reject");
+        assert_eq!(rendered[0]["status"], "waiting");
+        assert_eq!(rendered[0]["c"], 0xef6c00);
         let context = board.selected_display_context("deck").unwrap();
         assert_eq!(context["prompt"], "Deploy now?");
     }

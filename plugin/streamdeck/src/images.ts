@@ -169,11 +169,13 @@ export function renderContextKeyImage(mode: ContextKeyMode, ctx: StripContext, c
 function renderContextTaskBody(ctx: StripContext): string {
     const taskId = truncate(String(ctx.task_number ?? ctx.task_id ?? "—"), 9);
     const project = truncate(ctx.project ?? "—", 18);
-    const task = truncate(ctx.task ?? "—", 20);
+    const isWaiting = ctx.status?.toLowerCase() === "waiting";
+    const task = truncate(isWaiting && ctx.prompt ? ctx.prompt : (ctx.task ?? "—"), 20);
+    const taskLabel = isWaiting && ctx.prompt ? "APPROVAL" : "SELECTED TASK";
     return `<text x="12" y="56" font-family="monospace" font-size="26" font-weight="bold" fill="#90caf9">#${escapeXml(String(taskId))}</text>
   <text x="12" y="78" font-family="sans-serif" font-size="12" fill="#a5d6a7">${escapeXml(project)}</text>
   <text x="12" y="111" font-family="sans-serif" font-size="16" font-weight="bold" fill="#fff">${escapeXml(task)}</text>
-  <text x="12" y="130" font-family="sans-serif" font-size="9" fill="#607d8b">SELECTED TASK</text>`;
+  <text x="12" y="130" font-family="sans-serif" font-size="9" fill="#607d8b">${taskLabel}</text>`;
 }
 
 function renderContextModelBody(ctx: StripContext): string {
@@ -256,6 +258,11 @@ export interface StripContext {
     model?: string | null;
     effort?: string | null;
     status?: string | null;
+    wait_reason?: string | null;
+    prompt?: string | null;
+    interaction_id?: string | null;
+    short_action?: string | null;
+    long_action?: string | null;
     progress?: number | null;
     task_id?: string | null;
     task_number?: number | null;

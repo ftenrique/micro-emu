@@ -5,10 +5,14 @@ INSTALL
 1. Extract this ZIP to a folder.
 2. Double-click Install.cmd.
 3. Confirm the plugin installation when Stream Deck opens.
+4. If Codex CLI is installed, the installer registers the bridge as the
+   `micro_emu_bridge` MCP server automatically.
 
 The installer uses your local application-data and Startup folders. It does not
 need administrator access. The bridge automatically detects an RP2040 serial
 port when one is available and still runs for the Stream Deck plugin without it.
+If Codex CLI is not installed yet, the installer skips MCP registration and
+prints the command to run after installing it.
 
 FIRMWARE (OPTIONAL - only if you have an RP2040 Zero board)
 This step flashes the Codex Micro firmware onto the board. Skip it if you only

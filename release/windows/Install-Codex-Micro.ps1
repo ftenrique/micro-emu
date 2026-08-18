@@ -9,6 +9,7 @@ $installRoot = Join-Path $env:LOCALAPPDATA "micro-emu"
 $installedBridge = Join-Path $installRoot "rp2040-bridge.exe"
 $startupFolder = [Environment]::GetFolderPath("Startup")
 $startupCommand = Join-Path $startupFolder "Codex Micro Bridge.cmd"
+$mcpServerName = "micro_emu_bridge"
 
 if (-not (Test-Path -LiteralPath $sourceBridge)) {
     throw "The release bundle is missing rp2040-bridge.exe. Extract the complete ZIP and try again."
@@ -28,6 +29,31 @@ $startupContents = @(
 Set-Content -LiteralPath $startupCommand -Value $startupContents -Encoding Ascii
 
 Start-Process -FilePath $installedBridge -ArgumentList @("--daemon", "--port", "auto", "--controller", "none") -WindowStyle Hidden
+
+function Register-CodexMcpServer {
+    $codexCommand = Get-Command -Name "codex" -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+
+    if (-not $codexCommand) {
+        Write-Warning "Codex CLI was not found. The bridge is installed, but MCP registration was skipped. Install Codex CLI and run 'codex mcp add $mcpServerName -- `"$installedBridge`" --mcp-proxy --agent codex --autostart'."
+        return
+    }
+
+    # Reinstalling should update the entry if an older release already added it.
+    & $codexCommand.Source mcp remove $mcpServerName 2>&1 | Out-Null
+
+    & $codexCommand.Source mcp add $mcpServerName -- $installedBridge --mcp-proxy --agent codex --autostart 2>&1 | ForEach-Object {
+        Write-Verbose $_
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "The bridge is installed, but Codex MCP registration failed (exit code $LASTEXITCODE). Run 'codex mcp add $mcpServerName -- `"$installedBridge`" --mcp-proxy --agent codex --autostart' manually."
+        return
+    }
+
+    Write-Host "Registered $mcpServerName with Codex MCP."
+}
+
+Register-CodexMcpServer
 
 try {
     Start-Process -FilePath $sourcePlugin
