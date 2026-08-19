@@ -134,6 +134,26 @@ function Find-AnySessionRow {
     }
 }
 
+function Get-SessionSearchTerms {
+    # The bridge normally passes the native id, but old/re-published task
+    # snapshots can preserve one or more bridge namespaces. Hermes indexes the
+    # native id, so try it first and then increasingly clean variants instead
+    # of allowing a wrapper to make an otherwise visible task disappear.
+    $terms = [System.Collections.Generic.List[string]]::new()
+    $candidate = $TargetSessionId.Trim()
+    while (-not [string]::IsNullOrWhiteSpace($candidate)) {
+        if (-not $terms.Contains($candidate)) {
+            $terms.Add($candidate)
+        }
+        if ($candidate.StartsWith("hermes:", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $candidate = $candidate.Substring("hermes:".Length).Trim()
+        } else {
+            break
+        }
+    }
+    return $terms
+}
+
 function Find-SidebarToggle {
     param([System.Windows.Automation.AutomationElement]$SearchRoot)
 
@@ -235,22 +255,35 @@ if ($null -ne $toggle -and $toggle.Current.Name -eq "Show sidebar") {
     $searchBox = Wait-For { Find-SearchBox $root } 2500
 }
 
+# Fast path: a visible session row can be invoked directly. This avoids
+# filtering the full sidebar (and the extra Chromium render pass it causes)
+# for the common case where the selected task is already on screen.
+if ($null -eq $sessionRow) {
+    $sessionRow = Find-SessionRow $root
+}
+
 # Hermes' command-center and sidebar search both index the stable session id.
-# Filtering by it makes duplicate titles unambiguous. Fall back to title only
-# for older Hermes builds that do not index ids in the sidebar search.
+# Filtering by it makes duplicate titles unambiguous. Try cleaned id variants
+# too: a bridged/re-published task can carry redundant `hermes:` wrappers that
+# Hermes itself does not index. Fall back to title only for older Hermes builds
+# that do not index ids in the sidebar search.
 $searchUsed = $false
 if ($null -eq $searchBox) {
     $searchBox = Find-SearchBox $root
 }
-if ($null -ne $searchBox -and (Set-SearchText $searchBox $TargetSessionId)) {
+if ($null -eq $sessionRow -and $null -ne $searchBox) {
     $searchUsed = $true
-    Start-Sleep -Milliseconds 250
-    $sessionRow = Wait-For { Find-AnySessionRow $root } 3000
+    foreach ($searchTerm in Get-SessionSearchTerms) {
+        if (-not (Set-SearchText $searchBox $searchTerm)) { break }
+        Start-Sleep -Milliseconds 250
+        $sessionRow = Wait-For { Find-AnySessionRow $root } 1000
+        if ($null -ne $sessionRow) { break }
+    }
     if ($null -eq $sessionRow -and (Set-SearchText $searchBox $TargetTitle)) {
         Start-Sleep -Milliseconds 250
-        $sessionRow = Wait-For { Find-SessionRow $root } 3000
+        $sessionRow = Wait-For { Find-SessionRow $root } 1500
     }
-} else {
+} elseif ($null -eq $sessionRow -and $null -eq $searchBox) {
     $sessionRow = Wait-For { Find-SessionRow $root } 2500
 }
 

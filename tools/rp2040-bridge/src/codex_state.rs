@@ -6,7 +6,7 @@
 //! and append-only rollout events.
 
 use crate::tasks::{
-    CODEX_HID_SLOTS, CODEX_TASK_SLOTS, TASK_PRIORITY_ACTIVE, TASK_PRIORITY_IDLE, TaskState,
+    CODEX_HID_SLOTS, TASK_PRIORITY_ACTIVE, TASK_PRIORITY_IDLE, TaskState,
 };
 use rusqlite::OpenFlags;
 use serde_json::{Value, json};
@@ -25,6 +25,10 @@ struct Lifecycle {
     /// this identity prevents a delayed terminal event for an older turn from
     /// finishing a newer turn in the same task.
     active_turn_id: Option<String>,
+    /// Escalated tool calls that have been issued but have not yet received a
+    /// corresponding result. Codex records these separately from task
+    /// lifecycle events, so they must be tracked independently.
+    pending_approval_calls: HashMap<String, ()>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -118,7 +122,14 @@ fn read_codex_snapshot_from(
             row.ok()?;
         let lifecycle = refresh_rollout(cache, &thread_id, Path::new(&rollout_path));
         let title = titles.get(&thread_id).cloned().unwrap_or(fallback_title);
-        let state = lifecycle.state.unwrap_or(TaskState::Queued);
+        // A native shell approval is not a lifecycle event. While it is open,
+        // it must override the normal running/selected presentation so the
+        // Stream Deck does not remain blue.
+        let awaiting_approval = !lifecycle.pending_approval_calls.is_empty();
+        let state = awaiting_approval
+            .then_some(TaskState::Waiting)
+            .or(lifecycle.state)
+            .unwrap_or(TaskState::Queued);
         tasks.push(json!({
             "task_id": thread_id,
             "title": title,
@@ -126,7 +137,7 @@ fn read_codex_snapshot_from(
             "model": model,
             "effort": effort,
             "state": state.as_str(),
-            "priority": if state.active() {
+            "priority": if state.active() || awaiting_approval {
                 TASK_PRIORITY_ACTIVE
             } else {
                 TASK_PRIORITY_IDLE
@@ -338,12 +349,40 @@ fn rollout_thread_id(value: &Value) -> Option<&str> {
 }
 
 fn apply_lifecycle_event(lifecycle: &mut Lifecycle, value: &Value) {
-    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
-        return;
-    }
     let Some(payload) = value.get("payload").and_then(Value::as_object) else {
         return;
     };
+
+    // Approval requests arrive as response items rather than `event_msg`
+    // lifecycle notifications. Associate the result with its call id so the
+    // orange waiting state clears immediately after a decision is made.
+    if value.get("type").and_then(Value::as_str) == Some("response_item") {
+        match payload.get("type").and_then(Value::as_str) {
+            Some("custom_tool_call")
+                if payload.get("input").and_then(Value::as_str).is_some_and(|input| {
+                    input.contains("require_escalated")
+                        || input.contains("sandbox_permissions") && input.contains("escalated")
+                }) =>
+            {
+                if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
+                    lifecycle
+                        .pending_approval_calls
+                        .insert(call_id.to_owned(), ());
+                }
+            }
+            Some("custom_tool_call_output") => {
+                if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
+                    lifecycle.pending_approval_calls.remove(call_id);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return;
+    }
     let millis = |key: &str| {
         payload
             .get(key)
@@ -465,6 +504,31 @@ mod tests {
     }
 
     #[test]
+    fn escalated_tool_call_overrides_lifecycle_until_its_result_arrives() {
+        let mut lifecycle = Lifecycle {
+            state: Some(TaskState::Running),
+            ..Lifecycle::default()
+        };
+        apply_lifecycle_event(
+            &mut lifecycle,
+            &json!({"type":"response_item","payload":{
+                "type":"custom_tool_call","call_id":"approval-1",
+                "input":"tools.exec_command({ sandbox_permissions: require_escalated })"
+            }}),
+        );
+        assert!(lifecycle.pending_approval_calls.contains_key("approval-1"));
+
+        apply_lifecycle_event(
+            &mut lifecycle,
+            &json!({"type":"response_item","payload":{
+                "type":"custom_tool_call_output","call_id":"approval-1","output":"approved"
+            }}),
+        );
+        assert!(lifecycle.pending_approval_calls.is_empty());
+        assert_eq!(lifecycle.state, Some(TaskState::Running));
+    }
+
+    #[test]
     fn rollout_lifecycle_is_rejected_when_thread_identity_does_not_match() {
         let root = std::env::temp_dir().join(format!(
             "micro-emu-codex-rollout-identity-{}",
@@ -506,6 +570,7 @@ mod tests {
             started_at_ms: Some(100_000),
             finished_at_ms: None,
             active_turn_id: None,
+            pending_approval_calls: HashMap::new(),
         };
         apply_lifecycle_event(
             &mut lifecycle,
@@ -520,6 +585,7 @@ mod tests {
                 started_at_ms: Some(100_000),
                 finished_at_ms: None,
                 active_turn_id: None,
+                pending_approval_calls: HashMap::new(),
             }
         );
     }
@@ -633,7 +699,7 @@ mod tests {
         let snapshot = read_codex_snapshot_from(
             &root,
             Some(&logs),
-            CODEX_TASK_SLOTS,
+            crate::tasks::CODEX_TASK_SLOTS,
             &mut CodexStateCache::default(),
         )
         .expect("snapshot");

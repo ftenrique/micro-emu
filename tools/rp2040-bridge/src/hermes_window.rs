@@ -235,14 +235,28 @@ mod native {
     /// stable id is used to filter Hermes' own session list; `title` is only
     /// used to verify the resulting active tab and as a compatibility fallback.
     pub fn request_session_selection(session_id: &str, title: &str) {
-        let session_id = session_id
-            .trim()
-            .strip_prefix("hermes:")
-            .unwrap_or(session_id.trim());
+        let session_id = normalize_session_id(session_id);
         if session_id.is_empty() || title.trim().is_empty() {
             return;
         }
         queue_request(session_id.to_owned(), title.trim().to_owned());
+    }
+
+    /// Task-board identities are namespaced as `hermes:<session-id>`.  A
+    /// snapshot can be republished through another adapter, however, which
+    /// used to leave multiple wrappers in the text entered into Hermes'
+    /// sidebar search (for example `hermes:hermes:<session-id>`).  Hermes
+    /// indexes the native id, not bridge namespaces, so remove every leading
+    /// wrapper before handing the query to UI automation.
+    fn normalize_session_id(session_id: &str) -> &str {
+        let mut normalized = session_id.trim();
+        while normalized
+            .get(.."hermes:".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("hermes:"))
+        {
+            normalized = normalized["hermes:".len()..].trim();
+        }
+        normalized
     }
 
     fn queue_request(session_id: String, title: String) {
@@ -565,7 +579,20 @@ mod native {
 
     #[cfg(test)]
     mod tests {
-        use super::{escape_powershell_single_quoted, is_hermes_desktop_executable};
+        use super::{
+            escape_powershell_single_quoted, is_hermes_desktop_executable, normalize_session_id,
+        };
+
+        #[test]
+        fn session_search_uses_the_native_id_without_bridge_wrappers() {
+            assert_eq!(normalize_session_id(" session-123 "), "session-123");
+            assert_eq!(normalize_session_id("hermes:session-123"), "session-123");
+            assert_eq!(normalize_session_id("HERMES:session-123"), "session-123");
+            assert_eq!(
+                normalize_session_id(" hermes: hermes:session-123 "),
+                "session-123"
+            );
+        }
 
         #[test]
         fn recognizes_only_hermes_desktop_executable() {
