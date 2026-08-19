@@ -28,7 +28,7 @@ struct Lifecycle {
     /// Escalated tool calls that have been issued but have not yet received a
     /// corresponding result. Codex records these separately from task
     /// lifecycle events, so they must be tracked independently.
-    pending_approval_calls: HashMap<String, ()>,
+    pending_approval_calls: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -120,12 +120,26 @@ fn read_codex_snapshot_from(
     for (source_slot, row) in rows.enumerate() {
         let (thread_id, fallback_title, cwd, model, effort, rollout_path, recency, updated) =
             row.ok()?;
-        let lifecycle = refresh_rollout(cache, &thread_id, Path::new(&rollout_path));
+        // The first pass through an existing rollout replays its entire
+        // history. Completed turns from that replay are not fresh device
+        // notifications, so render them as idle rather than lighting every
+        // task green when the bridge connects.
+        let first_observation = !cache.rollouts.contains_key(&thread_id);
+        let mut lifecycle = refresh_rollout(cache, &thread_id, Path::new(&rollout_path));
+        if first_observation && lifecycle.state == Some(TaskState::Completed) {
+            lifecycle.state = Some(TaskState::Queued);
+            lifecycle.started_at_ms = None;
+            lifecycle.finished_at_ms = None;
+            if let Some(cursor) = cache.rollouts.get_mut(&thread_id) {
+                cursor.lifecycle = lifecycle.clone();
+            }
+        }
         let title = titles.get(&thread_id).cloned().unwrap_or(fallback_title);
         // A native shell approval is not a lifecycle event. While it is open,
         // it must override the normal running/selected presentation so the
         // Stream Deck does not remain blue.
-        let awaiting_approval = !lifecycle.pending_approval_calls.is_empty();
+        let approval_prompt = lifecycle.pending_approval_calls.values().next().cloned();
+        let awaiting_approval = approval_prompt.is_some();
         let state = awaiting_approval
             .then_some(TaskState::Waiting)
             .or(lifecycle.state)
@@ -137,6 +151,10 @@ fn read_codex_snapshot_from(
             "model": model,
             "effort": effort,
             "state": state.as_str(),
+            "context": approval_prompt.map(|prompt| json!({
+                "wait_reason": "approval",
+                "prompt": prompt,
+            })),
             "priority": if state.active() || awaiting_approval {
                 TASK_PRIORITY_ACTIVE
             } else {
@@ -358,16 +376,19 @@ fn apply_lifecycle_event(lifecycle: &mut Lifecycle, value: &Value) {
     // orange waiting state clears immediately after a decision is made.
     if value.get("type").and_then(Value::as_str) == Some("response_item") {
         match payload.get("type").and_then(Value::as_str) {
-            Some("custom_tool_call")
-                if payload.get("input").and_then(Value::as_str).is_some_and(|input| {
-                    input.contains("require_escalated")
-                        || input.contains("sandbox_permissions") && input.contains("escalated")
-                }) =>
-            {
+            Some("custom_tool_call") => {
+                let Some(input) = payload.get("input").and_then(Value::as_str) else {
+                    return;
+                };
+                if !(input.contains("require_escalated")
+                    || input.contains("sandbox_permissions") && input.contains("escalated"))
+                {
+                    return;
+                }
                 if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
                     lifecycle
                         .pending_approval_calls
-                        .insert(call_id.to_owned(), ());
+                        .insert(call_id.to_owned(), approval_prompt(input));
                 }
             }
             Some("custom_tool_call_output") => {
@@ -425,6 +446,28 @@ fn apply_lifecycle_event(lifecycle: &mut Lifecycle, value: &Value) {
                 .or_else(|| lifecycle.active_turn_id.clone());
         }
         _ => {}
+    }
+}
+
+fn approval_prompt(input: &str) -> String {
+    let Some(value) = input
+        .split_once("justification")
+        .and_then(|(_, remainder)| remainder.split_once(':').map(|(_, value)| value.trim_start()))
+    else {
+        return "Approval required in Codex".to_owned();
+    };
+    let Some(quote) = value.chars().next().filter(|quote| *quote == '\"' || *quote == '\'') else {
+        return "Approval required in Codex".to_owned();
+    };
+    let prompt = value[quote.len_utf8()..]
+        .split(quote)
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if prompt.is_empty() {
+        "Approval required in Codex".to_owned()
+    } else {
+        prompt.chars().take(160).collect()
     }
 }
 
@@ -516,7 +559,10 @@ mod tests {
                 "input":"tools.exec_command({ sandbox_permissions: require_escalated })"
             }}),
         );
-        assert!(lifecycle.pending_approval_calls.contains_key("approval-1"));
+        assert_eq!(
+            lifecycle.pending_approval_calls.get("approval-1"),
+            Some(&"Approval required in Codex".to_owned())
+        );
 
         apply_lifecycle_event(
             &mut lifecycle,
@@ -526,6 +572,14 @@ mod tests {
         );
         assert!(lifecycle.pending_approval_calls.is_empty());
         assert_eq!(lifecycle.state, Some(TaskState::Running));
+    }
+
+    #[test]
+    fn approval_prompt_uses_the_tool_justification() {
+        assert_eq!(
+            approval_prompt(r#"{ justification: "Allow deployment?" }"#),
+            "Allow deployment?"
+        );
     }
 
     #[test]
@@ -710,11 +764,69 @@ mod tests {
         assert_eq!(task["project"], "micro-emu");
         assert_eq!(task["model"], "gpt-selected");
         assert_eq!(task["effort"], "xhigh");
-        assert_eq!(task["state"], "completed");
-        assert_eq!(task["started_at_ms"], 100_000);
-        assert_eq!(task["finished_at_ms"], 145_000);
+        assert_eq!(task["state"], "queued");
+        assert_eq!(task["started_at_ms"], Value::Null);
+        assert_eq!(task["finished_at_ms"], Value::Null);
         assert_eq!(task["source_slot"], 0);
         assert_eq!(task["legacy_key"], "AG00");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_exposes_pending_approval_prompt_as_context() {
+        let root = std::env::temp_dir().join(format!(
+            "micro-emu-codex-approval-snapshot-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temporary Codex directory");
+        let rollout = root.join("rollout.jsonl");
+        std::fs::write(
+            &rollout,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"thread"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_started","started_at":100}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"approval-1","input":"{ justification: \"Allow deployment?\", sandbox_permissions: require_escalated }"}}"#,
+                "\n"
+            ),
+        )
+        .expect("rollout");
+        std::fs::write(root.join("session_index.jsonl"), "").expect("session index");
+
+        let connection = rusqlite::Connection::open(root.join("state_5.sqlite")).expect("state database");
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL, name TEXT,
+                    first_user_message TEXT NOT NULL DEFAULT '', cwd TEXT,
+                    model TEXT, reasoning_effort TEXT, rollout_path TEXT NOT NULL,
+                    archived INTEGER NOT NULL, thread_source TEXT,
+                    recency_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO threads VALUES (?1, ?2, NULL, '', NULL, NULL, NULL, ?3, 0, 'user', 20, 20)",
+                rusqlite::params!["thread", "Approval task", rollout.to_string_lossy().as_ref()],
+            )
+            .expect("thread");
+        drop(connection);
+
+        let snapshot = read_codex_snapshot_from(
+            &root,
+            None,
+            crate::tasks::CODEX_TASK_SLOTS,
+            &mut CodexStateCache::default(),
+        )
+        .expect("snapshot");
+        let task = &snapshot["tasks"][0];
+        assert_eq!(task["state"], "waiting");
+        assert_eq!(task["context"]["wait_reason"], "approval");
+        assert_eq!(task["context"]["prompt"], "Allow deployment?");
 
         let _ = std::fs::remove_dir_all(root);
     }

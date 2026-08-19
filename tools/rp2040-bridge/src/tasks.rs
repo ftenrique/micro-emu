@@ -933,6 +933,7 @@ impl TaskBoard {
         if let Some(source) = task.context.as_object() {
             for key in [
                 "project", "task", "model", "effort", "status", "progress", "task_id",
+                "wait_reason", "prompt", "interaction_id", "short_action", "long_action",
             ] {
                 if let Some(value) = source.get(key) {
                     context.insert(key.to_owned(), value.clone());

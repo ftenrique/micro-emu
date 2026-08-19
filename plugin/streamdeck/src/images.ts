@@ -150,6 +150,7 @@ export function renderContextKeyImage(mode: ContextKeyMode, ctx: StripContext, c
   <text x="72" y="88" font-family="sans-serif" font-size="18" font-weight="bold" fill="#555" text-anchor="middle">OFFLINE</text>
 </svg>`);
     }
+    if (isPendingApproval(ctx)) return renderApprovalContextImage(mode, ctx);
     const body = mode === "task" ? renderContextTaskBody(ctx)
         : mode === "model" ? renderContextModelBody(ctx)
             : renderContextUsageBody(ctx, showResetTimes);
@@ -176,6 +177,31 @@ function renderContextTaskBody(ctx: StripContext): string {
   <text x="12" y="78" font-family="sans-serif" font-size="12" fill="#a5d6a7">${escapeXml(project)}</text>
   <text x="12" y="111" font-family="sans-serif" font-size="16" font-weight="bold" fill="#fff">${escapeXml(task)}</text>
   <text x="12" y="130" font-family="sans-serif" font-size="9" fill="#607d8b">${taskLabel}</text>`;
+}
+
+function isPendingApproval(ctx: StripContext): boolean {
+    return ctx.status?.toLowerCase() === "waiting" && ctx.wait_reason?.toLowerCase() === "approval";
+}
+
+function renderApprovalContextImage(mode: ContextKeyMode, ctx: StripContext): string {
+    if (mode === "task") {
+        const prompt = truncate(ctx.prompt ?? "Approval required in Codex", 42);
+        return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">
+  <rect x="4" y="4" width="136" height="136" rx="12" fill="#ef6c00" stroke="#ffcc80" stroke-width="2"/>
+  <text x="72" y="27" font-family="sans-serif" font-size="13" font-weight="bold" letter-spacing="1" fill="#fff3e0" text-anchor="middle">APPROVAL</text>
+  <text x="72" y="64" font-family="sans-serif" font-size="12" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(prompt)}</text>
+  <text x="72" y="116" font-family="sans-serif" font-size="10" fill="#fff3e0" text-anchor="middle">CHOOSE ON CODEX</text>
+</svg>`);
+    }
+    const approve = mode === "model";
+    const color = approve ? "#1b5e20" : "#b71c1c";
+    const label = approve ? "APPROVE" : "DENY";
+    return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">
+  <rect x="4" y="4" width="136" height="136" rx="12" fill="${color}" stroke="#fff" stroke-opacity="0.45" stroke-width="2"/>
+  <text x="72" y="54" font-family="sans-serif" font-size="22" font-weight="bold" fill="#fff" text-anchor="middle">${label}</text>
+  <text x="72" y="81" font-family="sans-serif" font-size="11" font-weight="bold" fill="#fff3e0" text-anchor="middle">OPEN CODEX</text>
+  <text x="72" y="112" font-family="sans-serif" font-size="9" fill="#fff3e0" text-anchor="middle">DECIDE IN THE PROMPT</text>
+</svg>`);
 }
 
 function renderContextModelBody(ctx: StripContext): string {

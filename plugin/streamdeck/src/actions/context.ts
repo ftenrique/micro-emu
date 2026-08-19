@@ -31,8 +31,24 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
         this.refresh(ev.action as KeyAction<ContextKeySettings>, ev.payload.settings);
     }
 
-    onKeyDown(ev: KeyDownEvent<ContextKeySettings>): void {
+    async onKeyDown(ev: KeyDownEvent<ContextKeySettings>): Promise<void> {
         const mode = normalizeMode(ev.payload.settings.mode);
+        const selected = this.ctx.getSelectedDisplayContext();
+        const isApproval = selected.status?.toLowerCase() === "waiting"
+            && selected.wait_reason?.toLowerCase() === "approval";
+        if (isApproval && (mode === "model" || mode === "usage")) {
+            if (!this.ctx.isConnected()) {
+                ev.action.showAlert();
+                return;
+            }
+            try {
+                await this.ctx.executeSelectedAgentAction("task.open");
+                await ev.action.showOk();
+            } catch {
+                await ev.action.showAlert();
+            }
+            return;
+        }
         if (mode === "usage") {
             if (!this.ctx.isConnected()) {
                 ev.action.showAlert();
