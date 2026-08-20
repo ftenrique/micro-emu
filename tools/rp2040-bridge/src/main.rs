@@ -276,21 +276,32 @@ fn wait_for_firmware(
     writer: &mut File,
     sequence: &mut u16,
 ) -> Result<String, String> {
-    let ping = Frame::new(FrameType::Ping, next_sequence(sequence), Vec::new())
-        .map_err(|error| error.to_string())?;
-    serial::write_frame(writer, &ping)?;
     let deadline = Instant::now() + Duration::from_secs(3);
+    let mut next_ping_at = Instant::now();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err("RP2040 did not answer the bridge ping within 3 seconds".to_owned());
+        }
+        if Instant::now() >= next_ping_at {
+            let ping = Frame::new(FrameType::Ping, next_sequence(sequence), Vec::new())
+                .map_err(|error| error.to_string())?;
+            serial::write_frame(writer, &ping)?;
+            // CDC can enumerate before the firmware's task loop is servicing
+            // the first packet. A few spaced probes avoid declaring a healthy
+            // board dead during USB re-enumeration.
+            next_ping_at = Instant::now() + Duration::from_millis(250);
         }
         match receiver.recv_timeout(remaining) {
             Ok(SerialEvent::Frame(frame)) if frame.frame_type == FrameType::Status => {
                 return String::from_utf8(frame.payload)
                     .map_err(|_| "RP2040 returned a non-UTF8 status".to_owned());
             }
-            Ok(SerialEvent::ProtocolError(error)) => return Err(error),
+            Ok(SerialEvent::ProtocolError(_error)) => {
+                // The decoder is deliberately resynchronising. One corrupt
+                // frame must not turn a transient USB byte loss into a full
+                // reconnect loop.
+            }
             Ok(SerialEvent::Disconnected(error)) => return Err(error),
             Ok(SerialEvent::Frame(_)) => {}
             Err(RecvTimeoutError::Timeout) => {
@@ -950,14 +961,27 @@ fn open_serial_runtime(
         .try_clone()
         .map_err(|error| format!("could not clone RP2040 port: {error}"))?;
     let (serial_tx, receiver) = mpsc::channel();
-    let reader_thread = serial::start_reader(reader, serial_tx);
+    let mut reader_thread = Some(serial::start_reader(reader, serial_tx));
     let mut sequence = 1_u16;
-    let firmware = wait_for_firmware(&receiver, &mut writer, &mut sequence)?;
+    let firmware = match wait_for_firmware(&receiver, &mut writer, &mut sequence) {
+        Ok(firmware) => firmware,
+        Err(error) => {
+            // Do not leave the reader owning the COM handle when the initial
+            // handshake fails. That leaked handle makes the next auto-retry
+            // report "access denied" and can make a momentary USB reset look
+            // like a permanently disconnected RP2040.
+            drop(writer);
+            if let Some(reader_thread) = reader_thread.take() {
+                let _ = reader_thread.join();
+            }
+            return Err(error);
+        }
+    };
     Ok((
         SerialRuntime {
             writer: Some(writer),
             receiver,
-            reader_thread: Some(reader_thread),
+            reader_thread,
         },
         firmware,
         port,

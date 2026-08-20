@@ -18,9 +18,26 @@ if (-not (Test-Path -LiteralPath $sourcePlugin)) {
     throw "The release bundle is missing the Stream Deck plugin package. Extract the complete ZIP and try again."
 }
 
-Get-Process -Name "rp2040-bridge" -ErrorAction SilentlyContinue | Stop-Process -Force
 New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
-Copy-Item -LiteralPath $sourceBridge -Destination $installedBridge -Force
+
+# Codex may respawn the MCP proxy while an upgrade is copying the bridge.
+# Retry the replacement so an otherwise valid GitHub release does not fail
+# with Windows error 32 (the executable is still in use).
+$copied = $false
+for ($attempt = 0; $attempt -lt 40 -and -not $copied; $attempt++) {
+    Get-Process -Name "rp2040-bridge" -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    try {
+        Copy-Item -LiteralPath $sourceBridge -Destination $installedBridge -Force -ErrorAction Stop
+        $copied = $true
+    }
+    catch [System.IO.IOException] {
+        Start-Sleep -Milliseconds 100
+    }
+}
+if (-not $copied) {
+    throw "Could not replace $installedBridge because the bridge is still running. Close Codex and retry the installer."
+}
 
 $startupContents = @(
     "@echo off"

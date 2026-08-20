@@ -36,18 +36,25 @@ pub fn resolve_port(requested: &str) -> Result<String, String> {
 
 #[cfg(windows)]
 fn discover_rp2040_port() -> Result<String, String> {
-    let script = discovery_script_path().ok_or_else(|| {
-        "could not locate tools/find-rp2040-port.ps1 for automatic port discovery".to_owned()
-    })?;
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script)
+    // Installed bridge binaries live under %LOCALAPPDATA% and do not carry
+    // the repository's tools/ directory. Keep the script for development,
+    // but make auto-discovery self-contained for installed releases too.
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+    ]);
+    if let Some(script) = discovery_script_path() {
+        command.args(["-File"]).arg(script);
+    } else {
+        command.args([
+            "-Command",
+            "$ErrorActionPreference='Stop'; $ports=@(Get-PnpDevice -PresentOnly -Class Ports -ErrorAction SilentlyContinue | Where-Object InstanceId -Match 'VID_303A&PID_8360' | ForEach-Object { $port=if($_.FriendlyName -match '\\((COM\\d+)\\)'){$Matches[1]}else{$null}; [pscustomobject]@{port=$port;friendlyName=$_.FriendlyName;instanceId=$_.InstanceId;status=$_.Status} }); [pscustomobject]@{found=$ports.Count;ports=$ports} | ConvertTo-Json -Depth 4",
+        ]);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("could not run RP2040 port discovery: {error}"))?;
     if !output.status.success() {

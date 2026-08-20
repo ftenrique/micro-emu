@@ -22,15 +22,16 @@ test("Codex search and terminal catalog actions invoke desktop shortcuts", () =>
   assert.match(windowSource, /pub fn toggle_terminal\(\)[\s\S]*send_control_shortcut\(VK_OEM_3\)/);
 });
 
-test("the Mic action falls back to held Ctrl+Shift+M without RP2040 serial", () => {
+test("the Mic action uses Windows dictation without RP2040 serial", () => {
   assert.match(
     bridgeSource,
     /PhysicalEvent::EncoderButton \{ index: 2, pressed \}[\s\S]*!bridge\.has_serial\(\)[\s\S]*codex_window::set_microphone\(pressed\)/,
   );
   assert.match(
     windowSource,
-    /pub fn set_microphone\(pressed: bool\)[\s\S]*show_and_focus\(\)\?[\s\S]*key_down\(VK_CONTROL\)[\s\S]*key_down\(VK_SHIFT\)[\s\S]*key_down\(VK_M\)[\s\S]*key_up\(VK_M\)[\s\S]*key_up\(VK_SHIFT\)[\s\S]*key_up\(VK_CONTROL\)/,
+    /pub fn set_microphone\(pressed: bool\)[\s\S]*focus_composer\(target\)\?[\s\S]*key_down\(VK_LWIN\)[\s\S]*tap_key\(VK_H\)[\s\S]*key_up\(VK_LWIN\)[\s\S]*tap_key\(VK_ESCAPE\)/,
   );
+  assert.match(windowSource, /include_str!\("focus_agent_composer\.ps1"\)/);
 });
 
 test("model cycling invokes the semantic Codex UI controls without key presses", () => {

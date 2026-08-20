@@ -70,6 +70,38 @@ try {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination $bundleRoot
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "NOTICE") -Destination $bundleRoot
 
+    $requiredBundleFiles = @(
+        "rp2040-bridge.exe",
+        "com.micro-emu.codex.streamDeckPlugin",
+        "Install.cmd",
+        "Install-Codex-Micro.ps1",
+        "Uninstall.cmd",
+        "Uninstall-Codex-Micro.ps1",
+        "Flash-Firmware.cmd",
+        "Flash-Firmware.ps1",
+        "README.txt",
+        "codex_micro_rp2040_bridge.uf2",
+        "LICENSE",
+        "NOTICE"
+    )
+    $missingBundleFiles = @($requiredBundleFiles | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $bundleRoot $_) -PathType Leaf)
+    })
+    if ($missingBundleFiles.Count -gt 0) {
+        throw "Release bundle is missing required files: $($missingBundleFiles -join ', ')"
+    }
+
+    # Release scripts must resolve resources from the extracted bundle or the
+    # user's Windows profile. A repository/workspace path here would break
+    # every GitHub installation outside the build machine.
+    $releaseScripts = Get-ChildItem -LiteralPath $bundleRoot -File |
+        Where-Object { $_.Extension -in @(".ps1", ".cmd") }
+    $workspacePathPattern = '(?i)([A-Z]:\\|/home/|/Users/|tools[\\/]find-rp2040-port)'
+    $workspaceReferences = @($releaseScripts | Select-String -Pattern $workspacePathPattern)
+    if ($workspaceReferences.Count -gt 0) {
+        throw "Release scripts contain machine-specific or repository-relative paths: $($workspaceReferences -join '; ')"
+    }
+
     Compress-Archive -Path (Join-Path $bundleRoot "*") -DestinationPath $zipPath -CompressionLevel Optimal
 
     $standaloneUf2Name = "codex_micro_rp2040_bridge-v$Version.uf2"

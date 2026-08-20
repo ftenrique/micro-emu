@@ -6,6 +6,7 @@ mod native {
     use std::io::Write;
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     type Bool = i32;
     type Handle = isize;
@@ -14,6 +15,10 @@ mod native {
 
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const GWL_EXSTYLE: i32 = -20;
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const VK_LWIN: u8 = 0x5B;
+    const VK_H: u8 = 0x48;
+    const VK_ESCAPE: u8 = 0x1B;
     const WS_EX_TOOLWINDOW: i32 = 0x0000_0080;
     const SW_MINIMIZE: i32 = 6;
     const SW_RESTORE: i32 = 9;
@@ -24,15 +29,15 @@ mod native {
     const HWND_TOPMOST: Hwnd = -1;
     const HWND_NOTOPMOST: Hwnd = -2;
     const VK_CONTROL: u8 = 0x11;
-    const VK_SHIFT: u8 = 0x10;
     const VK_G: u8 = 0x47;
-    const VK_M: u8 = 0x4d;
     const VK_OEM_3: u8 = 0xc0;
-    const KEYEVENTF_KEYUP: u32 = 0x0002;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     const FEATURED_MODELS: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
     const CYCLE_MODEL_SCRIPT: &str = include_str!("cycle_codex_model.ps1");
+    const FOCUS_COMPOSER_SCRIPT: &str = include_str!("focus_agent_composer.ps1");
+
+    static DICTATION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
     #[repr(C)]
     #[derive(Default)]
@@ -323,25 +328,34 @@ mod native {
         send_control_shortcut(VK_OEM_3)
     }
 
-    /// Holds Codex's push-to-talk shortcut while the Stream Deck key is held.
-    /// The focus step is only needed for the initial press; releasing the
-    /// modifiers in reverse order prevents a stuck keyboard state.
+    /// Uses Windows dictation as hold-to-talk input for Codex's composer.
     pub fn set_microphone(pressed: bool) -> Result<(), String> {
         if pressed {
-            show_and_focus()?;
-            unsafe {
-                key_down(VK_CONTROL);
-                key_down(VK_SHIFT);
-                key_down(VK_M);
+            let target = find_codex_window()?;
+            if unsafe { GetForegroundWindow() } != target {
+                DICTATION_ACTIVE.store(false, Ordering::SeqCst);
+                return Err("the Codex window is no longer focused".to_owned());
             }
-        } else {
-            unsafe {
-                key_up(VK_M);
-                key_up(VK_SHIFT);
-                key_up(VK_CONTROL);
+            focus_composer(target)?;
+            if unsafe { GetForegroundWindow() } != target {
+                DICTATION_ACTIVE.store(false, Ordering::SeqCst);
+                return Err("the Codex window lost focus while selecting its composer".to_owned());
             }
+            unsafe {
+                key_down(VK_LWIN);
+                tap_key(VK_H);
+                key_up(VK_LWIN);
+            }
+            DICTATION_ACTIVE.store(true, Ordering::SeqCst);
+        } else if DICTATION_ACTIVE.swap(false, Ordering::SeqCst) {
+            unsafe { tap_key(VK_ESCAPE); }
         }
         Ok(())
+    }
+
+    fn focus_composer(window: Hwnd) -> Result<(), String> {
+        let script = format!("$WindowHandle = {window}\n$AgentName = 'Codex'\n{FOCUS_COMPOSER_SCRIPT}");
+        run_automation(&script, "focused")
     }
 
     fn send_control_shortcut(key: u8) -> Result<(), String> {
@@ -366,6 +380,40 @@ mod native {
         unsafe {
             key_down(key);
             key_up(key);
+        }
+    }
+
+    fn run_automation(script: &str, success_marker: &str) -> Result<(), String> {
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|error| format!("could not start Codex composer automation: {error}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "could not open Codex composer automation input".to_owned())?
+            .write_all(script.as_bytes())
+            .map_err(|error| format!("could not send Codex composer automation: {error}"))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("Codex composer automation did not finish: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Codex composer automation failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        if String::from_utf8_lossy(&output.stdout).lines().any(|line| line.trim() == success_marker) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Codex composer automation returned an unexpected result: {}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            ))
         }
     }
 
