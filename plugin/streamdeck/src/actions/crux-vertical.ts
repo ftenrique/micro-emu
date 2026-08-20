@@ -18,7 +18,7 @@ import {
     sendClick,
     type CruxDialSettings,
 } from "./dial-common";
-import { normalizeUsageAgent, type UsageAgent } from "./context";
+import { isPendingApproval, normalizeUsageAgent, sendApprovalDecision, type UsageAgent } from "./context";
 
 /** Crux V settings: the dial click assignment plus the usage source shown
  * on the touch strip (independent per dial, so two dials can show codex and
@@ -68,11 +68,16 @@ export class CruxVerticalAction extends SingletonAction<CruxVSettings> {
     }
 
     onDialDown(ev: DialDownEvent<CruxVSettings>): Promise<void> {
+        if (isPendingApproval(this.ctx.getSelectedDisplayContext())) {
+            if (!this.ctx.isConnected()) return ev.action.showAlert();
+            sendApprovalDecision(this.ctx, "deny");
+            return Promise.resolve();
+        }
         return handleDialDown(this.ctx, ev.action as DialAction<CruxVSettings>,
             ev.payload.settings.click, 2);
     }
-
     onDialUp(ev: DialUpEvent<CruxVSettings>): void {
+        if (isPendingApproval(this.ctx.getSelectedDisplayContext())) return;
         void sendClick(this.ctx, resolveClick(ev.payload.settings.click, 2), false);
     }
     onTouchTap(ev: TouchTapEvent<CruxVSettings>): void {
@@ -102,7 +107,7 @@ export class CruxVerticalAction extends SingletonAction<CruxVSettings> {
         // usage can be displayed at the same time on separate dials.
         const agent = normalizeUsageAgent(settings.usageAgent);
         const ctx: StripContext = {
-            ...this.ctx.getDisplayContext(),
+            ...this.ctx.getSelectedDisplayContext(),
             ...this.ctx.getUsageFields(agent),
             usage_agent: agent,
         };

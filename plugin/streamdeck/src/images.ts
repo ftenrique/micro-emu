@@ -302,6 +302,13 @@ export interface StripContext {
 
 /** Knob strip: task number, project, shortened task name, and owning agent. */
 export function renderKnobStrip(ctx: StripContext): string {
+    if (isPendingApproval(ctx)) {
+        const prompt = truncate(ctx.prompt ?? "Approval required in Codex", 34);
+        return stripSvg(`<rect width="${STRIP_W}" height="${STRIP_H}" fill="#5f3700"/>
+  <text x="10" y="22" font-family="sans-serif" font-size="10" font-weight="bold" letter-spacing="1" fill="#ffb74d">APPROVAL WAITING</text>
+  <text x="${STRIP_W / 2}" y="53" font-family="sans-serif" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(prompt)}</text>
+  <text x="${STRIP_W / 2}" y="84" font-family="sans-serif" font-size="12" font-weight="bold" fill="#ffe0b2" text-anchor="middle">PRESS: OPEN CODEX</text>`);
+    }
     const taskId = ctx.task_number ?? ctx.task_id ?? "—";
     const agent = truncate((ctx.agent ?? agentFromTaskId(ctx.task_id) ?? "—").toUpperCase(), 12);
     const project = truncate(ctx.project ?? "—", 18);
@@ -314,6 +321,13 @@ export function renderKnobStrip(ctx: StripContext): string {
 
 /** Crux horizontal strip: model / effort, or status / progress as fallback. */
 export function renderCruxHStrip(ctx: StripContext, clickLabel: string): string {
+    if (isPendingApproval(ctx)) {
+        const prompt = truncate(ctx.prompt ?? "Approval required", 32);
+        return stripSvg(`<rect width="${STRIP_W}" height="${STRIP_H}" fill="#123d21"/>
+  <text x="10" y="22" font-family="sans-serif" font-size="10" font-weight="bold" letter-spacing="1" fill="#81c784">PENDING APPROVAL</text>
+  <text x="${STRIP_W / 2}" y="53" font-family="sans-serif" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(prompt)}</text>
+  <text x="${STRIP_W / 2}" y="84" font-family="sans-serif" font-size="15" font-weight="bold" fill="#a5d6a7" text-anchor="middle">PRESS: APPROVE</text>`);
+    }
     const hasModel = ctx.model != null && ctx.model !== "";
     const hasEffort = ctx.effort != null && ctx.effort !== "";
     const status = ctx.status ?? "—";
@@ -333,6 +347,13 @@ export function renderCruxHStrip(ctx: StripContext, clickLabel: string): string 
 
 /** Crux vertical strip: usage bars, or status/progress as fallback. */
 export function renderCruxVStrip(ctx: StripContext, clickLabel: string, showResetTimes = false): string {
+    if (isPendingApproval(ctx)) {
+        const prompt = truncate(ctx.prompt ?? "Approval required", 32);
+        return stripSvg(`<rect width="${STRIP_W}" height="${STRIP_H}" fill="#5b1515"/>
+  <text x="10" y="22" font-family="sans-serif" font-size="10" font-weight="bold" letter-spacing="1" fill="#ef9a9a">PENDING APPROVAL</text>
+  <text x="${STRIP_W / 2}" y="53" font-family="sans-serif" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(prompt)}</text>
+  <text x="${STRIP_W / 2}" y="84" font-family="sans-serif" font-size="15" font-weight="bold" fill="#ef9a9a" text-anchor="middle">PRESS: DENY</text>`);
+    }
     const hasUsage = ctx.five_hour_remaining != null || ctx.weekly_remaining != null;
     const hasResetTimes = ctx.five_hour_reset_at != null || ctx.weekly_reset_at != null;
     // The reporting agent (codex/zcode) rides along in the top-left corner.

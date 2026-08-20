@@ -17,11 +17,14 @@ test("Context is a Keypad action with fixed task/model/usage modes", () => {
   assert.match(plugin, /new ContextKeyAction\(ctx\)/);
 });
 
-test("Context actions dispatch task search/model cycle and toggle usage reset details", () => {
+test("Context actions open tasks, decide pending approvals, and toggle usage reset details", () => {
   assert.match(action, /mode === "usage"/);
   assert.match(action, /showResetTimes\.set/);
   assert.match(action, /renderContextKeyImage\(mode, ctx, this\.ctx\.isConnected\(\),/);
-  assert.match(action, /sendCatalogAction\("agent\.search"\)/);
+  assert.match(action, /executeSelectedAgentAction\("task\.open"\)/);
+  assert.match(action, /sendApprovalDecision/);
+  assert.match(action, /ACT06/);
+  assert.match(action, /ACT07/);
   assert.match(action, /sendModelCycle\(\)/);
   assert.match(action, /value === "model" \|\| value === "usage"/);
   assert.match(action, /showAlert\(\)/);
@@ -38,6 +41,9 @@ test("Context rendering covers strip parity and selected-task overlay", () => {
   assert.match(images, /formatResetAt/);
   assert.match(images, /pct <= 10/);
   assert.match(images, /pct <= 25/);
+  assert.match(images, /PRESS: OPEN CODEX/);
+  assert.match(images, /PRESS: APPROVE/);
+  assert.match(images, /PRESS: DENY/);
   assert.match(context, /getSelectedDisplayContext/);
   assert.match(context, /merged\.task_number = sourceSlot \+ 1/);
   assert.match(readFileSync(new URL("../../plugin/streamdeck/src/actions/crux-vertical.ts", import.meta.url), "utf8"), /onTouchTap/);

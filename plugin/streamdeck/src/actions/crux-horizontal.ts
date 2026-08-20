@@ -1,4 +1,4 @@
-﻿import {
+import {
     action,
     SingletonAction,
     type WillAppearEvent,
@@ -18,6 +18,7 @@ import {
     sendClick,
     type CruxDialSettings,
 } from "./dial-common";
+import { isPendingApproval, sendApprovalDecision } from "./context";
 
 /**
  * Crux Horizontal dial — emulates the left/right axis of the original
@@ -58,14 +59,18 @@ export class CruxHorizontalAction extends SingletonAction<CruxDialSettings> {
     }
 
     onDialDown(ev: DialDownEvent<CruxDialSettings>): Promise<void> {
+        if (isPendingApproval(this.ctx.getSelectedDisplayContext())) {
+            if (!this.ctx.isConnected()) return ev.action.showAlert();
+            sendApprovalDecision(this.ctx, "approve");
+            return Promise.resolve();
+        }
         return handleDialDown(this.ctx, ev.action as DialAction<CruxDialSettings>,
             ev.payload.settings.click, 0);
     }
-
     onDialUp(ev: DialUpEvent<CruxDialSettings>): void {
+        if (isPendingApproval(this.ctx.getSelectedDisplayContext())) return;
         void sendClick(this.ctx, resolveClick(ev.payload.settings.click, 0), false);
     }
-
     onTouchTap(ev: TouchTapEvent<CruxDialSettings>): void {
         if (!this.ctx.isConnected()) {
             ev.action.showAlert();
@@ -87,7 +92,7 @@ export class CruxHorizontalAction extends SingletonAction<CruxDialSettings> {
             action.setFeedback({ canvas: renderStripOffline("CRUX H") });
             return;
         }
-        const ctx = this.ctx.getDisplayContext();
+        const ctx = this.ctx.getSelectedDisplayContext();
         const label = clickLabel(settings.click, "SEND");
         action.setFeedback({ canvas: renderCruxHStrip(ctx ?? {}, label) });
     }

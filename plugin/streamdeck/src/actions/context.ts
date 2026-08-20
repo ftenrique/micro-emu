@@ -12,6 +12,24 @@ export interface ContextKeySettings {
     usageAgent?: UsageAgent;
 }
 
+export function isPendingApproval(ctx: { status?: string | null; wait_reason?: string | null }): boolean {
+    return ctx.status?.toLowerCase() === "waiting"
+        && ctx.wait_reason?.toLowerCase() === "approval";
+}
+
+/** Send the same Micro action configured for approval or denial. */
+export function sendApprovalDecision(ctx: PluginContext, decision: "approve" | "deny"): void {
+    const card = ctx.getSelectedTaskCard();
+    const slot = Number(card?.source_slot ?? card?.id ?? card?.slot ?? card?.i);
+    const taskId = typeof card?.task_id === "string" ? card.task_id : undefined;
+    if (card?.interaction != null && Number.isFinite(slot) && taskId) {
+        ctx.daemon.sendTaskAction(slot, decision === "approve" ? "short" : "long", taskId);
+        return;
+    }
+    const key = decision === "approve" ? "ACT06" : "ACT07";
+    ctx.daemon.sendMicroKey(key, true);
+    ctx.daemon.sendMicroKey(key, false);
+}
 /** Shows one LCD-strip context screen on a regular Stream Deck key. */
 @action({ UUID: "com.micro-emu.codex.context" })
 export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
@@ -34,15 +52,14 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
     async onKeyDown(ev: KeyDownEvent<ContextKeySettings>): Promise<void> {
         const mode = normalizeMode(ev.payload.settings.mode);
         const selected = this.ctx.getSelectedDisplayContext();
-        const isApproval = selected.status?.toLowerCase() === "waiting"
-            && selected.wait_reason?.toLowerCase() === "approval";
-        if (isApproval && (mode === "model" || mode === "usage")) {
-            if (!this.ctx.isConnected()) {
-                ev.action.showAlert();
-                return;
-            }
+        if (!this.ctx.isConnected()) {
+            await ev.action.showAlert();
+            return;
+        }
+        if (isPendingApproval(selected)) {
             try {
-                await this.ctx.executeSelectedAgentAction("task.open");
+                if (mode === "task") await this.ctx.executeSelectedAgentAction("task.open");
+                else sendApprovalDecision(this.ctx, mode === "model" ? "approve" : "deny");
                 await ev.action.showOk();
             } catch {
                 await ev.action.showAlert();
@@ -50,23 +67,14 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
             return;
         }
         if (mode === "usage") {
-            if (!this.ctx.isConnected()) {
-                ev.action.showAlert();
-                return;
-            }
             const action = ev.action as KeyAction<ContextKeySettings>;
             this.showResetTimes.set(action, !(this.showResetTimes.get(action) ?? false));
             this.refresh(action, ev.payload.settings);
             return;
         }
-        if (!this.ctx.isConnected()) {
-            ev.action.showAlert();
-            return;
-        }
-        if (mode === "task") this.ctx.daemon.sendCatalogAction("agent.search");
+        if (mode === "task") await this.ctx.executeSelectedAgentAction("task.open");
         else this.ctx.daemon.sendModelCycle();
     }
-
     /** Pushes the configured usage source to the daemon whenever a key in
      * Usage mode appears or its settings change. Task/Model keys leave the
      * current selection untouched. */

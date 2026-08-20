@@ -9,6 +9,7 @@ import {
 } from "@elgato/streamdeck";
 import { PluginContext } from "../context";
 import { renderKnobStrip, renderStripOffline } from "../images";
+import { isPendingApproval } from "./context";
 
 /**
  * Knob dial — emulates the original Codex Micro rotor knob.
@@ -51,10 +52,15 @@ export class KnobDialAction extends SingletonAction {
             ev.action.showAlert();
             return;
         }
+        if (isPendingApproval(this.ctx.getSelectedDisplayContext())) {
+            void this.ctx.executeSelectedAgentAction("task.open").catch(() => ev.action.showAlert());
+            return;
+        }
         this.ctx.daemon.sendEncoderButton(1, true);
     }
 
     onDialUp(): void {
+        if (isPendingApproval(this.ctx.getSelectedDisplayContext())) return;
         this.ctx.daemon.sendEncoderButton(1, false);
     }
 
