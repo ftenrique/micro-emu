@@ -6,6 +6,7 @@ mod controller;
 mod daemon;
 mod diaglog;
 mod hermes_state;
+mod powershell;
 mod hermes_window;
 mod mcp;
 mod plugin_controller;

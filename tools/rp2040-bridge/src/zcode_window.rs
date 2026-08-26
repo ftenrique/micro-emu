@@ -393,8 +393,8 @@ mod native {
         let window = find_zcode_window()?;
         let script = match request {
             AutomationRequest::SelectSession(title) => format!(
-                "$WindowHandle = {window}\n$TargetTitle = '{}'\n{SELECT_SESSION_SCRIPT}",
-                escape_powershell_single_quoted(title)
+                "$WindowHandle = {window}\n$TargetTitle = {}\n{SELECT_SESSION_SCRIPT}",
+                crate::powershell::unicode_literal(title)
             ),
             AutomationRequest::NewTask => {
                 format!("$WindowHandle = {window}\n{NEW_TASK_SCRIPT}")
@@ -447,10 +447,6 @@ mod native {
                 stdout.trim()
             ))
         }
-    }
-
-    fn escape_powershell_single_quoted(value: &str) -> String {
-        value.replace('\'', "''")
     }
 
     fn find_zcode_window() -> Result<Hwnd, String> {
@@ -531,7 +527,7 @@ mod native {
 
     #[cfg(test)]
     mod tests {
-        use super::{escape_powershell_single_quoted, is_zcode_desktop_executable};
+        use super::is_zcode_desktop_executable;
 
         #[test]
         fn recognizes_only_zcode_desktop_executable() {
@@ -539,18 +535,6 @@ mod native {
             assert!(is_zcode_desktop_executable(r"D:/CODE/ZCode/ZCODE.EXE"));
             assert!(!is_zcode_desktop_executable(r"D:\CODE\ZCode\zcode.cjs"));
             assert!(!is_zcode_desktop_executable(r"D:\apps\Codex.exe"));
-        }
-
-        #[test]
-        fn escapes_single_quotes_for_powershell_literals() {
-            assert_eq!(
-                escape_powershell_single_quoted("plain title"),
-                "plain title"
-            );
-            assert_eq!(
-                escape_powershell_single_quoted("it's a task's title"),
-                "it''s a task''s title"
-            );
         }
     }
 }

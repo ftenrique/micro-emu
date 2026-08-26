@@ -15,6 +15,11 @@ if ($null -eq $TargetSessionId -or [string]::IsNullOrWhiteSpace($TargetSessionId
     throw "Hermes session id was not supplied"
 }
 
+# Remote-backed task cards can carry a backend-truncated preview as their
+# title (a trailing ellipsis). Sidebar rows hold the full text, so the title
+# search and row scoring also try the title without the truncation marker.
+$SearchTitle = $TargetTitle.TrimEnd([char]0x2026).TrimEnd()
+
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 
@@ -85,13 +90,24 @@ function Find-Element {
     return $null
 }
 
-# Hermes renders every sidebar session row as a button whose class starts
-# with "pl-2 pr-1 gap-1.5" (pinned, recent, and messaging sections share it).
+# Hermes renders every sidebar session row as a button whose class begins
+# with the row's padding/gap utilities (pinned, project, and messaging
+# sections share it). The exact prefix differs across Hermes builds — builds
+# since 2026-08 dropped the pr-1 padding — so accept every known variant; a
+# single literal would let an app update hide all rows from the automation.
 function Test-SessionRow {
     param($element)
 
-    return $element.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and
-        $element.Current.ClassName.StartsWith("pl-2 pr-1 gap-1.5", [System.StringComparison]::Ordinal)
+    if ($element.Current.ControlType -ne [System.Windows.Automation.ControlType]::Button) {
+        return $false
+    }
+    $className = $element.Current.ClassName
+    foreach ($prefix in @("pl-2 gap-1.5", "pl-2 pr-1 gap-1.5")) {
+        if ($className.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
+            return $true
+        }
+    }
+    return $false
 }
 
 # Row names differ per section: pinned and messaging rows are exactly the
@@ -104,6 +120,7 @@ function Get-RowScore {
     if ($Name -ceq $TargetTitle) { return 3 }
     if ($Name.StartsWith("Reorder " + $TargetTitle, [System.StringComparison]::Ordinal)) { return 2 }
     if ($Name.Contains($TargetTitle)) { return 1 }
+    if ($SearchTitle -ne $TargetTitle -and $Name.Contains($SearchTitle)) { return 1 }
     return 0
 }
 
@@ -132,6 +149,19 @@ function Find-AnySessionRow {
         param($element)
         Test-SessionRow $element
     }
+}
+
+function Get-SessionRowCount {
+    param([System.Windows.Automation.AutomationElement]$SearchRoot)
+
+    $count = 0
+    $elements = $SearchRoot.FindAll($descendants, $allElements)
+    for ($index = 0; $index -lt $elements.Count; $index++) {
+        if (Test-SessionRow $elements.Item($index)) {
+            $count++
+        }
+    }
+    return $count
 }
 
 function Get-SessionSearchTerms {
@@ -224,13 +254,12 @@ if ($null -eq $root) {
 # Warm Chromium's accessibility tree briefly. Selection below filters Hermes'
 # own session list by the stable session id, so it does not need to scan a large
 # sidebar or wait for a title that may be duplicated or stale.
-$sessionRow = $null
 $warmup = [System.Diagnostics.Stopwatch]::StartNew()
 while ($true) {
     $searchBox = Find-SearchBox $root
     $toggle = Find-SidebarToggle $root
-    $sessionRow = Find-AnySessionRow $root
-    if ($null -ne $searchBox -or $null -ne $toggle -or $null -ne $sessionRow) {
+    $warmRow = Find-AnySessionRow $root
+    if ($null -ne $searchBox -or $null -ne $toggle -or $null -ne $warmRow) {
         break
     }
     if ($warmup.ElapsedMilliseconds -ge 3000) {
@@ -257,16 +286,18 @@ if ($null -ne $toggle -and $toggle.Current.Name -eq "Show sidebar") {
 
 # Fast path: a visible session row can be invoked directly. This avoids
 # filtering the full sidebar (and the extra Chromium render pass it causes)
-# for the common case where the selected task is already on screen.
-if ($null -eq $sessionRow) {
-    $sessionRow = Find-SessionRow $root
-}
+# for the common case where the selected task is already on screen. The
+# warm-up probe above must not feed this: it accepts any positional row, so
+# it would click whatever happens to be first in the sidebar.
+$sessionRow = Find-SessionRow $root
 
 # Hermes' command-center and sidebar search both index the stable session id.
-# Filtering by it makes duplicate titles unambiguous. Try cleaned id variants
-# too: a bridged/re-published task can carry redundant `hermes:` wrappers that
-# Hermes itself does not index. Fall back to title only for older Hermes builds
-# that do not index ids in the sidebar search.
+# Filtering by it makes duplicate titles unambiguous, and it is the only
+# reliable query: the sidebar search also matches message content, so a title
+# query can rank another session's excerpt above the target. Try cleaned id
+# variants too: a bridged/re-published task can carry redundant `hermes:`
+# wrappers that Hermes itself does not index. Fall back to title only for
+# older Hermes builds that do not index ids in the sidebar search.
 $searchUsed = $false
 if ($null -eq $searchBox) {
     $searchBox = Find-SearchBox $root
@@ -274,14 +305,22 @@ if ($null -eq $searchBox) {
 if ($null -eq $sessionRow -and $null -ne $searchBox) {
     $searchUsed = $true
     foreach ($searchTerm in Get-SessionSearchTerms) {
+        # Hermes resolves the filter through the session backend, so the row
+        # list keeps showing the unfiltered sessions for a moment after the
+        # text lands. Find-AnySessionRow would happily return one of those,
+        # so only accept a row after the list has moved off its pre-search
+        # row count (a miss settles on zero rows, a hit narrows the list).
+        $baseline = Get-SessionRowCount $root
         if (-not (Set-SearchText $searchBox $searchTerm)) { break }
-        Start-Sleep -Milliseconds 250
-        $sessionRow = Wait-For { Find-AnySessionRow $root } 1000
+        $sessionRow = Wait-For {
+            if ((Get-SessionRowCount $root) -eq $baseline) { return $null }
+            Find-AnySessionRow $root
+        } 3000
         if ($null -ne $sessionRow) { break }
     }
-    if ($null -eq $sessionRow -and (Set-SearchText $searchBox $TargetTitle)) {
+    if ($null -eq $sessionRow -and (Set-SearchText $searchBox $SearchTitle)) {
         Start-Sleep -Milliseconds 250
-        $sessionRow = Wait-For { Find-SessionRow $root } 1500
+        $sessionRow = Wait-For { Find-SessionRow $root } 2000
     }
 } elseif ($null -eq $sessionRow -and $null -eq $searchBox) {
     $sessionRow = Wait-For { Find-SessionRow $root } 2500
@@ -317,17 +356,26 @@ if ($searchUsed) {
 
 # Confirm the app actually activated the session: open sessions render as
 # editor tabs, and the active tab carries the tab-active styling class. The
-# tab label renders uppercased, so compare case-insensitively. Waiting here
-# keeps racing observers (and users) from turning a slow switch into a false
-# negative.
+# tab label renders uppercased and its accessible name concatenates sibling
+# content (draft badges, the tab Close button), so compare case-insensitively
+# on containment rather than equality. Waiting here keeps racing observers
+# (and users) from turning a slow switch into a false negative.
 $activated = $false
+$loweredTitle = $TargetTitle.ToLowerInvariant()
+$loweredSearch = $SearchTitle.ToLowerInvariant()
 $timer = [System.Diagnostics.Stopwatch]::StartNew()
 while ($timer.ElapsedMilliseconds -lt 2500) {
     $activeTab = Find-Element $root {
         param($element)
-        $element.Current.ControlType -eq [System.Windows.Automation.ControlType]::TabItem -and
-            $element.Current.Name -eq $TargetTitle -and
-            $element.Current.ClassName.Contains("tab-active")
+        if ($element.Current.ControlType -ne [System.Windows.Automation.ControlType]::TabItem) {
+            return $false
+        }
+        if (-not $element.Current.ClassName.Contains("tab-active")) {
+            return $false
+        }
+        $name = $element.Current.Name.ToLowerInvariant()
+        return $name.Contains($loweredTitle) -or
+            ($loweredSearch -ne $loweredTitle -and $name.Contains($loweredSearch))
     }
     if ($null -ne $activeTab) {
         $activated = $true

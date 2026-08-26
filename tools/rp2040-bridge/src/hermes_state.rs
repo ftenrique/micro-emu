@@ -177,14 +177,16 @@ fn build_cached_task(session: &Value, now_ms: u128) -> Option<Value> {
         .unwrap_or_default();
     let failed = end_reason.contains("error") || end_reason.contains("fail");
     let ended_at = session.get("ended_at").and_then(Value::as_f64);
+    // The remote backend flips is_active off the moment a turn finishes, but
+    // it records ended_at only on abnormal closes (ws_orphan_reap,
+    // cli_close). Requiring ended_at for completion left every naturally
+    // finished session stuck in queued, so its card never turned green.
     let state = if active {
         "running"
     } else if failed {
         "error"
-    } else if ended_at.is_some() {
-        "completed"
     } else {
-        "queued"
+        "completed"
     };
     let activity_ms = seconds_to_ms(cached_session_activity(session));
     let started_at_ms = session
@@ -527,5 +529,64 @@ mod tests {
         assert_eq!(task["project"], "default");
         assert_eq!(task["started_at_ms"], 10_000);
         assert!(task["finished_at_ms"].is_null());
+    }
+
+    #[test]
+    fn cached_remote_finished_session_maps_to_completed_task() {
+        // A naturally finished turn: the backend clears is_active but only
+        // writes ended_at on abnormal closes, so ended_at stays empty.
+        let task = build_cached_task(
+            &json!({
+                "id": "remote-2",
+                "source": "desktop",
+                "title": "Finished work",
+                "started_at": 10.0,
+                "last_active": 15.0,
+                "ended_at": null,
+                "end_reason": null,
+                "is_active": false
+            }),
+            20_000,
+        )
+        .unwrap();
+        assert_eq!(task["state"], "completed");
+        assert_eq!(task["finished_at_ms"], 15_000);
+    }
+
+    #[test]
+    fn cached_remote_reaped_session_still_maps_to_completed_task() {
+        let task = build_cached_task(
+            &json!({
+                "id": "remote-3",
+                "title": "Reaped work",
+                "started_at": 10.0,
+                "last_active": 12.0,
+                "ended_at": 14.0,
+                "end_reason": "ws_orphan_reap",
+                "is_active": false
+            }),
+            20_000,
+        )
+        .unwrap();
+        assert_eq!(task["state"], "completed");
+        assert_eq!(task["finished_at_ms"], 14_000);
+    }
+
+    #[test]
+    fn cached_remote_failed_session_maps_to_error_task() {
+        let task = build_cached_task(
+            &json!({
+                "id": "remote-4",
+                "title": "Failed work",
+                "started_at": 10.0,
+                "last_active": 12.0,
+                "ended_at": 14.0,
+                "end_reason": "agent_error",
+                "is_active": false
+            }),
+            20_000,
+        )
+        .unwrap();
+        assert_eq!(task["state"], "error");
     }
 }

@@ -89,6 +89,21 @@ mod native {
         fn CloseHandle(handle: Handle) -> Bool;
     }
 
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegOpenKeyExW(
+            key: Handle,
+            sub_key: *const u16,
+            options: u32,
+            desired_access: u32,
+            result: *mut Handle,
+        ) -> i32;
+        fn RegCloseKey(key: Handle) -> i32;
+    }
+
+    const HKEY_CURRENT_USER: Handle = 0x8000_0001_u32 as Handle;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+
     #[derive(Default)]
     struct WindowSearch {
         window: Hwnd,
@@ -350,12 +365,88 @@ mod native {
         queue: &'static AutomationQueue,
     ) -> Result<(), String> {
         let window = find_hermes_window()?;
+        // Prefer Hermes' own deep-link navigation: the OS protocol handler
+        // hands the URL to the running app, which focuses its window and
+        // opens the session itself. That contract survives UI restyling,
+        // unlike the accessibility-tree selectors of the script fallback.
+        if deep_link_registered() {
+            match open_session_deep_link(&request.session_id) {
+                Ok(()) => return Ok(()),
+                Err(error) => eprintln!(
+                    "Hermes deep-link selection failed, falling back to UI automation: {error}"
+                ),
+            }
+        }
         let script = format!(
-            "$WindowHandle = {window}\n$TargetSessionId = '{}'\n$TargetTitle = '{}'\n{SELECT_SESSION_SCRIPT}",
-            escape_powershell_single_quoted(&request.session_id),
-            escape_powershell_single_quoted(&request.title)
+            "$WindowHandle = {window}\n$TargetSessionId = {}\n$TargetTitle = {}\n{SELECT_SESSION_SCRIPT}",
+            crate::powershell::unicode_literal(&request.session_id),
+            crate::powershell::unicode_literal(&request.title)
         );
         run_automation(&script, "selected", Some((request.generation, queue)))
+    }
+
+    /// Whether Hermes registered its `hermes://` URL protocol for this user
+    /// (Electron writes `HKCU\Software\Classes\hermes` for user-level
+    /// installs). When absent, deep-link selection is impossible and callers
+    /// must fall back to the UIA script.
+    fn deep_link_registered() -> bool {
+        let sub_key: Vec<u16> = "Software\\Classes\\hermes\\shell\\open\\command"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut handle: Handle = 0;
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                sub_key.as_ptr(),
+                0,
+                KEY_QUERY_VALUE,
+                &mut handle,
+            )
+        };
+        if status != 0 {
+            return false;
+        }
+        unsafe { RegCloseKey(handle) };
+        true
+    }
+
+    /// Navigates the running Hermes desktop app to `session_id` through
+    /// `hermes://open/<session-id>`. The app resolves non-reserved paths as
+    /// session routes, focuses its window, and opens (or jumps to) the
+    /// session. Fire-and-forget: delivery is synchronous OS process
+    /// launching, but the app gives the caller no completion feedback.
+    fn open_session_deep_link(session_id: &str) -> Result<(), String> {
+        let url = format!("hermes://open/{}", encode_uri_component(session_id));
+        let status = Command::new("cmd.exe")
+            .args(["/C", "start", "", &url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("could not launch the Hermes deep link: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("the Hermes deep link launch exited with {status}"))
+        }
+    }
+
+    /// Percent-encodes everything outside the URI unreserved set, matching
+    /// JavaScript's `encodeURIComponent`, so arbitrary session ids stay a
+    /// single path segment in the deep-link URL.
+    fn encode_uri_component(value: &str) -> String {
+        let mut encoded = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    encoded.push(byte as char);
+                }
+                _ => encoded.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        encoded
     }
 
     fn run_automation(
@@ -416,6 +507,17 @@ mod native {
                 stderr.trim()
             ));
         }
+        // The script is fed through `powershell -Command -`, which executes
+        // stdin statements one at a time: the script's `trap { exit 1 }` only
+        // aborts the current statement, so a failing run still falls through
+        // to print the success marker and exits with code 0. The trap writes
+        // the failure to stderr, so any stderr output marks the run failed.
+        if !stderr.trim().is_empty() {
+            return Err(format!(
+                "Hermes sidebar automation failed: {}",
+                stderr.trim()
+            ));
+        }
         if stdout.lines().any(|line| line.trim() == success_marker) {
             Ok(())
         } else {
@@ -424,10 +526,6 @@ mod native {
                 stdout.trim()
             ))
         }
-    }
-
-    fn escape_powershell_single_quoted(value: &str) -> String {
-        value.replace('\'', "''")
     }
 
     pub fn minimize() -> Result<(), String> {
@@ -579,9 +677,7 @@ mod native {
 
     #[cfg(test)]
     mod tests {
-        use super::{
-            escape_powershell_single_quoted, is_hermes_desktop_executable, normalize_session_id,
-        };
+        use super::{encode_uri_component, is_hermes_desktop_executable, normalize_session_id};
 
         #[test]
         fn session_search_uses_the_native_id_without_bridge_wrappers() {
@@ -595,6 +691,16 @@ mod native {
         }
 
         #[test]
+        fn deep_link_ids_stay_a_single_unreserved_path_segment() {
+            assert_eq!(
+                encode_uri_component("20260819_132950_27de3c"),
+                "20260819_132950_27de3c"
+            );
+            assert_eq!(encode_uri_component("a b/c?d"), "a%20b%2Fc%3Fd");
+            assert_eq!(encode_uri_component("español"), "espa%C3%B1ol");
+        }
+
+        #[test]
         fn recognizes_only_hermes_desktop_executable() {
             assert!(is_hermes_desktop_executable(
                 r"C:\Users\me\AppData\Local\hermes\release\win-unpacked\Hermes.exe"
@@ -602,18 +708,6 @@ mod native {
             assert!(is_hermes_desktop_executable(r"D:/apps/HERMES.EXE"));
             assert!(!is_hermes_desktop_executable(r"D:\apps\hermes-agent.exe"));
             assert!(!is_hermes_desktop_executable(r"D:\apps\Codex.exe"));
-        }
-
-        #[test]
-        fn escapes_single_quotes_for_powershell_literals() {
-            assert_eq!(
-                escape_powershell_single_quoted("plain title"),
-                "plain title"
-            );
-            assert_eq!(
-                escape_powershell_single_quoted("it's a task's title"),
-                "it''s a task''s title"
-            );
         }
     }
 }
