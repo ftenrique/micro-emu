@@ -272,6 +272,7 @@ export class DaemonClient extends EventEmitter {
             this.clearConnectTimer();
             this.connecting = false;
             this.connected = true;
+            this.autostartAttempted = false;
             this.reconnectDelay = 250;
             this.socket = socket;
             this.lastInboundAt = Date.now();
@@ -308,7 +309,7 @@ export class DaemonClient extends EventEmitter {
         socket.on("error", (error: Error) => {
             if (this.socket !== socket) return;
             this.emit("error", error);
-            if (!this.connected && !this.autostartAttempted) {
+            if (!this.connected && !this.autostartAttempted && !this.daemonProcess) {
                 this.autostartAttempted = true;
                 this.tryAutostart();
             }

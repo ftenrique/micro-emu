@@ -51,7 +51,7 @@ pub fn read_hermes_snapshot(now_ms: u128, max_tasks: usize) -> Option<Value> {
     {
         return local;
     }
-    read_remote_cache_snapshot(now_ms, max_tasks).or(local)
+    read_remote_cache_snapshot(max_tasks).or(local)
 }
 
 /// Hermes Desktop can point at an OAuth-protected remote backend. In that
@@ -59,7 +59,7 @@ pub fn read_hermes_snapshot(now_ms: u128, max_tasks: usize) -> Option<Value> {
 /// already-authenticated sidebar response as a plain JSON response body. Read
 /// that response as a credential-free fallback so remote sessions remain
 /// visible without duplicating Chromium's OAuth cookie handling in the bridge.
-fn read_remote_cache_snapshot(now_ms: u128, max_tasks: usize) -> Option<Value> {
+fn read_remote_cache_snapshot(max_tasks: usize) -> Option<Value> {
     if max_tasks == 0 {
         return Some(json!({"tasks": []}));
     }
@@ -70,6 +70,10 @@ fn read_remote_cache_snapshot(now_ms: u128, max_tasks: usize) -> Option<Value> {
         .join("hermes-remote-oauth")
         .join("Cache")
         .join("Cache_Data");
+    read_remote_cache_snapshot_from(&cache_dir, max_tasks)
+}
+
+fn read_remote_cache_snapshot_from(cache_dir: &Path, max_tasks: usize) -> Option<Value> {
     let mut candidates = std::fs::read_dir(cache_dir)
         .ok()?
         .flatten()
@@ -95,11 +99,17 @@ fn read_remote_cache_snapshot(now_ms: u128, max_tasks: usize) -> Option<Value> {
         let Ok(response) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
-        let Some(sessions) = response
+        // The backend moved the sidebar listing from `recents.sessions` to a
+        // top-level `sessions` array. Accept both shapes: otherwise the last
+        // cached response in the retired shape (whose sessions are all
+        // inactive) masks every fresher listing and the board never sees a
+        // running session again.
+        let sessions = response
             .get("recents")
             .and_then(|recents| recents.get("sessions"))
-            .and_then(Value::as_array)
-        else {
+            .or_else(|| response.get("sessions"))
+            .and_then(Value::as_array);
+        let Some(sessions) = sessions else {
             continue;
         };
         let mut sessions = sessions.iter().collect::<Vec<_>>();
@@ -114,7 +124,7 @@ fn read_remote_cache_snapshot(now_ms: u128, max_tasks: usize) -> Option<Value> {
         });
         let tasks = sessions
             .into_iter()
-            .filter_map(|session| build_cached_task(session, now_ms))
+            .filter_map(|session| build_cached_task(session))
             .take(max_tasks)
             .collect::<Vec<_>>();
         return Some(json!({"tasks": tasks}));
@@ -138,7 +148,57 @@ fn cached_session_activity(session: &Value) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn build_cached_task(session: &Value, now_ms: u128) -> Option<Value> {
+/// Detects only explicit approval markers supplied by a Hermes backend or
+/// persisted message metadata. A generic active session is deliberately not
+/// treated as waiting: tool execution and approval pauses look identical in
+/// the lifecycle fields Hermes persists to its local database.
+fn value_has_pending_approval_marker(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    for key in [
+        "pending_approval",
+        "approval_pending",
+        "approval_required",
+        "permission_request",
+    ] {
+        let Some(marker) = object.get(key) else {
+            continue;
+        };
+        if marker.as_bool() == Some(true) || marker.is_object() || marker.is_array() {
+            return true;
+        }
+        if marker.as_str().is_some_and(is_pending_approval_status) {
+            return true;
+        }
+    }
+    ["status", "state", "kind", "type", "display_kind"]
+        .into_iter()
+        .filter_map(|key| object.get(key).and_then(Value::as_str))
+        .any(is_pending_approval_status)
+}
+
+fn is_pending_approval_status(value: &str) -> bool {
+    matches!(
+        value
+            .trim()
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .replace(' ', "_")
+            .as_str(),
+        "approval"
+            | "approval_pending"
+            | "approval_required"
+            | "approval_request"
+            | "awaiting_approval"
+            | "needs_approval"
+            | "permission_request"
+            | "permission_required"
+            | "pending_approval"
+    )
+}
+
+fn build_cached_task(session: &Value) -> Option<Value> {
     let id = session.get("id")?.as_str()?;
     let source = session
         .get("source")
@@ -170,40 +230,35 @@ fn build_cached_task(session: &Value, now_ms: u128) -> Option<Value> {
             .map(str::to_owned)
     });
     let model = session.get("model").and_then(Value::as_str);
+    let approval_pending = value_has_pending_approval_marker(session);
     let active = cached_session_active(session);
     let end_reason = session
         .get("end_reason")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let failed = end_reason.contains("error") || end_reason.contains("fail");
-    let ended_at = session.get("ended_at").and_then(Value::as_f64);
     // The remote backend flips is_active off the moment a turn finishes, but
     // it records ended_at only on abnormal closes (ws_orphan_reap,
     // cli_close). Requiring ended_at for completion left every naturally
     // finished session stuck in queued, so its card never turned green.
-    let state = if active {
+    let state = if approval_pending {
+        "waiting"
+    } else if active {
         "running"
     } else if failed {
         "error"
     } else {
         "completed"
     };
-    let activity_ms = seconds_to_ms(cached_session_activity(session));
-    let started_at_ms = session
-        .get("started_at")
-        .and_then(Value::as_f64)
-        .map(seconds_to_ms)
-        .or((state == "running").then_some(now_ms.min(activity_ms)));
-    let finished_at_ms = if active {
-        None
-    } else {
-        Some(ended_at.map(seconds_to_ms).unwrap_or(activity_ms))
-    };
-    let priority = if active {
+    let priority = if active || approval_pending {
         TASK_PRIORITY_ACTIVE
     } else {
         TASK_PRIORITY_IDLE
     };
+    // The cached listing only dates the session, never the current turn, so
+    // any explicit timestamp would render the session's age as the running
+    // timer. Publishing without timestamps makes the task board snapshot its
+    // own first-observed running time and keep it until the turn completes.
     Some(json!({
         "task_id": task_id,
         "title": title,
@@ -212,9 +267,6 @@ fn build_cached_task(session: &Value, now_ms: u128) -> Option<Value> {
         "model": model,
         "state": state,
         "priority": priority,
-        "started_at_ms": started_at_ms,
-        "finished_at_ms": finished_at_ms,
-        "timing_authoritative": true,
         "context": {
             "project": project,
             "task": title,
@@ -323,19 +375,36 @@ struct MessageActivity {
     latest_at: Option<f64>,
     finish_reason: Option<String>,
     latest_user_at: Option<f64>,
+    approval_pending: bool,
 }
 
 fn message_activity(connection: &Connection, session_id: &str) -> MessageActivity {
+    let columns = table_columns(connection, "messages").unwrap_or_default();
+    let display_kind = if columns.iter().any(|column| column == "display_kind") {
+        "display_kind"
+    } else {
+        "NULL"
+    };
+    let display_metadata = if columns.iter().any(|column| column == "display_metadata") {
+        "display_metadata"
+    } else {
+        "NULL"
+    };
     let latest = connection
         .query_row(
-            "SELECT role, timestamp, finish_reason FROM messages \
-             WHERE session_id = ?1 ORDER BY timestamp DESC, id DESC LIMIT 1",
+            &format!(
+                "SELECT role, timestamp, finish_reason, {display_kind}, {display_metadata} \
+                 FROM messages WHERE session_id = ?1 \
+                 ORDER BY timestamp DESC, id DESC LIMIT 1"
+            ),
             [session_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, f64>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
@@ -348,11 +417,21 @@ fn message_activity(connection: &Connection, session_id: &str) -> MessageActivit
         )
         .ok()
         .flatten();
+    let approval_pending = latest.as_ref().is_some_and(|value| {
+        let kind_pending = value.3.as_deref().is_some_and(is_pending_approval_status);
+        let metadata_pending = value
+            .4
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .is_some_and(|metadata| value_has_pending_approval_marker(&metadata));
+        kind_pending || metadata_pending
+    });
     MessageActivity {
         latest_role: latest.as_ref().map(|value| value.0.clone()),
         latest_at: latest.as_ref().map(|value| value.1),
         finish_reason: latest.and_then(|value| value.2),
         latest_user_at,
+        approval_pending,
     }
 }
 
@@ -362,7 +441,7 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value 
     let task_id = format!("hermes:{}", row.id);
     let project = row.cwd.as_deref().map(project_name);
     let effort = row.model_config.as_deref().and_then(model_effort);
-    let priority = if state == "running" {
+    let priority = if matches!(state, "running" | "waiting") {
         TASK_PRIORITY_ACTIVE
     } else {
         TASK_PRIORITY_IDLE
@@ -398,6 +477,9 @@ fn derive_state(
     let latest_ms = seconds_to_ms(activity.latest_at.unwrap_or(row.last_activity_at));
     let started_ms = seconds_to_ms(activity.latest_user_at.unwrap_or(row.started_at));
     let elapsed = now_ms.saturating_sub(latest_ms);
+    if activity.approval_pending && elapsed <= ACTIVITY_LIVENESS.as_millis() {
+        return ("waiting", Some(started_ms), None);
+    }
     let finish = activity.finish_reason.as_deref().unwrap_or_default();
     let pending = matches!(activity.latest_role.as_deref(), Some("user" | "tool"))
         || (activity.latest_role.as_deref() == Some("assistant")
@@ -446,6 +528,8 @@ fn model_effort(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::time::SystemTime;
 
     fn fixture_db() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
@@ -459,7 +543,8 @@ mod tests {
              );
              CREATE TABLE messages (
                 id integer primary key, session_id text not null, role text not null,
-                content text, timestamp real not null, finish_reason text
+                content text, timestamp real not null, finish_reason text,
+                display_kind text, display_metadata text
              );",
             )
             .unwrap();
@@ -473,7 +558,8 @@ mod tests {
             "INSERT INTO sessions VALUES
              ('run','desktop',NULL,'hermes-4','{\"reasoning_effort\":\"high\"}',1,NULL,NULL,'Build parity','D:\\repo\\micro-emu',5,0),
              ('done','cli',NULL,'hermes-4',NULL,1,NULL,NULL,'Finished','D:\\repo\\other',4,0);
-             INSERT INTO messages VALUES
+             INSERT INTO messages
+             (id,session_id,role,content,timestamp,finish_reason) VALUES
              (1,'run','user','go',5,NULL),
              (2,'done','user','go',2,NULL),
              (3,'done','assistant','ok',4,'stop');"
@@ -508,85 +594,265 @@ mod tests {
 
     #[test]
     fn cached_remote_active_session_maps_to_running_task() {
-        let task = build_cached_task(
-            &json!({
-                "id": "remote-1",
-                "source": "desktop",
-                "title": "Remote work",
-                "model": "hermes-4",
-                "profile": "default",
-                "started_at": 10.0,
-                "last_active": 12.0,
-                "ended_at": null,
-                "archived": false,
-                "is_active": true
-            }),
-            13_000,
-        )
+        let task = build_cached_task(&json!({
+            "id": "remote-1",
+            "source": "desktop",
+            "title": "Remote work",
+            "model": "hermes-4",
+            "profile": "default",
+            "started_at": 10.0,
+            "last_active": 12.0,
+            "ended_at": null,
+            "archived": false,
+            "is_active": true
+        }))
         .unwrap();
         assert_eq!(task["task_id"], "hermes:remote-1");
         assert_eq!(task["state"], "running");
         assert_eq!(task["project"], "default");
-        assert_eq!(task["started_at_ms"], 10_000);
-        assert!(task["finished_at_ms"].is_null());
+        // No explicit timing: the board times the turn from its own
+        // first observation instead of rendering the session's age.
+        assert!(task.get("started_at_ms").is_none());
+        assert!(task.get("finished_at_ms").is_none());
+    }
+
+    #[test]
+    fn explicit_remote_approval_marker_maps_to_waiting_task() {
+        let task = build_cached_task(&json!({
+            "id": "remote-approval",
+            "title": "Needs approval",
+            "started_at": 10.0,
+            "last_active": 12.0,
+            "is_active": true,
+            "pending_approval": {"tool": "shell"}
+        }))
+        .unwrap();
+        assert_eq!(task["state"], "waiting");
+        assert_eq!(task["priority"], 75);
+    }
+
+    #[test]
+    fn explicit_message_approval_marker_maps_to_waiting_task() {
+        let connection = fixture_db();
+        connection
+            .execute(
+                "INSERT INTO sessions VALUES
+                 ('approval','desktop',NULL,'hermes-4',NULL,1,NULL,NULL,
+                  'Needs approval','D:\\repo\\micro-emu',5,0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages
+                 (id, session_id, role, content, timestamp, finish_reason, display_kind)
+                 VALUES (1, 'approval', 'assistant', '', 5, 'stop', 'approval_required')",
+                [],
+            )
+            .unwrap();
+
+        let snapshot = read_hermes_snapshot_from_connection(&connection, 6_000, 6).unwrap();
+        let task = &snapshot["tasks"][0];
+        assert_eq!(task["state"], "waiting");
+        assert_eq!(task["priority"], 75);
     }
 
     #[test]
     fn cached_remote_finished_session_maps_to_completed_task() {
         // A naturally finished turn: the backend clears is_active but only
         // writes ended_at on abnormal closes, so ended_at stays empty.
-        let task = build_cached_task(
-            &json!({
-                "id": "remote-2",
-                "source": "desktop",
-                "title": "Finished work",
-                "started_at": 10.0,
-                "last_active": 15.0,
-                "ended_at": null,
-                "end_reason": null,
-                "is_active": false
-            }),
-            20_000,
-        )
+        let task = build_cached_task(&json!({
+            "id": "remote-2",
+            "source": "desktop",
+            "title": "Finished work",
+            "started_at": 10.0,
+            "last_active": 15.0,
+            "ended_at": null,
+            "end_reason": null,
+            "is_active": false
+        }))
         .unwrap();
         assert_eq!(task["state"], "completed");
-        assert_eq!(task["finished_at_ms"], 15_000);
+        assert!(task.get("finished_at_ms").is_none());
     }
 
     #[test]
     fn cached_remote_reaped_session_still_maps_to_completed_task() {
-        let task = build_cached_task(
-            &json!({
-                "id": "remote-3",
-                "title": "Reaped work",
-                "started_at": 10.0,
-                "last_active": 12.0,
-                "ended_at": 14.0,
-                "end_reason": "ws_orphan_reap",
-                "is_active": false
-            }),
-            20_000,
-        )
+        let task = build_cached_task(&json!({
+            "id": "remote-3",
+            "title": "Reaped work",
+            "started_at": 10.0,
+            "last_active": 12.0,
+            "ended_at": 14.0,
+            "end_reason": "ws_orphan_reap",
+            "is_active": false
+        }))
         .unwrap();
         assert_eq!(task["state"], "completed");
-        assert_eq!(task["finished_at_ms"], 14_000);
+        assert!(task.get("finished_at_ms").is_none());
     }
 
     #[test]
     fn cached_remote_failed_session_maps_to_error_task() {
-        let task = build_cached_task(
-            &json!({
-                "id": "remote-4",
-                "title": "Failed work",
-                "started_at": 10.0,
-                "last_active": 12.0,
-                "ended_at": 14.0,
-                "end_reason": "agent_error",
-                "is_active": false
-            }),
-            20_000,
-        )
+        let task = build_cached_task(&json!({
+            "id": "remote-4",
+            "title": "Failed work",
+            "started_at": 10.0,
+            "last_active": 12.0,
+            "ended_at": 14.0,
+            "end_reason": "agent_error",
+            "is_active": false
+        }))
         .unwrap();
         assert_eq!(task["state"], "error");
+    }
+
+    /// End-to-end check of the timing contract: a remote card picked up
+    /// mid-turn starts its timer when first observed, keeps it across
+    /// republished listings, and finishes with the observed turn length
+    /// instead of the session's age.
+    #[test]
+    fn board_times_remote_cards_from_first_observation() {
+        let mut board = crate::tasks::TaskBoard::new();
+        board.set_device("deck", 1, true);
+        let publish = |board: &mut crate::tasks::TaskBoard, session: Value, now_ms: u128| {
+            board
+                .publish_tasks(
+                    990,
+                    crate::routing::AgentId::Hermes,
+                    &json!({"tasks": [session]}),
+                    now_ms,
+                )
+                .unwrap();
+        };
+        let running = || {
+            build_cached_task(&json!({
+                "id": "timed",
+                "title": "Timed work",
+                "started_at": 10.0,
+                "is_active": true
+            }))
+            .unwrap()
+        };
+        publish(&mut board, running(), 1_000);
+        assert_eq!(
+            board.task("hermes:timed").unwrap().started_at_ms,
+            Some(1_000)
+        );
+
+        // A later listing of the still-running session must not restart the timer.
+        publish(&mut board, running(), 5_000);
+        assert_eq!(
+            board.task("hermes:timed").unwrap().started_at_ms,
+            Some(1_000)
+        );
+
+        let finished = build_cached_task(&json!({
+            "id": "timed",
+            "title": "Timed work",
+            "started_at": 10.0,
+            "is_active": false
+        }))
+        .unwrap();
+        publish(&mut board, finished, 9_000);
+        let card = board.task("hermes:timed").unwrap();
+        assert_eq!(card.state, crate::tasks::TaskState::Completed);
+        assert_eq!(card.started_at_ms, Some(1_000));
+        assert_eq!(card.finished_at_ms, Some(9_000));
+    }
+
+    fn temp_cache_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hermes-cache-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_cache_entry(dir: &Path, name: &str, modified: SystemTime, body: Value) {
+        let path = dir.join(name);
+        std::fs::write(&path, body.to_string()).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    #[test]
+    fn top_level_sessions_listing_feeds_the_task_board() {
+        let dir = temp_cache_dir("top-level");
+        write_cache_entry(
+            &dir,
+            "f_listing",
+            SystemTime::now(),
+            json!({
+                "sessions": [{
+                    "id": "live-1",
+                    "source": "desktop",
+                    "title": "Live work",
+                    "started_at": 10.0,
+                    "last_active": 12.0,
+                    "is_active": true
+                }],
+                "total": 1
+            }),
+        );
+        let snapshot = read_remote_cache_snapshot_from(&dir, 6).unwrap();
+        let tasks = snapshot["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["task_id"], "hermes:live-1");
+        assert_eq!(tasks[0]["state"], "running");
+    }
+
+    #[test]
+    fn fresh_top_level_listing_wins_over_stale_recents_entry() {
+        let dir = temp_cache_dir("mixed-shapes");
+        let now = SystemTime::now();
+        write_cache_entry(
+            &dir,
+            "f_stale",
+            now - Duration::from_secs(60),
+            json!({"recents": {"sessions": [{
+                "id": "stale-1",
+                "title": "Stale work",
+                "is_active": false
+            }]}}),
+        );
+        write_cache_entry(
+            &dir,
+            "f_fresh",
+            now,
+            json!({"sessions": [{
+                "id": "fresh-1",
+                "title": "Fresh work",
+                "is_active": true
+            }]}),
+        );
+        let snapshot = read_remote_cache_snapshot_from(&dir, 6).unwrap();
+        let tasks = snapshot["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["task_id"], "hermes:fresh-1");
+        assert_eq!(tasks[0]["state"], "running");
+    }
+
+    #[test]
+    fn legacy_recents_listing_still_feeds_the_task_board() {
+        let dir = temp_cache_dir("legacy");
+        write_cache_entry(
+            &dir,
+            "f_listing",
+            SystemTime::now(),
+            json!({"recents": {"sessions": [{
+                "id": "legacy-1",
+                "title": "Legacy work",
+                "last_active": 5.0,
+                "is_active": false
+            }]}}),
+        );
+        let snapshot = read_remote_cache_snapshot_from(&dir, 6).unwrap();
+        let tasks = snapshot["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["task_id"], "hermes:legacy-1");
+        assert_eq!(tasks[0]["state"], "completed");
     }
 }

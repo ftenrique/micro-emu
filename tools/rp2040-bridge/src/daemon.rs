@@ -103,6 +103,15 @@ const CODEX_HARDWARE_IDLE: Duration = Duration::from_secs(60);
 /// the MCP client.
 const BRIDGE_HELLO: &str = "hello";
 
+/// The plugin pings every 15 seconds, so a plugin session that stays silent
+/// this long is dead (e.g. a socket left half-open across a system suspend).
+/// Timing out the blocking read lets the daemon detach the stale controller
+/// instead of keeping its reader thread parked forever.
+const PLUGIN_SESSION_READ_TIMEOUT: Duration = Duration::from_secs(90);
+/// Bounds outbound render writes so the plugin writer thread cannot wedge on
+/// a peer that vanished during suspend while its send buffer is full.
+const PLUGIN_SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A message received from a connected session.
 #[derive(Clone, Debug)]
 pub(crate) struct HelloInfo {
@@ -1327,6 +1336,13 @@ fn handle_plugin_session(
         "daemon [{}] plugin controller session {id} instance={instance_id} slots={task_slots}",
         log_context()
     );
+
+    if let Err(error) = write_stream
+        .set_read_timeout(Some(PLUGIN_SESSION_READ_TIMEOUT))
+        .and_then(|_| write_stream.set_write_timeout(Some(PLUGIN_SESSION_WRITE_TIMEOUT)))
+    {
+        eprintln!("plugin session {id} could not set socket timeouts: {error}");
+    }
 
     let (events_tx, events_rx) = mpsc::channel::<Value>();
     let (plugin_writer_tx, plugin_writer_rx) = mpsc::channel::<Value>();

@@ -17,6 +17,7 @@ import { TASK_SLOT_COUNT } from "./task-slots";
 const SUSPEND_GAP_MS = 60_000;
 const HOST_WAKE_GRACE_MS = 20_000;
 const WATCHDOG_INTERVAL_MS = 15_000;
+const HOST_PROBE_TIMEOUT_MS = 5_000;
 
 // --- Daemon client setup ---
 // Stream Deck does not reliably inherit the user's shell environment, so use
@@ -70,13 +71,34 @@ setInterval(() => {
         `System resumed after ${gapMs}ms without a Stream Deck wake event; awaiting host recovery`,
     );
     hostRecoveryTimer = setTimeout(() => {
+        hostRecoveryTimer = null;
+        void probeHostConnection();
+    }, HOST_WAKE_GRACE_MS);
+}, WATCHDOG_INTERVAL_MS);
+
+async function probeHostConnection(): Promise<void> {
+    try {
+        await Promise.race([
+            streamDeck.settings.getGlobalSettings(),
+            new Promise((_, reject) =>
+                setTimeout(
+                    () => reject(new Error(`host probe timed out after ${HOST_PROBE_TIMEOUT_MS}ms`)),
+                    HOST_PROBE_TIMEOUT_MS,
+                ),
+            ),
+        ]);
+        streamDeck.logger.info(
+            "Stream Deck host responded after resume without a wake event; keeping plugin alive",
+        );
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         streamDeck.logger.error(
-            "Stream Deck host connection did not recover after resume; restarting plugin",
+            `Stream Deck host connection did not recover after resume (${message}); restarting plugin`,
         );
         daemon.stop();
         process.exit(1);
-    }, HOST_WAKE_GRACE_MS);
-}, WATCHDOG_INTERVAL_MS);
+    }
+}
 const codex = new CodexActionExecutor((message) => streamDeck.logger.info(message));
 const ctx = new PluginContext(daemon, codex);
 

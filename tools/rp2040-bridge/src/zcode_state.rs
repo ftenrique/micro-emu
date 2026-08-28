@@ -15,6 +15,8 @@
 //! message that ended in tool calls all mean the turn is still running.  A
 //! recency bound on `session.time_updated` keeps aborted turns, whose
 //! streaming message is never finalized, from looking active forever.
+//! A running `tool_usage` row with an explicit pending approval status is
+//! surfaced as `waiting`, which the task board renders as an orange card.
 //!
 //! All queries open the database read-only so the running ZCode process keeps
 //! its write lock undisturbed.  If the database is missing, locked, or has an
@@ -144,8 +146,13 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value 
     let selection = model_selection(connection, &row.id);
     let tail = session_tail(connection, &row.id);
     let latest = row.latest.as_ref();
+    let approval_pending = has_pending_tool_approval(connection, &row.id);
 
-    let state = derive_state(latest, tail.as_ref(), row.time_updated, now_ms);
+    let state = if approval_pending {
+        "waiting"
+    } else {
+        derive_state(latest, tail.as_ref(), row.time_updated, now_ms)
+    };
     let started_at_ms = latest.map(|usage| usage.started_at);
     let finished_at_ms = latest.and_then(|usage| usage.completed_at);
     let model = selection
@@ -159,7 +166,7 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value 
     let project = project_name(&row.directory);
 
     // Running sessions rank above idle ones so they claim the lowest slots.
-    let priority = if state == "running" {
+    let priority = if matches!(state, "running" | "waiting") {
         TASK_PRIORITY_ACTIVE
     } else {
         TASK_PRIORITY_IDLE
@@ -190,6 +197,47 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value 
         "timing_authoritative": true,
         "context": context,
     })
+}
+
+/// Returns true only while the newest tool record explicitly says that a
+/// running tool is waiting for permission. Older ZCode databases may not have
+/// `tool_usage`; a failed read is treated as “no signal” so auto-feed remains
+/// backwards compatible.
+fn has_pending_tool_approval(connection: &Connection, session_id: &str) -> bool {
+    let result = connection.query_row(
+        "SELECT approval_status, status
+         FROM tool_usage
+         WHERE session_id = ?1
+         ORDER BY started_at DESC, rowid DESC
+         LIMIT 1",
+        [session_id],
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+    );
+    let Ok((approval_status, status)) = result else {
+        return false;
+    };
+    status.eq_ignore_ascii_case("running")
+        && approval_status
+            .as_deref()
+            .is_some_and(is_pending_approval_status)
+}
+
+fn is_pending_approval_status(value: &str) -> bool {
+    matches!(
+        value
+            .trim()
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .replace(' ', "_")
+            .as_str(),
+        "pending"
+            | "waiting"
+            | "approval_pending"
+            | "approval_required"
+            | "awaiting_approval"
+            | "needs_approval"
+            | "permission_required"
+    )
 }
 
 /// The most recent `model_usage` row for a session, if any.
@@ -387,6 +435,13 @@ mod tests {
                     time_updated integer not null,
                     sequence integer,
                     data text not null
+                );
+                CREATE TABLE tool_usage (
+                    id text primary key,
+                    session_id text not null,
+                    approval_status text,
+                    status text not null,
+                    started_at integer not null
                 );",
             )
             .unwrap();
@@ -457,6 +512,24 @@ mod tests {
                  VALUES (?1, 'r1', ?2, 'builtin:zai-coding-plan',
                          'GLM-5.3', 'max', 'zcode-agent', ?3, ?4, ?5)",
                 rusqlite::params![id, session_id, status, started_at, completed_at],
+            )
+            .unwrap();
+    }
+
+    fn insert_tool_approval(
+        connection: &Connection,
+        id: &str,
+        session_id: &str,
+        approval_status: &str,
+        status: &str,
+        started_at: i64,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO tool_usage
+                 (id, session_id, approval_status, status, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, session_id, approval_status, status, started_at],
             )
             .unwrap();
     }
@@ -711,6 +784,43 @@ mod tests {
 
         let snapshot = read_zcode_snapshot_from_connection(&connection, 11_000, 6).unwrap();
         assert_eq!(snapshot["tasks"][0]["state"], "running");
+    }
+
+    #[test]
+    fn pending_tool_approval_maps_to_waiting_task() {
+        let connection = fixture_db();
+        insert_session(&connection, "sess_approval", 10_000);
+        insert_usage(
+            &connection,
+            "mu1",
+            "sess_approval",
+            "completed",
+            9_000,
+            Some(9_500),
+        );
+        insert_message(
+            &connection,
+            "sess_approval",
+            1,
+            10_500,
+            "assistant",
+            Some("tool-calls"),
+            Some(10_480),
+        );
+        insert_tool_approval(
+            &connection,
+            "tool1",
+            "sess_approval",
+            "pending",
+            "running",
+            10_600,
+        );
+
+        let snapshot = read_zcode_snapshot_from_connection(&connection, 11_000, 6).unwrap();
+        let task = &snapshot["tasks"][0];
+        assert_eq!(task["state"], "waiting");
+        assert_eq!(task["priority"], 75);
+        assert_eq!(task["context"]["status"], "waiting");
     }
 
     #[test]
