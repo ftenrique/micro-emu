@@ -38,10 +38,13 @@ test("every encoder-button mic route offers the ZCode dictation branch first", (
   );
   assert.ok(branches !== null && branches.length === 2, "expected the primary and task-device mic routes");
   for (const branch of branches) {
-    assert.match(
-      branch,
-      /zcode_window::microphone_active\(\)\s*\|\|\s*crate::zcode_window::is_foreground\(\)\.unwrap_or\(false\)/,
-    );
-    assert.match(branch, /zcode_window::set_microphone\(pressed\)/);
+    assert.match(branch, /if route_desktop_dictation\(pressed\) \{\s*continue;/);
   }
+  // The shared helper checks ZCode before Hermes and Claude.
+  const helper = bridgeSource.match(/fn route_desktop_dictation\(pressed: bool\) -> bool \{[\s\S]*?\n\}/);
+  assert.ok(helper !== null, "expected the shared desktop dictation helper");
+  assert.match(
+    helper[0],
+    /^[^]*?zcode_window::microphone_active\(\)\s*\|\|\s*crate::zcode_window::is_foreground\(\)\.unwrap_or\(false\)\s*\{\s*crate::zcode_window::set_microphone\(pressed\)/,
+  );
 });

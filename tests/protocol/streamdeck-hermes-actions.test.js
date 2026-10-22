@@ -66,11 +66,14 @@ test("every encoder-button mic route offers the Hermes dictation branch", () => 
   );
   assert.ok(branches !== null && branches.length === 2, "expected the primary and task-device mic routes");
   for (const branch of branches) {
-    assert.match(branch, /zcode_window::microphone_active\(\)/);
-    assert.match(branch, /hermes_window::microphone_active\(\)/);
-    assert.match(branch, /hermes_window::is_foreground\(\)\.unwrap_or\(false\)/);
-    assert.match(branch, /hermes_window::set_microphone\(pressed\)/);
+    assert.match(branch, /if route_desktop_dictation\(pressed\) \{\s*continue;/);
   }
+  const helper = bridgeSource.match(/fn route_desktop_dictation\(pressed: bool\) -> bool \{[\s\S]*?\n\}/);
+  assert.ok(helper !== null, "expected the shared desktop dictation helper");
+  assert.match(
+    helper[0],
+    /zcode_window::microphone_active\(\)[\s\S]*hermes_window::microphone_active\(\)\s*\|\|\s*crate::hermes_window::is_foreground\(\)\.unwrap_or\(false\)[\s\S]*hermes_window::set_microphone\(pressed\)/,
+  );
 });
 
 test("pressing an auto-fed Hermes card drives the desktop app to that session", () => {

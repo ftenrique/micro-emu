@@ -200,7 +200,7 @@ pub fn tool_available(name: &str, agent: Option<AgentId>) -> bool {
                 | "publish_tasks"
                 | "set_display_context"
         ),
-        Some(AgentId::ZCode) => matches!(
+        Some(AgentId::ZCode | AgentId::Claude) => matches!(
             name,
             "bridge_status"
                 | "poll_events"

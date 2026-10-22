@@ -1,8 +1,8 @@
 //! Agent routing, dynamic event partitioning and LCD slot fusion.
 //!
-//! The bridge serves up to three agents simultaneously: Codex (ChatGPT via
-//! HID + MCP), ZCode (Z.ai ADE, MCP only) and Hermes (Nous Research desktop
-//! agent, MCP only). Physical controller events are partitioned dynamically
+//! The bridge serves up to four agents simultaneously: Codex (ChatGPT via
+//! HID + MCP), Claude (Claude Code / Claude Desktop, MCP only), ZCode (Z.ai
+//! ADE, MCP only) and Hermes (Nous Research desktop agent, MCP only). Physical controller events are partitioned dynamically
 //! based on which agents are currently active, and LCD status slots are fused
 //! so each agent only writes its assigned slots.
 
@@ -13,14 +13,20 @@ use std::collections::VecDeque;
 pub const LCD_SLOTS: usize = 6;
 
 /// Number of agents supported by the bridge.
-pub const AGENT_COUNT: usize = 3;
+pub const AGENT_COUNT: usize = 4;
 
 /// Maximum buffered events per agent before the oldest are dropped.
 pub const EVENT_QUEUE_CAPACITY: usize = 256;
 
 /// Agents in priority order. Used for partition computation and repartition
-/// event ordering. Codex has the highest priority, then ZCode, then Hermes.
-pub const AGENTS: [AgentId; AGENT_COUNT] = [AgentId::Codex, AgentId::ZCode, AgentId::Hermes];
+/// event ordering. Codex has the highest priority, then Claude, then ZCode,
+/// then Hermes.
+pub const AGENTS: [AgentId; AGENT_COUNT] = [
+    AgentId::Codex,
+    AgentId::Claude,
+    AgentId::ZCode,
+    AgentId::Hermes,
+];
 
 /// Identifies which agent a session represents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -28,6 +34,7 @@ pub enum AgentId {
     Codex,
     ZCode,
     Hermes,
+    Claude,
 }
 
 impl AgentId {
@@ -36,8 +43,9 @@ impl AgentId {
             "codex" => Ok(Self::Codex),
             "zcode" => Ok(Self::ZCode),
             "hermes" => Ok(Self::Hermes),
+            "claude" => Ok(Self::Claude),
             _ => Err(format!(
-                "agent must be codex, zcode, or hermes (got {value})"
+                "agent must be codex, claude, zcode, or hermes (got {value})"
             )),
         }
     }
@@ -47,6 +55,7 @@ impl AgentId {
             Self::Codex => "codex",
             Self::ZCode => "zcode",
             Self::Hermes => "hermes",
+            Self::Claude => "claude",
         }
     }
 
@@ -56,6 +65,7 @@ impl AgentId {
             Self::Codex => 0,
             Self::ZCode => 1,
             Self::Hermes => 2,
+            Self::Claude => 3,
         }
     }
 }
@@ -125,9 +135,9 @@ impl Partition {
     /// Computes the partition for the given active set.
     ///
     /// Codex always owns the fixed first half (keys AG00-AG02 / slots 0-2).
-    /// ZCode has priority for the fixed second half (keys AG03-AG05 /
-    /// slots 3-5); Hermes uses that same second half only while ZCode is
-    /// absent. Unused halves remain unowned so presses are dropped and cards
+    /// The fixed second half (keys AG03-AG05 / slots 3-5) goes to the
+    /// highest-priority active agent among Claude, ZCode and Hermes, in that
+    /// order. Unused halves remain unowned so presses are dropped and cards
     /// render off.
     pub fn compute(active: ActiveSet) -> Self {
         let mut owners = [None; LCD_SLOTS];
@@ -135,7 +145,9 @@ impl Partition {
         if active.contains(AgentId::Codex) {
             owners[..3].fill(Some(AgentId::Codex));
         }
-        if active.contains(AgentId::ZCode) {
+        if active.contains(AgentId::Claude) {
+            owners[3..].fill(Some(AgentId::Claude));
+        } else if active.contains(AgentId::ZCode) {
             owners[3..].fill(Some(AgentId::ZCode));
         } else if active.contains(AgentId::Hermes) {
             owners[3..].fill(Some(AgentId::Hermes));
@@ -274,7 +286,12 @@ pub struct EventRouting {
 impl EventRouting {
     pub fn new() -> Self {
         Self {
-            queues: [EventQueue::new(), EventQueue::new(), EventQueue::new()],
+            queues: [
+                EventQueue::new(),
+                EventQueue::new(),
+                EventQueue::new(),
+                EventQueue::new(),
+            ],
         }
     }
 
@@ -430,6 +447,31 @@ mod tests {
         assert_eq!(AgentId::Codex.index(), 0);
         assert_eq!(AgentId::ZCode.index(), 1);
         assert_eq!(AgentId::Hermes.index(), 2);
+        assert_eq!(AgentId::Claude.index(), 3);
+    }
+
+    #[test]
+    fn claude_parses_and_outranks_zcode_and_hermes_on_the_second_half() {
+        assert_eq!(AgentId::parse("claude"), Ok(AgentId::Claude));
+        assert_eq!(AgentId::Claude.as_str(), "claude");
+        let mut set = ActiveSet::new();
+        set.insert(AgentId::Hermes);
+        set.insert(AgentId::ZCode);
+        set.insert(AgentId::Claude);
+        assert_eq!(
+            set.iter(),
+            vec![AgentId::Claude, AgentId::ZCode, AgentId::Hermes]
+        );
+        let partition = Partition::compute(set);
+        assert_eq!(partition.slots_for(AgentId::Claude), vec![3, 4, 5]);
+        assert!(partition.slots_for(AgentId::ZCode).is_empty());
+        assert!(partition.slots_for(AgentId::Hermes).is_empty());
+        assert!(partition.slots_for(AgentId::Codex).is_empty());
+
+        let mut routing = EventRouting::new();
+        routing.route_button(4, true, 1, &partition);
+        assert_eq!(routing.queue(AgentId::Claude).len(), 1);
+        assert!(routing.queue(AgentId::ZCode).is_empty());
     }
 
     #[test]

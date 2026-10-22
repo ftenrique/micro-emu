@@ -47,13 +47,13 @@ impl UsageAgent {
         }
     }
 
-    /// Maps a routing agent to its usage counterpart. Hermes reports no
-    /// usage limits, so it has none.
+    /// Maps a routing agent to its usage counterpart. Hermes and Claude
+    /// report no usage limits to the bridge, so they have none.
     pub(crate) fn from_agent(agent: crate::routing::AgentId) -> Option<Self> {
         match agent {
             crate::routing::AgentId::Codex => Some(Self::Codex),
             crate::routing::AgentId::ZCode => Some(Self::ZCode),
-            crate::routing::AgentId::Hermes => None,
+            crate::routing::AgentId::Hermes | crate::routing::AgentId::Claude => None,
         }
     }
 }

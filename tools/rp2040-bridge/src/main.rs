@@ -1,4 +1,6 @@
 mod ajazz;
+mod claude_state;
+mod claude_window;
 mod codex;
 mod codex_state;
 mod codex_window;
@@ -154,7 +156,7 @@ fn parse_options() -> Result<Options, String> {
             "--agent" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "--agent requires codex, zcode, or hermes".to_owned())?;
+                    .ok_or_else(|| "--agent requires codex, claude, zcode, or hermes".to_owned())?;
                 agent = Some(crate::routing::AgentId::parse(&value)?);
             }
             "--connect" => {
@@ -171,7 +173,7 @@ fn parse_options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "rp2040-bridge --port COMx|auto|none [--device KIND[,serial=SERIAL][,task-slots=N]]... [--controller ajazz|streamdeck-plus|streamdeck-plus-xl|streamdeck-xl|none] [--controller-serial SERIAL] [--no-ajazz] [--listen 0..3600] [--emit AG00] [--emit-after 0..3600] [--mcp|--legacy|--daemon [--bind 127.0.0.1:48360] | --mcp-proxy --agent codex|zcode|hermes [--connect 127.0.0.1:48360] [--autostart] [--daemon-args \"...\"]]"
+                    "rp2040-bridge --port COMx|auto|none [--device KIND[,serial=SERIAL][,task-slots=N]]... [--controller ajazz|streamdeck-plus|streamdeck-plus-xl|streamdeck-xl|none] [--controller-serial SERIAL] [--no-ajazz] [--listen 0..3600] [--emit AG00] [--emit-after 0..3600] [--mcp|--legacy|--daemon [--bind 127.0.0.1:48360] | --mcp-proxy --agent codex|claude|zcode|hermes [--connect 127.0.0.1:48360] [--autostart] [--daemon-args \"...\"]]"
                 );
                 std::process::exit(0);
             }
@@ -215,7 +217,7 @@ fn parse_options() -> Result<Options, String> {
         .unwrap_or(ControllerKind::None);
     let controller_serial = device_specs.first().and_then(|spec| spec.serial.clone());
     if mcp_proxy && agent.is_none() {
-        return Err("--mcp-proxy requires --agent codex|zcode|hermes".to_owned());
+        return Err("--mcp-proxy requires --agent codex|claude|zcode|hermes".to_owned());
     }
     if let Some(key) = &emit_key {
         messages_for_synthetic_key(key)?;
@@ -1233,6 +1235,11 @@ pub(crate) fn bridge_status(bridge: &BridgeRuntime, mode: &str) -> Value {
                 "events": bridge.routing.queue(crate::routing::AgentId::Hermes).len(),
                 "keys": bridge.partition.keys_for(crate::routing::AgentId::Hermes),
                 "slots": bridge.partition.slots_for(crate::routing::AgentId::Hermes)
+            },
+            "claude": {
+                "events": bridge.routing.queue(crate::routing::AgentId::Claude).len(),
+                "keys": bridge.partition.keys_for(crate::routing::AgentId::Claude),
+                "slots": bridge.partition.slots_for(crate::routing::AgentId::Claude)
             }
         },
         "partition": {
@@ -1506,6 +1513,64 @@ fn route_task_toggle(
                 }
             }
         },
+        crate::routing::AgentId::Claude => match crate::claude_window::is_foreground() {
+            Ok(true) => {
+                if let Err(error) = crate::claude_window::minimize() {
+                    eprintln!("Claude window minimize failed: {error}");
+                }
+            }
+            Ok(false) | Err(_) => {
+                // Select the card on the board (a connected proxy receives
+                // the event), then raise the Claude desktop window.
+                route_task_button(
+                    bridge,
+                    device_id,
+                    slot_count,
+                    index,
+                    true,
+                    Some(&task.task_id),
+                    now_ms,
+                );
+                route_task_button(
+                    bridge,
+                    device_id,
+                    slot_count,
+                    index,
+                    false,
+                    Some(&task.task_id),
+                    now_ms,
+                );
+                if let Err(error) = crate::claude_window::show_and_focus() {
+                    eprintln!("Claude window focus failed: {error}");
+                }
+            }
+        },
+    }
+    true
+}
+
+/// ZCode, Hermes and Claude Desktop have no push-to-talk of their own. While
+/// one of their windows is the foreground app (or owns an open dictation
+/// session) the mic key drives Windows dictation into it instead of
+/// ChatGPT/Codex. Returns whether the press/release was handled here.
+fn route_desktop_dictation(pressed: bool) -> bool {
+    let result = if crate::zcode_window::microphone_active()
+        || crate::zcode_window::is_foreground().unwrap_or(false)
+    {
+        crate::zcode_window::set_microphone(pressed)
+    } else if crate::hermes_window::microphone_active()
+        || crate::hermes_window::is_foreground().unwrap_or(false)
+    {
+        crate::hermes_window::set_microphone(pressed)
+    } else if crate::claude_window::microphone_active()
+        || crate::claude_window::is_foreground().unwrap_or(false)
+    {
+        crate::claude_window::set_microphone(pressed)
+    } else {
+        return false;
+    };
+    if let Err(error) = result {
+        eprintln!("dictation shortcut failed: {error}");
     }
     true
 }
@@ -1520,7 +1585,8 @@ fn catalog_target_session(
         Some(session)
             if session != 0
                 && session != crate::daemon::ZCODE_POLL_SESSION
-                && session != crate::daemon::HERMES_POLL_SESSION =>
+                && session != crate::daemon::HERMES_POLL_SESSION
+                && session != crate::daemon::CLAUDE_POLL_SESSION =>
         {
             session
         }
@@ -1717,23 +1783,7 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
                 if let crate::codex::PhysicalEvent::EncoderButton { index: 2, pressed } =
                     event.clone()
                 {
-                    // ZCode and Hermes have no microphone of their own:
-                    // while their window is the foreground app (or owns an
-                    // open dictation session) the mic key drives Windows
-                    // dictation into them instead of ChatGPT/Codex.
-                    let zcode_mic = crate::zcode_window::microphone_active()
-                        || crate::zcode_window::is_foreground().unwrap_or(false);
-                    let hermes_mic = crate::hermes_window::microphone_active()
-                        || crate::hermes_window::is_foreground().unwrap_or(false);
-                    if zcode_mic || hermes_mic {
-                        let result = if zcode_mic {
-                            crate::zcode_window::set_microphone(pressed)
-                        } else {
-                            crate::hermes_window::set_microphone(pressed)
-                        };
-                        if let Err(error) = result {
-                            eprintln!("dictation shortcut failed: {error}");
-                        }
+                    if route_desktop_dictation(pressed) {
                         continue;
                     }
                     // The native ACT10 path needs the RP2040 vendor HID
@@ -1903,19 +1953,7 @@ fn route_task_device_events(
         .unwrap_or(0);
     for event in events {
         if let crate::codex::PhysicalEvent::EncoderButton { index: 2, pressed } = event.clone() {
-            let zcode_mic = crate::zcode_window::microphone_active()
-                || crate::zcode_window::is_foreground().unwrap_or(false);
-            let hermes_mic = crate::hermes_window::microphone_active()
-                || crate::hermes_window::is_foreground().unwrap_or(false);
-            if zcode_mic || hermes_mic {
-                let result = if zcode_mic {
-                    crate::zcode_window::set_microphone(pressed)
-                } else {
-                    crate::hermes_window::set_microphone(pressed)
-                };
-                if let Err(error) = result {
-                    eprintln!("dictation shortcut failed: {error}");
-                }
+            if route_desktop_dictation(pressed) {
                 continue;
             }
             if !bridge.has_serial() {

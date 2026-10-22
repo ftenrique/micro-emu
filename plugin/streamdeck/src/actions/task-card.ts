@@ -14,7 +14,7 @@ export interface TaskCardSettings {
     /** Task-board slot index (0-based). */
     slot?: number | string;
     /** Fixed owner for this card, or auto for daemon-managed allocation. */
-    agent?: "auto" | "codex" | "zcode" | "hermes";
+    agent?: "auto" | "codex" | "claude" | "zcode" | "hermes";
 }
 
 type TaskCardInstance = KeyAction<TaskCardSettings> | DialAction<TaskCardSettings>;
@@ -59,7 +59,8 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
 
     private syncAgent(settings: TaskCardSettings): void {
         const slot = Number(settings.slot ?? 0);
-        const agent = settings.agent === "codex" || settings.agent === "zcode" || settings.agent === "hermes"
+        const agent = settings.agent === "codex" || settings.agent === "claude"
+            || settings.agent === "zcode" || settings.agent === "hermes"
             ? settings.agent : "auto";
         if (Number.isInteger(slot) && slot >= 0 && slot < TASK_SLOT_COUNT) {
             this.ctx.daemon.setTaskSlotAgent(slot, agent);

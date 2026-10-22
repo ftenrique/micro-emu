@@ -2,6 +2,7 @@ import { AgentUsageFields, DaemonClient, DisplayContext } from "./daemon-client"
 import { CodexActionExecutor } from "./codex-action-executor";
 import { ZCodeActionExecutor } from "./zcode-action-executor";
 import { HermesActionExecutor } from "./hermes-action-executor";
+import { ClaudeActionExecutor } from "./claude-action-executor";
 
 /** Display context enriched with the selected task physical number. */
 export interface SelectedDisplayContext extends DisplayContext {
@@ -18,6 +19,7 @@ export class PluginContext {
     readonly codex: CodexActionExecutor;
     readonly zcode: ZCodeActionExecutor;
     readonly hermes: HermesActionExecutor;
+    readonly claude: ClaudeActionExecutor;
     private threadStatus: unknown[] = [];
     private taskCards: unknown[] = [];
     private displayContext: DisplayContext | null = null;
@@ -34,11 +36,13 @@ export class PluginContext {
         codex = new CodexActionExecutor(),
         zcode = new ZCodeActionExecutor(),
         hermes = new HermesActionExecutor(),
+        claude = new ClaudeActionExecutor(),
     ) {
         this.daemon = daemon;
         this.codex = codex;
         this.zcode = zcode;
         this.hermes = hermes;
+        this.claude = claude;
 
         daemon.on("connect", () => {
             this.connected = true;
@@ -187,13 +191,18 @@ export class PluginContext {
         }
         const owner = selectedTask?.agent
             ?? (taskId?.startsWith("zcode:") ? "zcode"
-                : taskId?.startsWith("hermes:") ? "hermes" : undefined);
+                : taskId?.startsWith("hermes:") ? "hermes"
+                : taskId?.startsWith("claude:") ? "claude" : undefined);
         if (owner === "zcode") {
             await this.zcode.execute(actionId, { selectedTask, taskId });
             return;
         }
         if (owner === "hermes") {
             await this.hermes.execute(actionId, { selectedTask, taskId });
+            return;
+        }
+        if (owner === "claude") {
+            await this.claude.execute(actionId, { selectedTask, taskId });
             return;
         }
         if (owner && owner !== "codex") {

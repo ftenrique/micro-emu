@@ -106,6 +106,7 @@ impl PluginController {
                             "codex" => Some(AgentId::Codex),
                             "zcode" => Some(AgentId::ZCode),
                             "hermes" => Some(AgentId::Hermes),
+                            "claude" => Some(AgentId::Claude),
                             _ => None,
                         }) else {
                             continue;

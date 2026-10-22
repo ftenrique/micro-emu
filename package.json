@@ -34,6 +34,7 @@
     "bridge:proxy:codex": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline -- --mcp-proxy --agent codex --autostart",
     "bridge:proxy:zcode": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline -- --mcp-proxy --agent zcode --autostart",
     "bridge:proxy:hermes": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline -- --mcp-proxy --agent hermes --autostart",
+    "bridge:proxy:claude": "cargo run --quiet --manifest-path tools/rp2040-bridge/Cargo.toml --release --offline -- --mcp-proxy --agent claude --autostart",
     "plugin:install": "npm --prefix plugin/streamdeck install",
     "plugin:build": "npm --prefix plugin/streamdeck run build",
     "plugin:watch": "npm --prefix plugin/streamdeck run watch",

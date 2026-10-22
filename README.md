@@ -8,7 +8,7 @@ The project is aimed at a Windows workstation running Codex/ChatGPT. Its local b
 
 - **Stream Deck plugin** â€” use Codex Micro controls alongside normal Stream Deck profiles and plugins. The official Stream Deck app keeps ownership of the device while the plugin talks to the local bridge daemon over loopback.
 - **AJAZZ AKP03E emulator** â€” maps the AKP03E's six LCD keys, lower keys, and three encoders to Codex Micro events. An RP2040 Zero presents the required USB HID device to Windows/ChatGPT and connects to the bridge over USB CDC.
-- **Local bridge and MCP server** â€” exposes status, controller input, task cards, and display context to Codex. Daemon mode can coordinate Codex, ZCode, and Hermes simultaneously.
+- **Local bridge and MCP server** â€” exposes status, controller input, task cards, and display context to Codex. Daemon mode can coordinate Codex, Claude, ZCode, and Hermes simultaneously.
 
 ```text
 Stream Deck plugin -- TCP loopback --+
@@ -116,7 +116,7 @@ The proxy starts or attaches to the loopback-only daemon. Key tools include `bri
 
 ## Multi-controller task board
 
-The daemon combines task slots across active controllers and assigns published tasks using stable IDs. An AKP03E supplies six physical slots; direct-HID Stream Deck + and XL controllers expose eight logical task slots by default (nine when driven through the Stream Deck plugin), with any hardware-only tail remaining disabled. It also supports fixed-half key and LCD-slot partitioning for Codex, ZCode, and Hermes sessions.
+The daemon combines task slots across active controllers and assigns published tasks using stable IDs. An AKP03E supplies six physical slots; direct-HID Stream Deck + and XL controllers expose eight logical task slots by default (nine when driven through the Stream Deck plugin), with any hardware-only tail remaining disabled. It also supports fixed-half key and LCD-slot partitioning for Codex, Claude, ZCode, and Hermes sessions.
 
 See [the multi-agent guide](docs/multi-agent-coexistence.md) for the session and partitioning model.
 
@@ -137,6 +137,7 @@ npm run plugin:watch
 - [Verified AJAZZ hardware profile](docs/hardware-profile.md)
 - [ZCode integration](docs/ZCode_integration.md)
 - [Hermes integration](docs/Hermes_integration.md)
+- [Claude integration](docs/Claude_integration.md)
 
 ## License
 

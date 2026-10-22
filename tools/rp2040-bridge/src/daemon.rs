@@ -1,5 +1,5 @@
 //! Daemon mode: TCP loopback server that multiplexes multiple MCP sessions
-//! (Codex, ZCode, and Hermes) over a single hardware-owning bridge process.
+//! (Codex, Claude, ZCode, and Hermes) over a single hardware-owning bridge process.
 //!
 //! See `run_daemon` for the entry point invoked from `main.rs` when the
 //! `--daemon` flag is set.
@@ -50,6 +50,13 @@ const HERMES_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// app runs, Hermes keeps its deck half and auto-fed cards even without a
 /// live MCP proxy, mirroring the ZCode probe.
 const HERMES_DESKTOP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+/// Claude Code's session registry is a handful of small JSON files; a
+/// one-second poll keeps busy/idle transitions responsive.
+const CLAUDE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the daemon probes for the Claude desktop app's window. While the
+/// app runs, Claude keeps its deck half and auto-fed cards even without a
+/// live MCP proxy, mirroring the ZCode and Hermes probes.
+const CLAUDE_DESKTOP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// Codex desktop state is local and cheap to poll. A 250 ms interval keeps
 /// focus and lifecycle responsive without reading SQLite in the 10 ms loop.
 const CODEX_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -61,6 +68,8 @@ const CODEX_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub const ZCODE_POLL_SESSION: usize = 999;
 /// Synthetic owner for cards mirrored from Hermes' read-only state database.
 pub const HERMES_POLL_SESSION: usize = 998;
+/// Synthetic owner for cards mirrored from Claude Code's session registry.
+pub const CLAUDE_POLL_SESSION: usize = 997;
 
 // Catalog actions without a concrete owning MCP session are routed to the
 // newest live session for their intended agent. These sentinels cannot collide
@@ -68,12 +77,14 @@ pub const HERMES_POLL_SESSION: usize = 998;
 const CODEX_CATALOG_SESSION: usize = usize::MAX;
 const ZCODE_CATALOG_SESSION: usize = usize::MAX - 1;
 const HERMES_CATALOG_SESSION: usize = usize::MAX - 2;
+const CLAUDE_CATALOG_SESSION: usize = usize::MAX - 3;
 
 pub(crate) fn catalog_action_session(agent: AgentId) -> usize {
     match agent {
         AgentId::Codex => CODEX_CATALOG_SESSION,
         AgentId::ZCode => ZCODE_CATALOG_SESSION,
         AgentId::Hermes => HERMES_CATALOG_SESSION,
+        AgentId::Claude => CLAUDE_CATALOG_SESSION,
     }
 }
 
@@ -82,6 +93,7 @@ fn catalog_action_agent(session_id: usize) -> Option<AgentId> {
         CODEX_CATALOG_SESSION => Some(AgentId::Codex),
         ZCODE_CATALOG_SESSION => Some(AgentId::ZCode),
         HERMES_CATALOG_SESSION => Some(AgentId::Hermes),
+        CLAUDE_CATALOG_SESSION => Some(AgentId::Claude),
         _ => None,
     }
 }
@@ -174,14 +186,15 @@ fn retry_serial_connection(
 
 /// Computes the effective active set: agents with live MCP sessions, plus
 /// Codex if the RP2040 serial link is up (ChatGPT drives Codex over HID
-/// without an MCP session), plus ZCode and Hermes while their desktop apps
-/// are running (the task feeds mirror the apps' databases directly and must
+/// without an MCP session), plus ZCode, Hermes and Claude while their desktop
+/// apps are running (the task feeds mirror the apps' databases directly and must
 /// survive MCP proxy blips and daemon restarts).
 fn effective_active_set(
     session_agents: ActiveSet,
     codex_hardware_active: bool,
     zcode_desktop_active: bool,
     hermes_desktop_active: bool,
+    claude_desktop_active: bool,
 ) -> ActiveSet {
     let mut set = session_agents;
     if codex_hardware_active {
@@ -192,6 +205,9 @@ fn effective_active_set(
     }
     if hermes_desktop_active {
         set.insert(AgentId::Hermes);
+    }
+    if claude_desktop_active {
+        set.insert(AgentId::Claude);
     }
     set
 }
@@ -209,7 +225,8 @@ fn task_slot_owners(
     let codex = active.contains(AgentId::Codex);
     let zcode = active.contains(AgentId::ZCode);
     let hermes = active.contains(AgentId::Hermes);
-    if codex && zcode && hermes {
+    let claude = active.contains(AgentId::Claude);
+    if codex && zcode && hermes && !claude {
         for slot in [0, 1] {
             if slot < slot_count {
                 owners[slot] = Some(AgentId::Codex);
@@ -226,7 +243,7 @@ fn task_slot_owners(
             }
         }
     } else {
-        let active_agents = [AgentId::Codex, AgentId::ZCode, AgentId::Hermes]
+        let active_agents = crate::routing::AGENTS
             .into_iter()
             .filter(|agent| active.contains(*agent))
             .collect::<Vec<_>>();
@@ -358,6 +375,13 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         crate::diaglog::log("hermes desktop app detected at daemon start");
     }
     let mut next_hermes_desktop_probe_at = Instant::now() + HERMES_DESKTOP_PROBE_INTERVAL;
+    // Same liveness probe for the Claude desktop app: its auto-feed mirrors
+    // Claude Code's session registry and must survive MCP proxy blips.
+    let mut claude_desktop_active = crate::claude_window::desktop_running();
+    if claude_desktop_active {
+        crate::diaglog::log("claude desktop app detected at daemon start");
+    }
+    let mut next_claude_desktop_probe_at = Instant::now() + CLAUDE_DESKTOP_PROBE_INTERVAL;
     let mut pending_repartition_at: Option<Instant> = None;
     let mut next_usage_refresh_at: Option<Instant> = None;
     {
@@ -366,6 +390,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             codex_hardware_active,
             zcode_desktop_active,
             hermes_desktop_active,
+            claude_desktop_active,
         );
         bridge.partition = Partition::compute(active);
         bridge.task_board.set_slot_owners(
@@ -404,6 +429,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     // cards, mirroring how Codex activity arrives via `v.oai.thstatus`.
     let mut next_zcode_poll_at: Option<Instant> = None;
     let mut next_hermes_poll_at: Option<Instant> = None;
+    let mut next_claude_poll_at: Option<Instant> = None;
 
     // Acceptor thread.
     let accept_tx = session_tx.clone();
@@ -782,6 +808,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             codex_hardware_active,
             zcode_desktop_active,
             hermes_desktop_active,
+            claude_desktop_active,
         );
         let owners = task_slot_owners(
             bridge.task_slot_count,
@@ -821,10 +848,14 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                         session.events.push_back(event.clone());
                     }
                 }
-            } else if session_id == HERMES_POLL_SESSION {
+            } else if let Some(feed_agent) = match session_id {
+                HERMES_POLL_SESSION => Some(AgentId::Hermes),
+                CLAUDE_POLL_SESSION => Some(AgentId::Claude),
+                _ => None,
+            } {
                 let targets: Vec<usize> = sessions
                     .iter()
-                    .filter(|session| session.agent == Some(AgentId::Hermes))
+                    .filter(|session| session.agent == Some(feed_agent))
                     .map(|session| session.id)
                     .collect();
                 for id in targets {
@@ -909,6 +940,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                         codex_hardware_active,
                         zcode_desktop_active,
                         hermes_desktop_active,
+                        claude_desktop_active,
                     );
                     let zcode_slots = task_slots_for_agent(
                         bridge.task_slot_count,
@@ -980,6 +1012,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     codex_hardware_active,
                     zcode_desktop_active,
                     hermes_desktop_active,
+                    claude_desktop_active,
                 );
                 let hermes_slots = task_slots_for_agent(
                     bridge.task_slot_count,
@@ -1007,6 +1040,75 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                             eprintln!("hermes poll publish failed: {error}");
                             crate::diaglog::log(&format!(
                                 "hermes auto-feed publish failed: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Mirror Claude Code's live session registry while a Claude proxy is
+        // connected or the desktop app is running, with the same gating as
+        // ZCode and Hermes. An explicit Claude publication is authoritative
+        // and suppresses this synthetic owner.
+        let claude_proxy_active = sessions
+            .iter()
+            .any(|session| session.agent == Some(AgentId::Claude));
+        let claude_active = claude_proxy_active || claude_desktop_active;
+        let claude_has_manual_tasks = bridge
+            .task_board
+            .has_agent_tasks_except(AgentId::Claude, CLAUDE_POLL_SESSION);
+        if !claude_active || claude_has_manual_tasks {
+            if bridge.task_board.has_session_tasks(CLAUDE_POLL_SESSION) {
+                bridge.task_board.clear_session(CLAUDE_POLL_SESSION);
+                crate::diaglog::log(&format!(
+                    "claude auto-feed cleared (proxy={}, desktop={}, manual={})",
+                    claude_proxy_active, claude_desktop_active, claude_has_manual_tasks
+                ));
+                let _ = crate::refresh_task_board(&mut bridge);
+            }
+            next_claude_poll_at = None;
+        } else {
+            if next_claude_poll_at.is_none() {
+                next_claude_poll_at = Some(now);
+                crate::diaglog::log(&format!(
+                    "claude auto-feed active (proxy={}, desktop={})",
+                    claude_proxy_active, claude_desktop_active
+                ));
+            }
+            if next_claude_poll_at.is_some_and(|poll_at| now >= poll_at) {
+                next_claude_poll_at = Some(now + CLAUDE_POLL_INTERVAL);
+                let active = effective_active_set(
+                    session_agents,
+                    codex_hardware_active,
+                    zcode_desktop_active,
+                    hermes_desktop_active,
+                    claude_desktop_active,
+                );
+                let claude_slots = task_slots_for_agent(
+                    bridge.task_slot_count,
+                    active,
+                    bridge
+                        .controller
+                        .as_ref()
+                        .and_then(|controller| controller.task_slot_agent_overrides()),
+                    AgentId::Claude,
+                );
+                if let Some(snapshot) = crate::claude_state::read_claude_snapshot(claude_slots) {
+                    match bridge.task_board.publish_tasks(
+                        CLAUDE_POLL_SESSION,
+                        AgentId::Claude,
+                        &snapshot,
+                        now_ms(),
+                    ) {
+                        Ok(_) => {
+                            bridge.has_explicit_task_state = true;
+                            let _ = crate::refresh_task_board(&mut bridge);
+                        }
+                        Err(error) => {
+                            eprintln!("claude poll publish failed: {error}");
+                            crate::diaglog::log(&format!(
+                                "claude auto-feed publish failed: {error}"
                             ));
                         }
                     }
@@ -1062,6 +1164,26 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             }
         }
 
+        // The Claude desktop app gets the same liveness treatment: its
+        // auto-feed mirrors Claude Code's registry, so cards survive proxy
+        // blips while the app stays open.
+        if now >= next_claude_desktop_probe_at {
+            next_claude_desktop_probe_at = now + CLAUDE_DESKTOP_PROBE_INTERVAL;
+            let running = crate::claude_window::desktop_running();
+            if running != claude_desktop_active {
+                claude_desktop_active = running;
+                crate::diaglog::log(&format!(
+                    "claude desktop app {}",
+                    if running {
+                        "detected"
+                    } else {
+                        "no longer running"
+                    }
+                ));
+                pending_repartition_at = Some(now + REPARTITION_DEBOUNCE);
+            }
+        }
+
         // Apply a debounced repartition if the active set has changed.
         if let Some(repartition_at) = pending_repartition_at {
             if now >= repartition_at {
@@ -1071,6 +1193,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     codex_hardware_active,
                     zcode_desktop_active,
                     hermes_desktop_active,
+                    claude_desktop_active,
                 );
                 let new_partition = Partition::compute(active);
                 eprintln!(
@@ -1703,6 +1826,7 @@ fn call_tool_for(
             let auto_feed_session = match agent_id {
                 AgentId::ZCode => Some(ZCODE_POLL_SESSION),
                 AgentId::Hermes => Some(HERMES_POLL_SESSION),
+                AgentId::Claude => Some(CLAUDE_POLL_SESSION),
                 AgentId::Codex => None,
             };
             if let Some(poll_session) = auto_feed_session.filter(|&s| s != session_id) {
@@ -1967,7 +2091,7 @@ mod tests {
         sessions.insert(AgentId::ZCode);
         sessions.insert(AgentId::Hermes);
 
-        let active = effective_active_set(sessions, false, false, false);
+        let active = effective_active_set(sessions, false, false, false, false);
         assert!(!active.contains(AgentId::Codex));
         assert_eq!(
             Partition::compute(active).owners_json(),
@@ -1983,7 +2107,7 @@ mod tests {
     }
     #[test]
     fn hermes_desktop_probe_claims_the_shared_half_without_zcode() {
-        let active = effective_active_set(ActiveSet::new(), false, false, true);
+        let active = effective_active_set(ActiveSet::new(), false, false, true, false);
         assert!(active.contains(AgentId::Hermes));
         assert_eq!(
             Partition::compute(active).owners_json(),
@@ -1999,7 +2123,7 @@ mod tests {
         // ZCode keeps priority on the shared half when both desktops run.
         let mut sessions = ActiveSet::new();
         sessions.insert(AgentId::ZCode);
-        let active = effective_active_set(sessions, false, false, true);
+        let active = effective_active_set(sessions, false, false, true, false);
         assert_eq!(
             Partition::compute(active).owners_json(),
             vec![
@@ -2011,6 +2135,38 @@ mod tests {
                 json!("zcode")
             ]
         );
+    }
+
+    #[test]
+    fn claude_desktop_probe_takes_priority_on_the_shared_half() {
+        let active = effective_active_set(ActiveSet::new(), false, false, false, true);
+        assert!(active.contains(AgentId::Claude));
+        assert_eq!(
+            Partition::compute(active).slots_for(AgentId::Claude),
+            vec![3, 4, 5]
+        );
+        // Claude outranks ZCode and Hermes; Codex keeps its own half.
+        let mut sessions = ActiveSet::new();
+        sessions.insert(AgentId::ZCode);
+        let active = effective_active_set(sessions, true, true, true, true);
+        assert_eq!(
+            Partition::compute(active).owners_json(),
+            vec![
+                json!("codex"),
+                json!("codex"),
+                json!("codex"),
+                json!("claude"),
+                json!("claude"),
+                json!("claude")
+            ]
+        );
+        // With four agents the 8-slot task layout shares slots in priority order.
+        let owners = task_slot_owners(8, active, None);
+        assert_eq!(owners[0], Some(AgentId::Codex));
+        assert_eq!(owners[2], Some(AgentId::Claude));
+        assert_eq!(owners[7], Some(AgentId::Hermes));
+        assert_eq!(task_slots_for_agent(8, active, None, AgentId::Claude), 2);
+        assert_eq!(catalog_action_agent(catalog_action_session(AgentId::Claude)), Some(AgentId::Claude));
     }
 
     #[test]
