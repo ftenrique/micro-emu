@@ -212,6 +212,30 @@ mod native {
         }
     }
 
+    /// Switches the Claude desktop app to the session behind a `claude:<id>`
+    /// card. The app's `claude://code/continue?session=local_<id>` deep link
+    /// focuses that desktop session and raises the window. Only desktop host
+    /// ids (`local_...`) are addressable this way; CLI-only sessions are not.
+    pub fn request_session_selection(task_id: &str) {
+        let Some(session) = super::desktop_session_id(task_id) else {
+            return;
+        };
+        let url = format!("claude://code/continue?session={session}");
+        // `start` returns once the protocol handler is launched; spawning keeps
+        // the daemon loop from waiting on it.
+        if let Err(error) = Command::new("cmd.exe")
+            .args(["/C", "start", "", &url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            eprintln!("Claude session selection failed: {error}");
+            crate::diaglog::log(&format!("claude session selection failed: {error}"));
+        }
+    }
+
     pub fn minimize() -> Result<(), String> {
         let target = find_claude_window()?;
         unsafe {
@@ -373,8 +397,40 @@ mod native {
 
 #[cfg(windows)]
 pub use native::{
-    desktop_running, is_foreground, microphone_active, minimize, set_microphone, show_and_focus,
+    desktop_running, is_foreground, microphone_active, minimize, request_session_selection,
+    set_microphone, show_and_focus,
 };
+
+/// Extracts the desktop host session id from a `claude:<id>` task id. The app
+/// accepts only `local_` followed by 1-64 ASCII letters, digits or dashes, so
+/// anything else (CLI session ids, injected URL text) is rejected here.
+fn desktop_session_id(task_id: &str) -> Option<&str> {
+    let id = task_id.trim().strip_prefix("claude:")?;
+    let suffix = id.strip_prefix("local_")?;
+    (!suffix.is_empty()
+        && suffix.len() <= 64
+        && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+    .then_some(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::desktop_session_id;
+
+    #[test]
+    fn only_desktop_host_ids_are_selectable() {
+        assert_eq!(
+            desktop_session_id("claude:local_7c456048-7009-4e8b-8e18-815b5aceec7d"),
+            Some("local_7c456048-7009-4e8b-8e18-815b5aceec7d")
+        );
+        assert_eq!(desktop_session_id("claude:86f78787-9abb-4ee5"), None);
+        assert_eq!(desktop_session_id("claude:local_"), None);
+        assert_eq!(desktop_session_id("claude:local_a&calc"), None);
+        assert_eq!(desktop_session_id("claude:local_a b"), None);
+        assert_eq!(desktop_session_id(&format!("claude:local_{}", "a".repeat(65))), None);
+        assert_eq!(desktop_session_id("hermes:local_abc"), None);
+    }
+}
 
 #[cfg(not(windows))]
 pub fn is_foreground() -> Result<bool, String> {
@@ -388,6 +444,8 @@ pub fn minimize() -> Result<(), String> {
 pub fn show_and_focus() -> Result<(), String> {
     Err("Claude window control is only available on Windows".to_owned())
 }
+#[cfg(not(windows))]
+pub fn request_session_selection(_task_id: &str) {}
 #[cfg(not(windows))]
 pub fn microphone_active() -> bool {
     false

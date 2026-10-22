@@ -83,7 +83,11 @@ source checkout.
 ## Deck behaviour (Windows)
 
 - **Short press** on a Claude card selects it on the board (and delivers a
-  `task_selected` event to a connected Claude proxy).
+  `task_selected` event to a connected Claude proxy) and switches Claude
+  Desktop to that session through the app's own deep link,
+  `claude://code/continue?session=local_<id>`, which also raises the window.
+  Only sessions hosted by the desktop app (`local_…` ids) can be opened this
+  way; a card for a session started from a terminal selects on the board only.
 - **Long press** raises the Claude desktop window, or minimizes it when it is
   already in the foreground. If Windows refuses the foreground switch, the
   bridge opens `claude://`, which hands the request to the running app.
@@ -97,8 +101,6 @@ source checkout.
 
 ## Not supported yet
 
-- Switching the desktop app to the pressed session (ZCode and Hermes do this
-  through UI Automation or a deep link). Claude cards select on the board only.
 - The **New task** key with Claude focused still falls back to the Codex
   new-task screen.
 - Claude usage limits (5-hour / weekly) on the Context key: the desktop app

@@ -1327,6 +1327,13 @@ fn route_task_button(
         {
             crate::hermes_window::request_session_selection(&task.task_id, &task.title);
         }
+        // Auto-fed Claude cards switch Claude Desktop to the pressed session
+        // through the app's own `claude://code/continue` deep link.
+        if task.owner_agent == crate::routing::AgentId::Claude
+            && task.owner_session == crate::daemon::CLAUDE_POLL_SESSION
+        {
+            crate::claude_window::request_session_selection(&task.task_id);
+        }
     }
 
     if let Some(legacy_key) = task.legacy_key.as_deref() {
