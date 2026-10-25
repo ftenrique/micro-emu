@@ -153,8 +153,11 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value 
     } else {
         derive_state(latest, tail.as_ref(), row.time_updated, now_ms)
     };
-    let started_at_ms = latest.map(|usage| usage.started_at);
-    let finished_at_ms = latest.and_then(|usage| usage.completed_at);
+    let message_timing = turn_timestamps(connection, &row.id);
+    let started_at_ms = message_timing.map(|(start, _)| start)
+        .or_else(|| tail.is_none().then(|| latest.map(|usage| usage.started_at)).flatten());
+    let finished_at_ms = message_timing.and_then(|(_, end)| end)
+        .or_else(|| tail.is_none().then(|| latest.and_then(|usage| usage.completed_at)).flatten());
     let model = selection
         .as_ref()
         .and_then(|s| s.model.clone())
@@ -190,13 +193,30 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value 
         "priority": priority,
         // A running turn without a finished request yet has no request start
         // timestamp; the session's last update is the closest stable anchor.
-        "started_at_ms": (state != "queued").then_some(started_at_ms.or(Some(row.time_updated))),
-        "finished_at_ms": (state == "completed").then_some(
-            finished_at_ms.unwrap_or_else(|| started_at_ms.unwrap_or(0).max(row.time_updated))
-        ),
+        "started_at_ms": (state != "queued").then_some(started_at_ms),
+        "finished_at_ms": (state == "completed").then_some(finished_at_ms),
         "timing_authoritative": true,
         "context": context,
     })
+}
+
+/// Follow the assistant's parent prompt across every model/tool iteration.
+/// A previous completed model request is never the start of a new turn.
+fn turn_timestamps(connection: &Connection, session_id: &str) -> Option<(i64, Option<i64>)> {
+    let (created, raw): (i64, String) = connection.query_row(
+        "SELECT time_created, data FROM message WHERE session_id = ?1 ORDER BY time_created DESC, sequence DESC LIMIT 1",
+        [session_id], |row| Ok((row.get(0)?, row.get(1)?))).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    if value.get("role")?.as_str()? == "user" { return Some((created, None)); }
+    let parent = value.get("parentID")?.as_str()?;
+    let (start, parent_raw): (i64, String) = connection.query_row(
+        "SELECT time_created, data FROM message WHERE id = ?1 AND session_id = ?2",
+        rusqlite::params![parent, session_id], |row| Ok((row.get(0)?, row.get(1)?))).ok()?;
+    let prompt: Value = serde_json::from_str(&parent_raw).ok()?;
+    if prompt.get("role")?.as_str()? != "user" { return None; }
+    let end = value.get("time").and_then(|time| time.get("completed")).and_then(Value::as_i64)
+        .filter(|end| *end >= start && value.get("finish").and_then(Value::as_str) != Some("tool-calls"));
+    Some((start, end))
 }
 
 /// Returns true only while the newest tool record explicitly says that a
@@ -340,6 +360,9 @@ fn derive_state(
     if turn_in_flight(tail, session_updated_ms, now_ms) {
         return "running";
     }
+    if tail.is_some_and(|tail| tail.role == "user" || tail.streaming || tail.ends_with_tool_calls) {
+        return "paused";
+    }
     match latest {
         // No finished request: the session exists but has not produced a
         // terminal status yet.
@@ -386,6 +409,18 @@ fn project_name(directory: &str) -> String {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn turn_dates_follow_the_prompt_across_model_iterations() {
+        let connection = fixture_db();
+        connection.execute_batch("INSERT INTO message VALUES ('prompt','s',100,100,1,'{\"role\":\"user\"}');
+            INSERT INTO message VALUES ('model1','s',200,300,2,'{\"role\":\"assistant\",\"parentID\":\"prompt\",\"time\":{\"completed\":300},\"finish\":\"tool-calls\"}');").unwrap();
+        assert_eq!(turn_timestamps(&connection,"s"),Some((100,None)));
+        connection.execute_batch("INSERT INTO message VALUES ('model2','s',400,500,3,'{\"role\":\"assistant\",\"parentID\":\"prompt\",\"time\":{\"completed\":500},\"finish\":\"stop\"}');").unwrap();
+        assert_eq!(turn_timestamps(&connection,"s"),Some((100,Some(500))));
+        connection.execute_batch("INSERT INTO message VALUES ('new-prompt','s',700,700,4,'{\"role\":\"user\"}');").unwrap();
+        assert_eq!(turn_timestamps(&connection,"s"),Some((700,None)));
+    }
 
     /// Builds an in-memory database with the ZCode schema subset we query, for
     /// deterministic mapping tests that do not touch the real database.
@@ -754,7 +789,7 @@ mod tests {
         let task = &snapshot["tasks"][0];
         assert_eq!(task["state"], "running");
         assert_eq!(task["priority"], 75);
-        assert_eq!(task["started_at_ms"], 9_000);
+        assert_eq!(task["started_at_ms"], Value::Null);
     }
 
     #[test]
@@ -879,7 +914,7 @@ mod tests {
         let snapshot =
             read_zcode_snapshot_from_connection(&connection, 10_000 + RUNNING_WINDOW_MS + 1, 6)
                 .unwrap();
-        assert_eq!(snapshot["tasks"][0]["state"], "completed");
+        assert_eq!(snapshot["tasks"][0]["state"], "paused");
     }
 
     #[test]
@@ -894,7 +929,7 @@ mod tests {
         let task = &snapshot["tasks"][0];
         assert_eq!(task["task_id"], "zcode:sess_fresh");
         assert_eq!(task["state"], "running");
-        assert_eq!(task["started_at_ms"], 10_000);
+        assert_eq!(task["started_at_ms"], 9_900);
     }
 
     #[test]

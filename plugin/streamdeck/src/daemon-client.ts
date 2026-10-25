@@ -7,8 +7,8 @@ import * as path from "path";
 export const DEFAULT_DAEMON_PORT = 48360;
 export const DEFAULT_DAEMON_HOST = "127.0.0.1";
 const CONNECT_TIMEOUT_MS = 10_000;
-const HEARTBEAT_INTERVAL_MS = 15_000;
-const HEARTBEAT_TIMEOUT_MS = 45_000;
+const HEARTBEAT_INTERVAL_MS = 5_000;
+const HEARTBEAT_TIMEOUT_MS = 15_000;
 const KEEP_ALIVE_INITIAL_DELAY_MS = 10_000;
 
 /** Render state pushed from the daemon to the plugin. */

@@ -86,9 +86,35 @@ pub struct UsageCache {
     zcode: Option<UsageSnapshot>,
     codex_refreshed_at: Option<Instant>,
     zcode_refreshed_at: Option<Instant>,
+    pending: Vec<(UsageAgent, std::sync::mpsc::Receiver<UsageSnapshot>)>,
 }
 
 impl UsageCache {
+    /// Network requests never run on the controller/serial event loop.
+    pub(crate) fn request_refresh(&mut self, agent: UsageAgent) {
+        if self.pending.iter().any(|(pending, _)| *pending == agent)
+            || self.refreshed_within(agent, USAGE_REFRESH_INTERVAL) {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pending.push((agent, rx));
+        std::thread::spawn(move || { let _ = tx.send(fetch_usage(agent)); });
+    }
+
+    pub(crate) fn poll_ready(&mut self) -> bool {
+        let mut changed = false;
+        for (agent, rx) in std::mem::take(&mut self.pending) {
+            match rx.try_recv() {
+                Ok(snapshot) => changed |= self.store(agent, snapshot),
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.pending.push((agent, rx)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    changed |= self.store(agent, UsageSnapshot::default());
+                }
+            }
+        }
+        changed
+    }
+
     pub(crate) fn snapshot(&self, agent: UsageAgent) -> Option<UsageSnapshot> {
         match agent {
             UsageAgent::Codex => self.codex,

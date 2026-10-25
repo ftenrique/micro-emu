@@ -87,18 +87,50 @@ fn read_remote_cache_snapshot_from(cache_dir: &Path, max_tasks: usize) -> Option
             if !metadata.is_file() || metadata.len() > 2 * 1024 * 1024 {
                 return None;
             }
-            Some((metadata.modified().ok()?, entry.path()))
+            Some((metadata.modified().ok()?, entry.path(), metadata.len()))
         })
         .collect::<Vec<_>>();
-    candidates.sort_by_key(|(modified, _)| *modified);
+    candidates.sort_by_key(|(modified, _, _)| *modified);
+    candidates.reverse();
+    candidates.truncate(64);
 
-    for (_, path) in candidates.into_iter().rev().take(64) {
+    // Parsing up to 64 response bodies is expensive and this runs once a
+    // second. The result depends only on these files and `max_tasks`, so
+    // reuse the previous snapshot while neither has changed.
+    type CacheKey = (PathBuf, usize, Vec<(std::time::SystemTime, PathBuf, u64)>);
+    static LAST: std::sync::Mutex<Option<(CacheKey, Option<Value>)>> = std::sync::Mutex::new(None);
+    let key: CacheKey = (cache_dir.to_owned(), max_tasks, candidates.clone());
+    if let Ok(last) = LAST.lock() {
+        if let Some((last_key, snapshot)) = last.as_ref() {
+            if *last_key == key {
+                return snapshot.clone();
+            }
+        }
+    }
+    let snapshot = parse_remote_cache_candidates(candidates, max_tasks);
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some((key, snapshot.clone()));
+    }
+    snapshot
+}
+
+fn parse_remote_cache_candidates(
+    candidates: Vec<(std::time::SystemTime, PathBuf, u64)>,
+    max_tasks: usize,
+) -> Option<Value> {
+    let mut listing = None;
+    let mut details = std::collections::HashMap::new();
+    for (_, path, _) in candidates {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
         let Ok(response) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
+        if let (Some(id), Some(messages)) = (response.get("session_id").and_then(Value::as_str), response.get("messages").and_then(Value::as_array)) {
+            details.entry(id.to_owned()).or_insert_with(|| messages.clone());
+        }
+        if listing.is_some() { continue; }
         // The backend moved the sidebar listing from `recents.sessions` to a
         // top-level `sessions` array. Accept both shapes: otherwise the last
         // cached response in the retired shape (whose sessions are all
@@ -112,24 +144,39 @@ fn read_remote_cache_snapshot_from(cache_dir: &Path, max_tasks: usize) -> Option
         let Some(sessions) = sessions else {
             continue;
         };
-        let mut sessions = sessions.iter().collect::<Vec<_>>();
-        sessions.sort_by(|left, right| {
-            cached_session_active(right)
-                .cmp(&cached_session_active(left))
-                .then_with(|| {
-                    cached_session_activity(right)
-                        .partial_cmp(&cached_session_activity(left))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-        });
-        let tasks = sessions
-            .into_iter()
-            .filter_map(|session| build_cached_task(session))
-            .take(max_tasks)
-            .collect::<Vec<_>>();
-        return Some(json!({"tasks": tasks}));
+        listing = Some(sessions.clone());
     }
-    None
+    let mut sessions = listing?;
+    sessions.sort_by(|left, right| {
+        cached_session_active(right).cmp(&cached_session_active(left))
+            .then_with(|| cached_session_activity(right).partial_cmp(&cached_session_activity(left)).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let tasks = sessions.iter().filter_map(|session| {
+        let mut task = build_cached_task(session)?;
+        if let Some(messages) = session.get("id").and_then(Value::as_str).and_then(|id| details.get(id)) {
+            apply_cached_turn_timing(&mut task, session, messages);
+        }
+        Some(task)
+    }).take(max_tasks).collect::<Vec<_>>();
+    Some(json!({"tasks":tasks}))
+}
+
+/// Only use message dates when the cached transcript covers the listing's
+/// activity. An older transcript may belong to a completely different turn.
+fn apply_cached_turn_timing(task: &mut Value, session: &Value, messages: &[Value]) {
+    let timestamp = |message: &Value| message.get("timestamp").and_then(Value::as_f64).unwrap_or(0.0);
+    let Some(latest) = messages.iter().max_by(|a, b| timestamp(a).total_cmp(&timestamp(b))) else { return };
+    if timestamp(latest) + 0.001 < cached_session_activity(session) { return; }
+    let Some(prompt) = messages.iter().filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .max_by(|a,b| timestamp(a).total_cmp(&timestamp(b))) else { return };
+    let terminal = latest.get("role").and_then(Value::as_str) == Some("assistant")
+        && latest.get("finish_reason").and_then(Value::as_str).is_some_and(|finish| !finish.is_empty() && finish != "tool_calls" && finish != "tool-calls");
+    if cached_session_active(session) && terminal { return; }
+    if timestamp(prompt) <= 0.0 { return; }
+    task["started_at_ms"] = json!(seconds_to_ms(timestamp(prompt)));
+    if task["state"] == "completed" && terminal {
+        task["finished_at_ms"] = json!(seconds_to_ms(timestamp(latest)));
+    }
 }
 
 fn cached_session_active(session: &Value) -> bool {
@@ -255,10 +302,8 @@ fn build_cached_task(session: &Value) -> Option<Value> {
     } else {
         TASK_PRIORITY_IDLE
     };
-    // The cached listing only dates the session, never the current turn, so
-    // any explicit timestamp would render the session's age as the running
-    // timer. Publishing without timestamps makes the task board snapshot its
-    // own first-observed running time and keep it until the turn completes.
+    // Unknown turn dates must remain unknown, including across refresh/restart.
+    // The caller enriches these from a current cached transcript when available.
     Some(json!({
         "task_id": task_id,
         "title": title,
@@ -266,6 +311,9 @@ fn build_cached_task(session: &Value) -> Option<Value> {
         "workspace_path": cwd,
         "model": model,
         "state": state,
+        "timing_authoritative": true,
+        "started_at_ms": null,
+        "finished_at_ms": null,
         "priority": priority,
         "context": {
             "project": project,
@@ -528,6 +576,21 @@ fn model_effort(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_transcript_dates_are_used_only_for_the_current_turn() {
+        let session = json!({"id":"a","last_active":20.0,"is_active":false});
+        let messages = vec![json!({"role":"user","timestamp":10.0}),json!({"role":"assistant","timestamp":20.0,"finish_reason":"stop"})];
+        let mut task = build_cached_task(&session).unwrap();
+        apply_cached_turn_timing(&mut task,&session,&messages);
+        assert_eq!(task["started_at_ms"],10_000);
+        assert_eq!(task["finished_at_ms"],20_000);
+        let newer = json!({"id":"a","last_active":30.0,"is_active":true});
+        let mut task = build_cached_task(&newer).unwrap();
+        apply_cached_turn_timing(&mut task,&newer,&messages);
+        assert!(task["started_at_ms"].is_null());
+        assert!(task["finished_at_ms"].is_null());
+    }
     use std::fs::File;
     use std::time::SystemTime;
 
@@ -612,8 +675,8 @@ mod tests {
         assert_eq!(task["project"], "default");
         // No explicit timing: the board times the turn from its own
         // first observation instead of rendering the session's age.
-        assert!(task.get("started_at_ms").is_none());
-        assert!(task.get("finished_at_ms").is_none());
+        assert!(task["started_at_ms"].is_null());
+        assert!(task["finished_at_ms"].is_null());
     }
 
     #[test]
@@ -673,7 +736,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(task["state"], "completed");
-        assert!(task.get("finished_at_ms").is_none());
+        assert!(task["finished_at_ms"].is_null());
     }
 
     #[test]
@@ -689,7 +752,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(task["state"], "completed");
-        assert!(task.get("finished_at_ms").is_none());
+        assert!(task["finished_at_ms"].is_null());
     }
 
     #[test]
@@ -707,12 +770,8 @@ mod tests {
         assert_eq!(task["state"], "error");
     }
 
-    /// End-to-end check of the timing contract: a remote card picked up
-    /// mid-turn starts its timer when first observed, keeps it across
-    /// republished listings, and finishes with the observed turn length
-    /// instead of the session's age.
     #[test]
-    fn board_times_remote_cards_from_first_observation() {
+    fn board_does_not_invent_dates_for_remote_listings() {
         let mut board = crate::tasks::TaskBoard::new();
         board.set_device("deck", 1, true);
         let publish = |board: &mut crate::tasks::TaskBoard, session: Value, now_ms: u128| {
@@ -737,14 +796,14 @@ mod tests {
         publish(&mut board, running(), 1_000);
         assert_eq!(
             board.task("hermes:timed").unwrap().started_at_ms,
-            Some(1_000)
+            None
         );
 
         // A later listing of the still-running session must not restart the timer.
         publish(&mut board, running(), 5_000);
         assert_eq!(
             board.task("hermes:timed").unwrap().started_at_ms,
-            Some(1_000)
+            None
         );
 
         let finished = build_cached_task(&json!({
@@ -757,8 +816,8 @@ mod tests {
         publish(&mut board, finished, 9_000);
         let card = board.task("hermes:timed").unwrap();
         assert_eq!(card.state, crate::tasks::TaskState::Completed);
-        assert_eq!(card.started_at_ms, Some(1_000));
-        assert_eq!(card.finished_at_ms, Some(9_000));
+        assert_eq!(card.started_at_ms, None);
+        assert_eq!(card.finished_at_ms, None);
     }
 
     fn temp_cache_dir(name: &str) -> PathBuf {

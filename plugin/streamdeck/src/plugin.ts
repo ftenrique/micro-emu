@@ -27,7 +27,8 @@ const HOST_PROBE_TIMEOUT_MS = 5_000;
 const bridgeExe = resolveBridgeExecutable();
 const daemonArgs = [
     "--port",
-    process.env.MICRO_EMU_PORT || "auto",
+    // The RP2040 Codex Micro emulation is opt-in (e.g. MICRO_EMU_PORT=auto).
+    process.env.MICRO_EMU_PORT || "none",
     "--controller",
     process.env.MICRO_EMU_CONTROLLER || "none",
 ];

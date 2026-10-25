@@ -41,11 +41,11 @@ if (-not $copied) {
 
 $startupContents = @(
     "@echo off"
-    "start `"Codex Micro Bridge`" /min `"$installedBridge`" --daemon --port auto --controller none"
+    "start `"Codex Micro Bridge`" /min `"$installedBridge`" --daemon --port none --controller none"
 ) -join "`r`n"
 Set-Content -LiteralPath $startupCommand -Value $startupContents -Encoding Ascii
 
-Start-Process -FilePath $installedBridge -ArgumentList @("--daemon", "--port", "auto", "--controller", "none") -WindowStyle Hidden
+Start-Process -FilePath $installedBridge -ArgumentList @("--daemon", "--port", "none", "--controller", "none") -WindowStyle Hidden
 
 function Register-CodexMcpServer {
     $codexCommand = Get-Command -Name "codex" -CommandType Application -ErrorAction SilentlyContinue |

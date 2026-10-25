@@ -363,7 +363,9 @@ mod native {
     }
 
     fn process_is_claude_desktop(process_id: u32) -> bool {
-        process_image_path(process_id).is_some_and(|path| is_claude_desktop_executable(&path))
+        crate::proc_cache::cached("claude", process_id, |pid| {
+            process_image_path(pid).is_some_and(|path| is_claude_desktop_executable(&path))
+        })
     }
 
     pub(super) fn is_claude_desktop_executable(path: &str) -> bool {

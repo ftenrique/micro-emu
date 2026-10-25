@@ -60,6 +60,10 @@ const CLAUDE_DESKTOP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// Codex desktop state is local and cheap to poll. A 250 ms interval keeps
 /// focus and lifecycle responsive without reading SQLite in the 10 ms loop.
 const CODEX_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// The loop ticks every ~10 ms, but rebuilding and diffing every controller's
+/// cards on each tick is wasted work. Idle ticks refresh at most this often;
+/// a tick that handled a task press refreshes immediately.
+const LOOP_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Synthetic owner session for ZCode cards published by the daemon's DB poll.
 /// Real MCP sessions are numbered from 1 upward by the acceptor, so this high
@@ -163,6 +167,11 @@ pub struct DaemonOptions {
     pub bridge_options: crate::Options,
 }
 
+/// Each failed `--port auto` attempt spawns PowerShell to enumerate COM ports,
+/// so the daemon backs off further than the one-shot CLI path when no RP2040
+/// is attached.
+const DAEMON_SERIAL_RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
+
 fn retry_serial_connection(
     bridge: &mut crate::BridgeRuntime,
     options: &crate::Options,
@@ -173,13 +182,15 @@ fn retry_serial_connection(
     match crate::replace_runtime(bridge, options) {
         Ok(()) => {
             eprintln!("{}", crate::bridge_status(bridge, "daemon-reconnected"));
+            crate::diaglog::log(&format!("RP2040 reconnected port={}", bridge.port));
             *retry_at = None;
             *retry_delay = crate::SERIAL_RETRY_INITIAL_DELAY;
         }
         Err(error) => {
             eprintln!("RP2040 reconnect pending ({reason}): {error}");
+            crate::diaglog::log(&format!("RP2040 reconnect pending ({reason}): {error}"));
             *retry_at = Some(Instant::now() + *retry_delay);
-            *retry_delay = (*retry_delay * 2).min(crate::SERIAL_RETRY_MAX_DELAY);
+            *retry_delay = (*retry_delay * 2).min(DAEMON_SERIAL_RETRY_MAX_DELAY);
         }
     }
 }
@@ -276,6 +287,13 @@ fn task_slot_owners(
     owners
 }
 
+fn primary_slot_overrides(bridge: &crate::BridgeRuntime) -> Option<Vec<(usize, AgentId)>> {
+    bridge.controller.as_ref().filter(|device| device.device_id() == bridge.task_device_id)
+        .map(|device| device.as_ref())
+        .or_else(|| bridge.aux_controllers.iter().find(|(id, _, _)| id == &bridge.task_device_id).map(|(_, device, _)| device.as_ref()))
+        .and_then(|device| device.task_slot_agent_overrides())
+}
+
 fn task_slots_for_agent(
     slot_count: usize,
     active: ActiveSet,
@@ -307,12 +325,10 @@ fn refresh_wanted_usage(
         || session_agents.contains(AgentId::ZCode)
         || plugin_connected;
     if codex_wanted {
-        let snapshot = crate::usage::fetch_usage(UsageAgent::Codex);
-        bridge.usage_cache.store(UsageAgent::Codex, snapshot);
+        bridge.usage_cache.request_refresh(UsageAgent::Codex);
     }
     if zcode_wanted {
-        let snapshot = crate::usage::fetch_usage(UsageAgent::ZCode);
-        bridge.usage_cache.store(UsageAgent::ZCode, snapshot);
+        bridge.usage_cache.request_refresh(UsageAgent::ZCode);
     }
     codex_wanted || zcode_wanted
 }
@@ -343,6 +359,14 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
 
     let mut bridge = crate::open_runtime(&options.bridge_options)?;
     bridge.task_mode = true;
+    let preferences_path = (options.bind == DEFAULT_BIND).then(|| std::env::var_os("LOCALAPPDATA")
+        .map(|base| std::path::PathBuf::from(base).join("micro-emu").join("task-slots.json"))).flatten();
+    if let Some(path) = &preferences_path {
+        if let Some(value) = std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
+            bridge.task_board.restore_slot_preferences(&value);
+        }
+    }
+    let mut saved_preferences = bridge.task_board.slot_preferences();
     let mut codex_snapshot_available = false;
     if let Some(snapshot) = crate::codex_state::read_codex_snapshot(crate::tasks::CODEX_TASK_SLOTS)
     {
@@ -358,6 +382,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         }
     }
     let mut next_codex_poll_at = Instant::now() + CODEX_TASK_POLL_INTERVAL;
+    let mut next_loop_refresh_at = Instant::now();
     // A connected RP2040 alone does not claim a share of the deck.
     let mut session_agents = ActiveSet::new();
     let mut codex_hardware_active = false;
@@ -398,10 +423,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             task_slot_owners(
                 bridge.task_slot_count,
                 active,
-                bridge
-                    .controller
-                    .as_ref()
-                    .and_then(|controller| controller.task_slot_agent_overrides()),
+                primary_slot_overrides(&bridge),
             ),
         );
     }
@@ -439,6 +461,10 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         .map_err(|error| format!("failed to start acceptor: {error}"))?;
 
     loop {
+        if bridge.usage_cache.poll_ready() {
+            crate::patch_display_context_usage(&mut bridge);
+            let _ = crate::refresh_task_board(&mut bridge);
+        }
         // Drain session messages.
         while let Ok(msg) = session_rx.try_recv() {
             match msg {
@@ -474,8 +500,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     // machine still populates the strip (and its usage data).
                     if matches!(agent, AgentId::Codex | AgentId::ZCode) {
                         if let Some(usage_agent) = crate::usage::UsageAgent::from_agent(agent) {
-                            let snapshot = crate::usage::fetch_usage(usage_agent);
-                            bridge.usage_cache.store(usage_agent, snapshot);
+                            bridge.usage_cache.request_refresh(usage_agent);
                         }
                         crate::auto_derive_display_context(&mut bridge);
                         let _ = crate::refresh_task_board(&mut bridge);
@@ -560,9 +585,13 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                             );
                         }
                     }
-                    bridge
-                        .aux_controllers
-                        .push((device_id.clone(), Box::new(controller), slots));
+                    if becomes_primary {
+                        bridge.controller = Some(Box::new(controller));
+                    } else {
+                        bridge
+                            .aux_controllers
+                            .push((device_id.clone(), Box::new(controller), slots));
+                    }
                     plugin_sessions.push((session_id, device_id.clone()));
                     // Bootstrap usage data for the deck right away (both
                     // agents) instead of waiting for the first periodic tick.
@@ -798,7 +827,10 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         // Controller reconnect + poll.
         crate::reconnect_controller_if_due(&mut bridge);
         bridge.task_board.expire(now_ms());
-        let _ = crate::refresh_task_board(&mut bridge);
+        if now >= next_loop_refresh_at {
+            next_loop_refresh_at = now + LOOP_REFRESH_INTERVAL;
+            let _ = crate::refresh_task_board(&mut bridge);
+        }
         crate::poll_controller(&mut bridge, false)?;
         // Capacity messages from the Stream Deck carry Task Card ownership
         // preferences. Apply them immediately, even when agent liveness did
@@ -813,14 +845,12 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         let owners = task_slot_owners(
             bridge.task_slot_count,
             active,
-            bridge
-                .controller
-                .as_ref()
-                .and_then(|controller| controller.task_slot_agent_overrides()),
+            primary_slot_overrides(&bridge),
         );
         bridge
             .task_board
             .set_slot_owners(bridge.task_device_id.clone(), owners);
+        let had_task_events = !bridge.pending_task_events.is_empty();
         for (session_id, event) in bridge.pending_task_events.drain(..) {
             if let Some(agent) = catalog_action_agent(session_id) {
                 // Multiple proxies for one agent can briefly overlap during a
@@ -872,7 +902,10 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         // A task-button press during poll may have changed the selected
         // task; push the updated display context and cards to aux
         // controllers so the strips reflect the new selection immediately.
-        let _ = crate::refresh_task_board(&mut bridge);
+        if had_task_events || now >= next_loop_refresh_at {
+            next_loop_refresh_at = now + LOOP_REFRESH_INTERVAL;
+            let _ = crate::refresh_task_board(&mut bridge);
+        }
 
         // Clear phantom Codex HID cards when the RP2040 link is gone.  The
         // synthetic session 0 cards published from `v.oai.thstatus` never
@@ -945,10 +978,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     let zcode_slots = task_slots_for_agent(
                         bridge.task_slot_count,
                         active,
-                        bridge
-                            .controller
-                            .as_ref()
-                            .and_then(|controller| controller.task_slot_agent_overrides()),
+                        primary_slot_overrides(&bridge),
                         AgentId::ZCode,
                     );
                     if let Some(snapshot) =
@@ -1017,10 +1047,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                 let hermes_slots = task_slots_for_agent(
                     bridge.task_slot_count,
                     active,
-                    bridge
-                        .controller
-                        .as_ref()
-                        .and_then(|controller| controller.task_slot_agent_overrides()),
+                    primary_slot_overrides(&bridge),
                     AgentId::Hermes,
                 );
                 if let Some(snapshot) =
@@ -1088,10 +1115,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                 let claude_slots = task_slots_for_agent(
                     bridge.task_slot_count,
                     active,
-                    bridge
-                        .controller
-                        .as_ref()
-                        .and_then(|controller| controller.task_slot_agent_overrides()),
+                    primary_slot_overrides(&bridge),
                     AgentId::Claude,
                 );
                 if let Some(snapshot) = crate::claude_state::read_claude_snapshot(claude_slots) {
@@ -1212,10 +1236,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     task_slot_owners(
                         bridge.task_slot_count,
                         active,
-                        bridge
-                            .controller
-                            .as_ref()
-                            .and_then(|controller| controller.task_slot_agent_overrides()),
+                        primary_slot_overrides(&bridge),
                     ),
                 );
                 // Re-render through the centralized desired-state path.  An
@@ -1266,6 +1287,17 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             }
         }
 
+        let preferences = bridge.task_board.slot_preferences();
+        if preferences != saved_preferences {
+            if let Some(path) = &preferences_path {
+                let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+                let result = serde_json::to_vec(&preferences).map_err(|e| e.to_string()).and_then(|bytes| {
+                    std::fs::write(&temporary, bytes).and_then(|_| std::fs::rename(&temporary, path)).map_err(|e| e.to_string())
+                });
+                if let Err(error) = result { crate::diaglog::log(&format!("slot persistence failed: {error}")); }
+            }
+            saved_preferences = preferences;
+        }
         // Brief sleep to avoid busy-looping.
         thread::sleep(Duration::from_millis(10));
     }
@@ -1354,7 +1386,7 @@ fn handle_session(id: usize, stream: TcpStream, tx: Sender<SessionMessage>) {
     if let Some((instance_id, task_slots)) =
         crate::plugin_controller::parse_controller_hello(&first_line_owned)
     {
-        handle_plugin_session(id, write_stream, reader, tx, instance_id, task_slots);
+        handle_plugin_session(id, write_stream, reader, tx, instance_id, task_slots, serde_json::from_str(&first_line_owned).unwrap_or(Value::Null));
         return;
     }
 
@@ -1454,6 +1486,7 @@ fn handle_plugin_session(
     tx: Sender<SessionMessage>,
     instance_id: String,
     task_slots: usize,
+    hello: Value,
 ) {
     eprintln!(
         "daemon [{}] plugin controller session {id} instance={instance_id} slots={task_slots}",
@@ -1468,9 +1501,8 @@ fn handle_plugin_session(
     }
 
     let (events_tx, events_rx) = mpsc::channel::<Value>();
+    let _ = events_tx.send(json!({"type":"capacity", "taskSlots":task_slots, "slotAgents":hello.get("slotAgents")}));
     let (plugin_writer_tx, plugin_writer_rx) = mpsc::channel::<Value>();
-    // Heartbeats bypass the daemon main loop so slow refresh work cannot starve liveness.
-    let heartbeat_writer = plugin_writer_tx.clone();
 
     // Plugin writer thread: drains outbound render lines and writes them to
     // the socket as newline-delimited JSON.
@@ -1519,10 +1551,6 @@ fn handle_plugin_session(
             Ok(line) => {
                 match serde_json::from_str::<Value>(&line) {
                     Ok(value) => {
-                        if let Some(pong) = plugin_heartbeat_response(&value) {
-                            let _ = heartbeat_writer.send(pong);
-                            continue;
-                        }
                         if events_tx.send(value).is_err() {
                             // Controller was dropped (daemon detach); stop reading.
                             return;
@@ -1547,17 +1575,6 @@ fn handle_plugin_session(
         log_context()
     );
     let _ = tx.send(SessionMessage::Disconnected { session_id: id });
-}
-
-/// Builds the heartbeat response without involving the daemon main loop.
-fn plugin_heartbeat_response(message: &Value) -> Option<Value> {
-    if message.get("type").and_then(Value::as_str) != Some("ping") {
-        return None;
-    }
-    Some(json!({
-        "type": "pong",
-        "timestamp": message.get("timestamp").cloned().unwrap_or(Value::Null),
-    }))
 }
 
 fn parse_hello_info(line: &str) -> Option<HelloInfo> {
@@ -1660,6 +1677,19 @@ fn remove_plugin_sessions_by_device(
 /// Detaches a plugin controller from `aux_controllers` by device_id, shutting
 /// it down and removing it from the task board.
 fn detach_plugin_controller(bridge: &mut crate::BridgeRuntime, device_id: &str) {
+    if bridge.task_device_id == device_id
+        && bridge.controller.as_ref().is_some_and(|device| device.kind() == crate::controller::ControllerKind::StreamDeckPlugin)
+    {
+        if let Some(mut device) = bridge.controller.take() {
+            device.shutdown();
+        }
+        bridge.task_board.set_device(device_id, 0, false);
+        bridge.task_device_id = "none".to_owned();
+        bridge.task_slot_count = 0;
+        bridge.task_board.set_slot_owners("none", Vec::new());
+        eprintln!("plugin primary controller {device_id} detached");
+        return;
+    }
     let mut survivors = Vec::new();
     let mut removed = false;
     for (id, mut device, slots) in std::mem::take(&mut bridge.aux_controllers) {
@@ -2045,11 +2075,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plugin_heartbeat_response_preserves_timestamp_without_main_loop() {
-        let response = plugin_heartbeat_response(&json!({"type": "ping", "timestamp": 42}))
-            .expect("ping should produce an immediate response");
-        assert_eq!(response, json!({"type": "pong", "timestamp": 42}));
-        assert!(plugin_heartbeat_response(&json!({"type": "event"})).is_none());
+    fn plugin_primary_uses_auxiliary_owner_preferences_and_main_loop_heartbeat() {
+        let mut bridge = crate::tests::test_bridge(std::sync::Arc::new(std::sync::Mutex::new(None)));
+        bridge.controller = None;
+        let (tx, rx) = mpsc::channel();
+        let (writer, output) = mpsc::channel();
+        let mut plugin = crate::plugin_controller::PluginController::new("deck".to_owned(), 8, rx, writer);
+        tx.send(json!({"type":"capacity","taskSlots":8,"slotAgents":{"6":"hermes","7":"hermes"}})).unwrap();
+        tx.send(json!({"type":"ping","timestamp":42})).unwrap();
+        assert!(output.try_recv().is_err(), "a socket reader cannot claim that the task loop is healthy");
+        plugin.poll(0).unwrap();
+        assert_eq!(output.try_recv().unwrap(), json!({"type":"pong","timestamp":42}));
+        bridge.task_device_id = plugin.device_id();
+        bridge.aux_controllers.push((plugin.device_id(), Box::new(plugin), 8));
+        assert_eq!(primary_slot_overrides(&bridge), Some(vec![(6,AgentId::Hermes),(7,AgentId::Hermes)]));
     }
 
     #[test]

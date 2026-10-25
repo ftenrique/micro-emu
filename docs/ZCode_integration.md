@@ -455,7 +455,7 @@ rp2040-bridge.exe --daemon --port auto|COMx|none [options]
 | Flag                  | Default             | Description                                      |
 |-----------------------|---------------------|--------------------------------------------------|
 | `--daemon`            |                     | Run as TCP daemon (multi-agent).                 |
-| `--port`              | `auto`              | `auto`, `COMx`, or `none` (standalone).          |
+| `--port`              | `none`              | `none` (default, no RP2040), `auto`, or `COMx` (opt-in Codex Micro hardware). |
 | `--bind`              | `127.0.0.1:48360`   | TCP bind address (loopback only recommended).    |
 | `--controller`        | `ajazz`             | `ajazz`, `streamdeck-plus`, `streamdeck-plus-xl`, `streamdeck-xl`, or `none`. |
 | `--controller-serial` |                     | Select a specific device by serial number.       |

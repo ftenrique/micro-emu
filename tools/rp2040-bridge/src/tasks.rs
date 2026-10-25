@@ -230,11 +230,25 @@ pub struct TaskBoard {
     /// Last slot each task occupied. Used to re-pin a task to its previous
     /// position after a transient eviction so cards do not shuffle.
     last_slots: HashMap<String, DeviceSlot>,
+    primary_preferences: BTreeMap<String, usize>,
 }
 
 impl TaskBoard {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn restore_slot_preferences(&mut self, value: &Value) {
+        if let Some(slots) = value.get("slots").and_then(Value::as_object) {
+            self.primary_preferences = slots.iter().take(256).filter_map(|(id, slot)| {
+                let slot = slot.as_u64()?;
+                (id.len() <= 160 && slot < 64).then(|| (id.clone(), slot as usize))
+            }).collect();
+        }
+    }
+
+    pub fn slot_preferences(&self) -> Value {
+        json!({"version":1, "slots":self.primary_preferences})
     }
 
     /// A physical task-button press selects a Codex task and can cause the
@@ -309,7 +323,8 @@ impl TaskBoard {
             replacement.push(self.parse_task(session, agent, item, now_ms, None)?);
             let id = replacement.last().expect("pushed task").task_id.clone();
             if let Some(existing) = self.tasks.get(&id) {
-                if existing.owner_session != session {
+                if existing.owner_session != session
+                    && !(existing.owner_agent == agent && existing.reconnect_until_ms.is_some()) {
                     return Err(format!(
                         "task_id is already owned by session {}: {id}",
                         existing.owner_session
@@ -668,9 +683,9 @@ impl TaskBoard {
             source_slot,
             timing_authoritative,
             updated_at_ms: now_ms,
-            started_at_ms: explicit_started_at.or_else(|| state.active().then_some(now_ms)),
+            started_at_ms: explicit_started_at.or_else(|| (!timing_authoritative && state.active()).then_some(now_ms)),
             finished_at_ms: explicit_finished_at
-                .or_else(|| (state == TaskState::Completed).then_some(now_ms)),
+                .or_else(|| (!timing_authoritative && state == TaskState::Completed).then_some(now_ms)),
             reconnect_until_ms: None,
             interaction,
         })
@@ -1120,17 +1135,17 @@ impl TaskBoard {
         let slot_owners = self.slot_owners.clone();
         self.assignments.retain(|task_id, assignment| {
             self.tasks.get(task_id).is_some_and(|task| {
-                task.state.eligible()
+                (task.state.eligible() || task.reconnect_until_ms.is_some())
                     && available_set.contains(&assignment.slot)
                     && (partitioned_device_id.as_deref()
                         != Some(assignment.slot.device_id.as_str())
                         || slot_owners
                             .get(assignment.slot.slot)
                             .copied()
-                            .is_none_or(|owner| owner == Some(task.owner_agent)))
+                            .is_none_or(|owner| owner == Some(task.owner_agent)
+                                || (owner.is_none() && assignment.slot.slot >= crate::routing::LCD_SLOTS)))
             })
         });
-        self.pin_codex_hid_primary_slots();
         // Sticky pass: an unassigned task returns to the slot it last held
         // when that slot is still free and owner-compatible. This keeps the
         // board coherent across transient evictions (repartitions, state
@@ -1140,7 +1155,10 @@ impl TaskBoard {
             .values()
             .filter(|task| task.state.eligible() && !self.assignments.contains_key(&task.task_id))
             .filter_map(|task| {
-                let slot = self.last_slots.get(&task.task_id)?;
+                let preferred = self.primary_preferences.get(&task.task_id).and_then(|slot| {
+                    self.partitioned_device_id.as_ref().map(|id| DeviceSlot { device_id: id.clone(), slot: *slot })
+                });
+                let slot = preferred.as_ref().or_else(|| self.last_slots.get(&task.task_id))?;
                 let free = available_set.contains(slot)
                     && !self.assignments.values().any(|a| a.slot == *slot);
                 let compatible = self
@@ -1154,6 +1172,7 @@ impl TaskBoard {
                 self.assignments.insert(task_id, TaskAssignment { slot });
             }
         }
+        self.pin_codex_hid_primary_slots();
         let mut free: Vec<DeviceSlot> = available
             .into_iter()
             .filter(|slot| !self.assignments.values().any(|a| a.slot == *slot))
@@ -1221,6 +1240,12 @@ impl TaskBoard {
         for (task_id, assignment) in &self.assignments {
             self.last_slots
                 .insert(task_id.clone(), assignment.slot.clone());
+            if self.partitioned_device_id.as_deref() == Some(assignment.slot.device_id.as_str()) {
+                self.primary_preferences.insert(task_id.clone(), assignment.slot.slot);
+            }
+        }
+        if self.primary_preferences.len() > 256 {
+            self.primary_preferences.retain(|id, _| self.tasks.contains_key(id));
         }
         self.last_slots.retain(|task_id, _| {
             self.tasks.contains_key(task_id) || self.assignments.contains_key(task_id)
@@ -1256,6 +1281,13 @@ impl TaskBoard {
             .tasks
             .values()
             .filter_map(|task| {
+                // Desktop source positions follow UI recency. They are routing
+                // metadata, not permission to move an already assigned card.
+                if !task.task_id.starts_with("codex-hid:") {
+                    if self.assignments.contains_key(&task.task_id) { return None; }
+                    if task.source_slot.is_some_and(|source| self.assignments.values().any(|a|
+                        a.slot.device_id == primary_device_id && a.slot.slot == source)) { return None; }
+                }
                 (task.owner_agent == AgentId::Codex)
                     .then_some(task.source_slot)
                     .flatten()
@@ -1448,6 +1480,60 @@ fn parse_brightness(value: Option<&Value>) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recency_changes_and_restart_keep_desktop_tasks_on_their_keys() {
+        let mut board = TaskBoard::new();
+        board.set_device("first-instance", 8, true);
+        board.set_slot_owners("first-instance", vec![Some(AgentId::Codex); 8]);
+        let snapshot = |a, b| json!({"tasks":[
+            {"task_id":"a","state":"running","source_slot":a},
+            {"task_id":"b","state":"running","source_slot":b}]});
+        board.publish_codex_snapshot(&snapshot(0,1), 10).unwrap();
+        board.publish_codex_snapshot(&snapshot(1,0), 20).unwrap();
+        assert_eq!(board.assignment("a").unwrap().slot.slot, 0);
+        assert_eq!(board.assignment("b").unwrap().slot.slot, 1);
+        let mut restarted = TaskBoard::new();
+        restarted.restore_slot_preferences(&board.slot_preferences());
+        restarted.set_device("new-instance", 8, true);
+        restarted.set_slot_owners("new-instance", vec![Some(AgentId::Codex); 8]);
+        restarted.publish_codex_snapshot(&snapshot(1,0), 30).unwrap();
+        assert_eq!(restarted.assignment("a").unwrap().slot.slot, 0);
+        assert_eq!(restarted.assignment("b").unwrap().slot.slot, 1);
+    }
+
+    #[test]
+    fn overflow_assignment_survives_a_higher_priority_new_candidate() {
+        let mut board = TaskBoard::new();
+        board.set_device("deck", 8, true);
+        board.set_slot_owners("deck", vec![Some(AgentId::Codex),Some(AgentId::Codex),Some(AgentId::Hermes),Some(AgentId::ZCode),Some(AgentId::ZCode),Some(AgentId::Hermes),None,None]);
+        board.publish_tasks(1, AgentId::ZCode, &json!({"tasks":[task("a","running",50),task("b","running",50),task("c","running",50),task("d","running",50)]}), 1).unwrap();
+        let before = board.assignment("c").unwrap().clone();
+        board.publish_tasks(2, AgentId::Hermes, &json!({"tasks":[task("e","waiting",99)]}), 2).unwrap();
+        assert_eq!(board.assignment("c"), Some(&before));
+    }
+
+    #[test]
+    fn reconnecting_owner_can_reclaim_its_task_without_losing_the_timer() {
+        let mut board = TaskBoard::new();
+        board.set_device("deck", 2, true);
+        board.publish_tasks(1, AgentId::ZCode, &json!({"tasks":[task("a","running",50)]}), 10).unwrap();
+        board.disconnect_session(1, 20);
+        board.publish_tasks(2, AgentId::Hermes, &json!({"tasks":[task("b","running",50)]}), 30).unwrap();
+        assert_eq!(board.assignment("a").unwrap().slot.slot, 0);
+        board.publish_tasks(3, AgentId::ZCode, &json!({"tasks":[task("a","running",50)]}), 40).unwrap();
+        assert_eq!(board.task("a").unwrap().started_at_ms, Some(10));
+        assert_eq!(board.task("a").unwrap().owner_session, 3);
+    }
+
+    #[test]
+    fn authoritative_missing_dates_do_not_become_observation_timers() {
+        let mut board = TaskBoard::new();
+        for now in [10,100,1000] {
+            board.publish_tasks(1, AgentId::Hermes, &json!({"tasks":[{"task_id":"a","state":"running","timing_authoritative":true,"started_at_ms":null}]}), now).unwrap();
+            assert_eq!(board.task("a").unwrap().started_at_ms, None);
+        }
+    }
 
     fn task(id: &str, state: &str, priority: u64) -> Value {
         json!({"task_id": id, "title": id, "state": state, "priority": priority})

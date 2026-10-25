@@ -4,7 +4,10 @@ import { PluginContext } from "../context";
 import { renderTaskCardImage, renderDisconnectedImage } from "../images";
 import { TASK_SLOT_COUNT } from "../task-slots";
 
-const TIMER_REFRESH_MS = 1_000;
+// The elapsed-time label does not need one-second precision. A slower redraw
+// keeps long-running tasks useful while avoiding a continuous image-upload
+// stream to the device.
+const TIMER_REFRESH_MS = 5_000;
 // Stream Deck exposes eight task-card positions.
 const LONG_PRESS_MS = 650;
 
@@ -32,8 +35,10 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
     // one device-wide queue and supersede stale renders for the same action.
     private renderQueue: Promise<void> = Promise.resolve();
     private readonly renderVersions = new WeakMap<TaskCardInstance, number>();
+    // Do not upload an image that is already on the key. This also prevents a
+    // state notification for another render channel from rewriting every card.
+    private readonly renderedImages = new WeakMap<TaskCardInstance, string>();
     private readonly actionSettings = new WeakMap<TaskCardInstance, TaskCardSettings>();
-    private repairSlot = 0;
 
     constructor(ctx: PluginContext) {
         super();
@@ -44,6 +49,7 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
 
     onWillAppear(ev: WillAppearEvent<TaskCardSettings>): void {
         const action = ev.action as TaskCardInstance;
+        this.renderedImages.delete(action);
         const settings = this.migrateLegacySlot(action, ev.payload.settings);
         this.actionSettings.set(action, settings);
         this.syncAgent(settings);
@@ -52,6 +58,7 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
 
     onDidReceiveSettings(ev: DidReceiveSettingsEvent<TaskCardSettings>): void {
         const action = ev.action as TaskCardInstance;
+        this.renderedImages.delete(action);
         this.actionSettings.set(action, ev.payload.settings);
         this.syncAgent(ev.payload.settings);
         this.enqueueRefresh(action, ev.payload.settings);
@@ -153,18 +160,15 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
 
     private refreshDynamicCards(): void {
         if (!this.ctx.isConnected()) return;
-        // Running timers repaint every second. One additional slot is swept on
-        // each tick so transient hardware upload failures cannot leave stale
-        // selection strips or lifecycle colors stuck indefinitely.
-        const repairSlot = this.repairSlot;
-        this.repairSlot = (this.repairSlot + 1) % TASK_SLOT_COUNT;
+        // Lifecycle changes arrive through the context listener. The timer is
+        // only for the elapsed-time label on active cards.
         for (const action of this.actions) {
             const settings = this.actionSettings.get(action);
             if (!settings) continue;
             const slot = Number(settings.slot ?? 0);
             const card = this.ctx.getTaskCard(slot) ?? this.ctx.getSlot(slot);
             const status = String(card?.status ?? card?.state ?? "").toLowerCase();
-            if (isRunningStatus(status) || slot === repairSlot) {
+            if (isRunningStatus(status)) {
                 this.enqueueRefresh(action, settings);
             }
         }
@@ -190,7 +194,7 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
         const slot = Number(settings.slot ?? 0);
         if (!this.ctx.isConnected()) {
             this.renderedTargets.delete(action);
-            await action.setImage(renderDisconnectedImage(`#${slot}`));
+            await this.setImageIfChanged(action, renderDisconnectedImage(`#${slot}`));
             return;
         }
         const taskCard = this.ctx.getTaskCard(slot) ?? this.ctx.getSlot(slot);
@@ -205,24 +209,30 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
         // e:0 is reserved exclusively for an actually empty slot.
         if (!taskCard || (!enabled && !isFinishedStatus(status))) {
             this.renderedTargets.delete(action);
-            await action.setImage(renderTaskCardImage(slot, null, "", 0x263238));
+            await this.setImageIfChanged(action, renderTaskCardImage(slot, null, "", 0x263238));
             return;
         }
         const taskId = taskIdentity(taskCard);
         if (!taskId) {
             this.renderedTargets.delete(action);
-            await action.setImage(renderTaskCardImage(slot, null, "", 0x263238));
+            await this.setImageIfChanged(action, renderTaskCardImage(slot, null, "", 0x263238));
             return;
         }
         const startedAt = timestamp(taskCard.started_at_ms);
         const finishedAt = timestamp(taskCard.finished_at_ms);
-        await action.setImage(renderTaskCardImage(
+        await this.setImageIfChanged(action, renderTaskCardImage(
             slot, agent, status, color,
             startedAt,
             finishedAt,
             selected,
         ));
         this.renderedTargets.set(action, taskId);
+    }
+
+    private async setImageIfChanged(action: TaskCardInstance, image: string): Promise<void> {
+        if (this.renderedImages.get(action) === image) return;
+        await action.setImage(image);
+        this.renderedImages.set(action, image);
     }
 }
 

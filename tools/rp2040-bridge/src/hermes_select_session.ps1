@@ -102,6 +102,9 @@ function Test-SessionRow {
         return $false
     }
     $className = $element.Current.ClassName
+    if ($element.Current.ClassName.StartsWith("pl-2 pr-1 gap-1.5", [System.StringComparison]::Ordinal)) {
+        return $true
+    }
     foreach ($prefix in @("pl-2 gap-1.5", "pl-2 pr-1 gap-1.5")) {
         if ($className.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
             return $true

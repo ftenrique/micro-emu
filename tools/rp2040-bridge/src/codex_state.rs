@@ -120,20 +120,7 @@ fn read_codex_snapshot_from(
     for (source_slot, row) in rows.enumerate() {
         let (thread_id, fallback_title, cwd, model, effort, rollout_path, recency, updated) =
             row.ok()?;
-        // The first pass through an existing rollout replays its entire
-        // history. Completed turns from that replay are not fresh device
-        // notifications, so render them as idle rather than lighting every
-        // task green when the bridge connects.
-        let first_observation = !cache.rollouts.contains_key(&thread_id);
-        let mut lifecycle = refresh_rollout(cache, &thread_id, Path::new(&rollout_path));
-        if first_observation && lifecycle.state == Some(TaskState::Completed) {
-            lifecycle.state = Some(TaskState::Queued);
-            lifecycle.started_at_ms = None;
-            lifecycle.finished_at_ms = None;
-            if let Some(cursor) = cache.rollouts.get_mut(&thread_id) {
-                cursor.lifecycle = lifecycle.clone();
-            }
-        }
+        let lifecycle = refresh_rollout(cache, &thread_id, Path::new(&rollout_path));
         let title = titles.get(&thread_id).cloned().unwrap_or(fallback_title);
         // A native shell approval is not a lifecycle event. While it is open,
         // it must override the normal running/selected presentation so the
@@ -764,9 +751,9 @@ mod tests {
         assert_eq!(task["project"], "micro-emu");
         assert_eq!(task["model"], "gpt-selected");
         assert_eq!(task["effort"], "xhigh");
-        assert_eq!(task["state"], "queued");
-        assert_eq!(task["started_at_ms"], Value::Null);
-        assert_eq!(task["finished_at_ms"], Value::Null);
+        assert_eq!(task["state"], "completed");
+        assert_eq!(task["started_at_ms"], 100_000);
+        assert_eq!(task["finished_at_ms"], 145_000);
         assert_eq!(task["source_slot"], 0);
         assert_eq!(task["legacy_key"], "AG00");
 

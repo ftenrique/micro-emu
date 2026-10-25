@@ -23,6 +23,7 @@ const HID_WRITE_RETRIES: usize = 4;
 const HID_REPORT_SETTLE: Duration = Duration::from_millis(5);
 const HID_IMAGE_SETTLE: Duration = Duration::from_millis(20);
 const HID_DEVICE_SETTLE: Duration = Duration::from_millis(100);
+const HID_KEY_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const HID_WINDOW_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const DIGITS: [[u8; 15]; STATUS_SLOTS] = [
     [0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1],
@@ -247,6 +248,9 @@ pub fn connect(
         pending_display_context: None,
         pending_display_mode: None,
         last_display_write_at: None,
+        pending_key_status: None,
+        last_key_write_at: None,
+        next_key_write_index: 0,
         write_lock: Mutex::new(()),
     };
     result.initialize()?;
@@ -293,6 +297,12 @@ struct StreamDeckDevice {
     pending_display_context: Option<DisplayContext>,
     pending_display_mode: Option<DisplayMode>,
     last_display_write_at: Option<Instant>,
+    pending_key_status: Option<(
+        [Option<(u32, u8)>; STATUS_SLOTS],
+        [Option<String>; STATUS_SLOTS],
+    )>,
+    last_key_write_at: Option<Instant>,
+    next_key_write_index: usize,
 }
 
 impl StreamDeckDevice {
@@ -452,6 +462,56 @@ impl StreamDeckDevice {
 
     fn write_key_image(&mut self, key: usize, image: &[u8]) -> Result<(), String> {
         self.send_image(0x07, key as u8, image, 0, 8)
+    }
+
+    /// Sends at most one changed key image per pacing interval. Status frames
+    /// can carry animated brightness values, so keep only the newest complete
+    /// state instead of letting image uploads queue indefinitely.
+    fn flush_key_status(&mut self) -> Result<(), String> {
+        let Some((colors, agents)) = self.pending_key_status.clone() else {
+            return Ok(());
+        };
+        if self
+            .last_key_write_at
+            .is_some_and(|written_at| written_at.elapsed() < HID_KEY_MIN_INTERVAL)
+        {
+            return Ok(());
+        }
+        let Some(index) = (0..STATUS_SLOTS)
+            .map(|offset| (self.next_key_write_index + offset) % STATUS_SLOTS)
+            .find(|&index| {
+                self.last_colors[index] != colors[index] || self.last_agents[index] != agents[index]
+            })
+        else {
+            self.pending_key_status = None;
+            return Ok(());
+        };
+        let color = colors[index];
+        let image = match color {
+            Some((rgb, brightness)) => encode_image_with_agent(
+                self.profile.key_size,
+                self.profile.key_size,
+                rgb_bytes(rgb, brightness),
+                Some(index),
+                true,
+                self.profile.rotation,
+                agents[index].as_deref(),
+            )?,
+            None => encode_image(
+                self.profile.key_size,
+                self.profile.key_size,
+                [0, 0, 0],
+                None,
+                false,
+                self.profile.rotation,
+            )?,
+        };
+        self.write_key_image(index, &image)?;
+        self.last_colors[index] = color;
+        self.last_agents[index] = agents[index].clone();
+        self.last_key_write_at = Some(Instant::now());
+        self.next_key_write_index = (index + 1) % STATUS_SLOTS;
+        Ok(())
     }
 
     fn events_from_report(&mut self, report: &[u8]) -> Vec<PhysicalEvent> {
@@ -619,6 +679,7 @@ impl PhysicalController for StreamDeckDevice {
             .read_timeout(&mut report, timeout_ms)
             .map_err(|error| error.to_string())?;
         let events = self.events_from_report(&report[..read]);
+        self.flush_key_status()?;
         self.flush_display_context(false)?;
         Ok(events)
     }
@@ -632,8 +693,10 @@ impl PhysicalController for StreamDeckDevice {
         let Some(entries) = parameters.as_array() else {
             return Err("v.oai.thstatus parameters must be an array".to_owned());
         };
-        let mut colors = self.last_colors;
-        let mut agents = self.last_agents.clone();
+        let (mut colors, mut agents) = self
+            .pending_key_status
+            .clone()
+            .unwrap_or((self.last_colors, self.last_agents.clone()));
         for entry in entries {
             let Some(id) = entry.get("id").and_then(Value::as_u64) else {
                 continue;
@@ -659,34 +722,8 @@ impl PhysicalController for StreamDeckDevice {
                     .map(str::to_owned);
             }
         }
-        for (index, color) in colors.into_iter().enumerate() {
-            if self.last_colors[index] == color && self.last_agents[index] == agents[index] {
-                continue;
-            }
-            let image = match color {
-                Some((rgb, brightness)) => encode_image_with_agent(
-                    self.profile.key_size,
-                    self.profile.key_size,
-                    rgb_bytes(rgb, brightness),
-                    Some(index),
-                    true,
-                    self.profile.rotation,
-                    agents[index].as_deref(),
-                )?,
-                None => encode_image(
-                    self.profile.key_size,
-                    self.profile.key_size,
-                    [0, 0, 0],
-                    None,
-                    false,
-                    self.profile.rotation,
-                )?,
-            };
-            self.write_key_image(index, &image)?;
-            self.last_colors[index] = color;
-            self.last_agents[index] = agents[index].clone();
-        }
-        Ok(())
+        self.pending_key_status = Some((colors, agents));
+        self.flush_key_status()
     }
     fn apply_display_context(&mut self, context: &DisplayContext) -> Result<(), String> {
         self.display_context = Some(context.clone());
@@ -1492,6 +1529,9 @@ mod tests {
             pending_display_context: None,
             pending_display_mode: None,
             last_display_write_at: None,
+            pending_key_status: None,
+            last_key_write_at: None,
+            next_key_write_index: 0,
         };
         let first = device.events_from_report(&report(0x00, &[1, 0, 0, 0, 0, 0, 0, 0]));
         assert_eq!(
@@ -1527,6 +1567,9 @@ mod tests {
             pending_display_context: None,
             pending_display_mode: None,
             last_display_write_at: None,
+            pending_key_status: None,
+            last_key_write_at: None,
+            next_key_write_index: 0,
         };
         assert_eq!(
             device.events_from_report(&report(0x03, &[1, 2, 255, 0, 0])),
@@ -1575,6 +1618,9 @@ mod tests {
             pending_display_context: None,
             pending_display_mode: None,
             last_display_write_at: Some(Instant::now()),
+            pending_key_status: None,
+            last_key_write_at: None,
+            next_key_write_index: 0,
         };
         let left = [0x03, 0, 138, 2, 20, 0, 100, 0, 22, 0];
         device.events_from_report(&report(0x02, &left));
@@ -1625,6 +1671,9 @@ mod tests {
             pending_display_context: None,
             pending_display_mode: None,
             last_display_write_at: None,
+            pending_key_status: None,
+            last_key_write_at: None,
+            next_key_write_index: 0,
         };
         let mut pressed = vec![0_u8; 32];
         pressed[0] = 1;
@@ -1667,6 +1716,9 @@ mod tests {
             pending_display_context: None,
             pending_display_mode: None,
             last_display_write_at: None,
+            pending_key_status: None,
+            last_key_write_at: None,
+            next_key_write_index: 0,
         };
         let mut pressed = vec![0_u8; 32];
         for index in [11, 14, 18, 19, 20, 27, 29, 30, 31] {
@@ -1748,6 +1800,9 @@ mod tests {
             pending_display_context: None,
             pending_display_mode: None,
             last_display_write_at: None,
+            pending_key_status: None,
+            last_key_write_at: None,
+            next_key_write_index: 0,
         };
         let mut reserved = vec![0_u8; 32];
         reserved[9] = 1;

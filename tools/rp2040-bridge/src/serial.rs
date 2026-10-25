@@ -8,7 +8,9 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use std::process::Command;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 pub const AUTO_PORT: &str = "auto";
 
@@ -118,13 +120,48 @@ pub fn open(port: &str) -> Result<File, String> {
     Ok(file)
 }
 
-pub fn start_reader(mut reader: File, sender: Sender<SerialEvent>) -> JoinHandle<()> {
-    thread::Builder::new()
+pub struct ReaderHandle {
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+impl ReaderHandle {
+    pub fn join(self) -> Result<(), String> {
+        self.stop.store(true, Ordering::Release);
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn CancelSynchronousIo(thread: *mut core::ffi::c_void) -> i32;
+            }
+            unsafe { CancelSynchronousIo(self.thread.as_raw_handle().cast()); }
+        }
+        // A broken driver must never park the daemon's task loop forever.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !self.thread.is_finished() {
+            if Instant::now() >= deadline {
+                return Err("serial reader cancellation timed out".to_owned());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        self.thread.join().map_err(|_| "serial reader panicked".to_owned())
+    }
+}
+
+pub fn start_reader(reader: File, sender: Sender<SerialEvent>) -> ReaderHandle {
+    start_reader_with(reader, sender)
+}
+
+fn start_reader_with<R: Read + Send + 'static>(mut reader: R, sender: Sender<SerialEvent>) -> ReaderHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let cancelled = stop.clone();
+    let thread = thread::Builder::new()
         .name("rp2040-cdc-reader".to_owned())
         .spawn(move || {
             let mut decoder = FrameDecoder::default();
             let mut buffer = [0_u8; 256];
-            loop {
+            while !cancelled.load(Ordering::Acquire) {
                 match reader.read(&mut buffer) {
                     Ok(0) => continue,
                     Ok(read) => {
@@ -147,7 +184,8 @@ pub fn start_reader(mut reader: File, sender: Sender<SerialEvent>) -> JoinHandle
                 }
             }
         })
-        .expect("serial reader thread should start")
+        .expect("serial reader thread should start");
+    ReaderHandle { stop, thread }
 }
 
 pub fn write_frame(writer: &mut File, frame: &Frame) -> Result<(), String> {
@@ -233,6 +271,22 @@ fn set_dtr(_file: &File) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_serial_reader_can_be_cancelled_without_an_incoming_frame() {
+        struct Silent;
+        impl Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                thread::sleep(Duration::from_millis(10));
+                Ok(0)
+            }
+        }
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reader = start_reader_with(Silent, tx);
+        let start = Instant::now();
+        reader.join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn explicit_port_is_preserved() {

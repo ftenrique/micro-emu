@@ -9,6 +9,7 @@ mod daemon;
 mod diaglog;
 mod hermes_state;
 mod powershell;
+mod proc_cache;
 mod hermes_window;
 mod mcp;
 mod plugin_controller;
@@ -34,10 +35,12 @@ use std::env;
 use std::fs::File;
 use std::io::{self, IsTerminal};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+// HID input does not need a tight busy loop. 100 ms keeps controls responsive
+// while reducing idle USB polling pressure on physical Stream Deck devices.
+const CONTROLLER_POLL_TIMEOUT_MS: i32 = 100;
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROLLER_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const CONTROLLER_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
@@ -173,7 +176,7 @@ fn parse_options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "rp2040-bridge --port COMx|auto|none [--device KIND[,serial=SERIAL][,task-slots=N]]... [--controller ajazz|streamdeck-plus|streamdeck-plus-xl|streamdeck-xl|none] [--controller-serial SERIAL] [--no-ajazz] [--listen 0..3600] [--emit AG00] [--emit-after 0..3600] [--mcp|--legacy|--daemon [--bind 127.0.0.1:48360] | --mcp-proxy --agent codex|claude|zcode|hermes [--connect 127.0.0.1:48360] [--autostart] [--daemon-args \"...\"]]"
+                    "rp2040-bridge --port none|auto|COMx [--device KIND[,serial=SERIAL][,task-slots=N]]... [--controller ajazz|streamdeck-plus|streamdeck-plus-xl|streamdeck-xl|none] [--controller-serial SERIAL] [--no-ajazz] [--listen 0..3600] [--emit AG00] [--emit-after 0..3600] [--mcp|--legacy|--daemon [--bind 127.0.0.1:48360] | --mcp-proxy --agent codex|claude|zcode|hermes [--connect 127.0.0.1:48360] [--autostart] [--daemon-args \"...\"]]"
                 );
                 std::process::exit(0);
             }
@@ -229,7 +232,9 @@ fn parse_options() -> Result<Options, String> {
     let port = if mcp_proxy {
         String::from("proxy")
     } else {
-        port.unwrap_or_else(|| "auto".to_owned())
+        // The RP2040 Codex Micro emulation is opt-in: without an explicit
+        // --port (or --emit, which needs the device) run hardware-free.
+        port.unwrap_or_else(|| if emit_key.is_some() { "auto" } else { "none" }.to_owned())
     };
     Ok(Options {
         port,
@@ -295,7 +300,7 @@ fn wait_for_firmware(
             // board dead during USB re-enumeration.
             next_ping_at = Instant::now() + Duration::from_millis(250);
         }
-        match receiver.recv_timeout(remaining) {
+        match receiver.recv_timeout(remaining.min(next_ping_at.saturating_duration_since(Instant::now()))) {
             Ok(SerialEvent::Frame(frame)) if frame.frame_type == FrameType::Status => {
                 return String::from_utf8(frame.payload)
                     .map_err(|_| "RP2040 returned a non-UTF8 status".to_owned());
@@ -307,9 +312,7 @@ fn wait_for_firmware(
             }
             Ok(SerialEvent::Disconnected(error)) => return Err(error),
             Ok(SerialEvent::Frame(_)) => {}
-            Err(RecvTimeoutError::Timeout) => {
-                return Err("RP2040 did not answer the bridge ping within 3 seconds".to_owned());
-            }
+            Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
                 return Err("RP2040 serial reader stopped".to_owned());
             }
@@ -440,7 +443,7 @@ fn codex_report_trace(report: &[u8], sequence: u16) -> Value {
 pub struct SerialRuntime {
     pub writer: Option<File>,
     pub receiver: Receiver<SerialEvent>,
-    pub reader_thread: Option<JoinHandle<()>>,
+    pub reader_thread: Option<serial::ReaderHandle>,
 }
 
 pub struct BridgeRuntime {
@@ -975,7 +978,7 @@ fn open_serial_runtime(
             // like a permanently disconnected RP2040.
             drop(writer);
             if let Some(reader_thread) = reader_thread.take() {
-                let _ = reader_thread.join();
+                if let Err(error) = reader_thread.join() { crate::diaglog::log(&error); }
             }
             return Err(error);
         }
@@ -1118,7 +1121,7 @@ pub(crate) fn replace_runtime(bridge: &mut BridgeRuntime, options: &Options) -> 
     if let Some(mut serial) = bridge.serial.take() {
         drop(serial.writer.take());
         if let Some(reader_thread) = serial.reader_thread.take() {
-            let _ = reader_thread.join();
+            if let Err(error) = reader_thread.join() { crate::diaglog::log(&error); }
         }
     }
     if options.port == "none" {
@@ -1708,8 +1711,7 @@ fn route_usage_select(bridge: &mut BridgeRuntime, agent: crate::usage::UsageAgen
             .usage_cache
             .refreshed_within(agent, crate::usage::USAGE_REFRESH_INTERVAL)
     {
-        let snapshot = crate::usage::fetch_usage(agent);
-        bridge.usage_cache.store(agent, snapshot);
+        bridge.usage_cache.request_refresh(agent);
     }
     crate::auto_derive_display_context(bridge);
     patch_display_context_usage(bridge);
@@ -1779,7 +1781,10 @@ fn route_model_cycle(bridge: &mut BridgeRuntime) {
 }
 
 pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result<(), String> {
-    let result = bridge.controller.as_mut().map(|device| device.poll(25));
+    let result = bridge
+        .controller
+        .as_mut()
+        .map(|device| device.poll(CONTROLLER_POLL_TIMEOUT_MS));
     match result {
         Some(Ok(events)) => {
             let now_ms = std::time::SystemTime::now()
@@ -1928,7 +1933,7 @@ pub(crate) fn poll_controller(bridge: &mut BridgeRuntime, trace: bool) -> Result
     }
     let mut survivors = Vec::new();
     for (device_id, mut device, slots) in std::mem::take(&mut bridge.aux_controllers) {
-        match device.poll(25) {
+        match device.poll(CONTROLLER_POLL_TIMEOUT_MS) {
             Ok(events) => route_task_device_events(bridge, &device_id, slots, events),
             Err(error) => {
                 eprintln!("device {device_id} poll failed: {error}");
@@ -2736,7 +2741,7 @@ mod tests {
         fn shutdown(&mut self) {}
     }
 
-    fn test_bridge(rendered: Arc<Mutex<Option<Value>>>) -> BridgeRuntime {
+    pub(crate) fn test_bridge(rendered: Arc<Mutex<Option<Value>>>) -> BridgeRuntime {
         test_bridge_with_context(rendered, Arc::new(Mutex::new(None)))
     }
 
