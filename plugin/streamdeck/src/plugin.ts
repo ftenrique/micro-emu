@@ -12,6 +12,7 @@ import { SendAction } from "./actions/send";
 import { ArrowKeyAction } from "./actions/arrow-key";
 import { ContextKeyAction } from "./actions/context";
 import { CodexActionExecutor } from "./codex-action-executor";
+import { T3ActionExecutor } from "./t3-action-executor";
 import { resolveBridgeExecutable } from "./bridge-path";
 import { TASK_SLOT_COUNT } from "./task-slots";
 const SUSPEND_GAP_MS = 60_000;
@@ -101,7 +102,8 @@ async function probeHostConnection(): Promise<void> {
     }
 }
 const codex = new CodexActionExecutor((message) => streamDeck.logger.info(message));
-const ctx = new PluginContext(daemon, codex);
+const t3 = new T3ActionExecutor(undefined, undefined, undefined, undefined, bridgeExe);
+const ctx = new PluginContext(daemon, codex, undefined, undefined, undefined, t3);
 
 // --- Action registration ---
 streamDeck.actions.registerAction(new AgentButtonAction(ctx));

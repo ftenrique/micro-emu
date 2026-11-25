@@ -1,6 +1,6 @@
 //! Usage (rate-limit) retrieval for the agents the bridge can report on.
 //!
-//! Two sources, both read directly by the bridge — no MCP involvement:
+//! Three sources, all read directly by the bridge — no MCP involvement:
 //!
 //! * Codex: the ChatGPT backend API (`/backend-api/wham/usage`), authorized
 //!   with the tokens Codex CLI persists in `~/.codex/auth.json`. Returns
@@ -11,6 +11,13 @@
 //!   `TOKENS_LIMIT` entry is the 5-hour token window and `TIME_LIMIT` is the
 //!   weekly request quota; both carry `percentage` (used) and
 //!   `nextResetTime` (epoch milliseconds).
+//! * Claude: the Anthropic OAuth usage endpoint (`/api/oauth/usage`) — the
+//!   same source Claude Code's `/usage` screen reads — authorized with the
+//!   access token Claude Code persists in `~/.claude/.credentials.json`.
+//!   `five_hour` and `seven_day` carry `utilization` (percent used) and an
+//!   ISO 8601 `resets_at`. An expired token is refreshed with Claude Code's
+//!   own refresh-token grant and written back atomically, so desktop-only
+//!   setups (whose sessions never renew that file) keep reporting usage.
 //!
 //! Snapshots are cached per agent in [`UsageCache`] so the selected agent's
 //! data survives switching sources, and stale entries are refreshed on the
@@ -24,18 +31,23 @@ use std::time::{Duration, Instant};
 pub(crate) const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Agent whose usage limits are reported on the strip. Codex is the default
-/// because it is the bridge's primary agent; ZCode is opt-in.
+/// because it is the bridge's primary agent; pressing another agent's task
+/// card switches the source to that agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UsageAgent {
     Codex,
     ZCode,
+    Claude,
 }
 
 impl UsageAgent {
+    pub(crate) const ALL: [Self; 3] = [Self::Codex, Self::ZCode, Self::Claude];
+
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "codex" => Some(Self::Codex),
             "zcode" => Some(Self::ZCode),
+            "claude" => Some(Self::Claude),
             _ => None,
         }
     }
@@ -44,16 +56,47 @@ impl UsageAgent {
         match self {
             Self::Codex => "codex",
             Self::ZCode => "zcode",
+            Self::Claude => "claude",
         }
     }
 
-    /// Maps a routing agent to its usage counterpart. Hermes and Claude
-    /// report no usage limits to the bridge, so they have none.
+    /// Maps a routing agent to its usage counterpart. Hermes reports no
+    /// usage limits to the bridge, and T3 Code delegates to whichever provider
+    /// harness backs the pressed thread (resolved via [`Self::from_task`]).
     pub(crate) fn from_agent(agent: crate::routing::AgentId) -> Option<Self> {
         match agent {
             crate::routing::AgentId::Codex => Some(Self::Codex),
             crate::routing::AgentId::ZCode => Some(Self::ZCode),
-            crate::routing::AgentId::Hermes | crate::routing::AgentId::Claude => None,
+            crate::routing::AgentId::Claude => Some(Self::Claude),
+            crate::routing::AgentId::Hermes | crate::routing::AgentId::T3 => None,
+        }
+    }
+
+    /// Maps a pressed/selected task to its usage counterpart. For T3 Code,
+    /// follows the underlying provider harness (`codex`, `claudeAgent`,
+    /// `glm`/Z.ai); providers without a usage endpoint return `None` so the
+    /// current usage source stays visible rather than blanking.
+    pub(crate) fn from_task(agent: crate::routing::AgentId, provider: Option<&str>) -> Option<Self> {
+        if agent != crate::routing::AgentId::T3 {
+            return Self::from_agent(agent);
+        }
+        let lower = provider?.trim().to_ascii_lowercase();
+        if lower == "codex" || lower.ends_with("_codex") {
+            Some(Self::Codex)
+        } else if lower == "claudeagent" || lower == "claude" || lower.contains("claude") {
+            Some(Self::Claude)
+        } else if lower.contains("glm") || lower.contains("zcode") || lower.contains("zai") {
+            Some(Self::ZCode)
+        } else {
+            None
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Codex => 0,
+            Self::ZCode => 1,
+            Self::Claude => 2,
         }
     }
 }
@@ -82,10 +125,9 @@ impl UsageSnapshot {
 /// Per-agent cache of the last fetched snapshot.
 #[derive(Debug, Default)]
 pub struct UsageCache {
-    codex: Option<UsageSnapshot>,
-    zcode: Option<UsageSnapshot>,
-    codex_refreshed_at: Option<Instant>,
-    zcode_refreshed_at: Option<Instant>,
+    /// Indexed by [`UsageAgent::index`].
+    snapshots: [Option<UsageSnapshot>; 3],
+    refreshed_at: [Option<Instant>; 3],
     pending: Vec<(UsageAgent, std::sync::mpsc::Receiver<UsageSnapshot>)>,
 }
 
@@ -116,18 +158,15 @@ impl UsageCache {
     }
 
     pub(crate) fn snapshot(&self, agent: UsageAgent) -> Option<UsageSnapshot> {
-        match agent {
-            UsageAgent::Codex => self.codex,
-            UsageAgent::ZCode => self.zcode,
-        }
+        self.snapshots[agent.index()]
     }
 
     /// Serializes every fetched snapshot by agent name so plugin-side
-    /// displays can render codex and zcode usage simultaneously. Agents
+    /// displays can render several agents' usage simultaneously. Agents
     /// that were never fetched are omitted.
     pub(crate) fn usage_map(&self) -> Value {
         let mut map = serde_json::Map::new();
-        for agent in [UsageAgent::Codex, UsageAgent::ZCode] {
+        for agent in UsageAgent::ALL {
             if let Some(snapshot) = self.snapshot(agent) {
                 map.insert(agent.as_str().to_owned(), snapshot.to_value());
             }
@@ -137,11 +176,7 @@ impl UsageCache {
 
     /// True when the agent's snapshot was refreshed within `max_age`.
     pub(crate) fn refreshed_within(&self, agent: UsageAgent, max_age: Duration) -> bool {
-        let refreshed_at = match agent {
-            UsageAgent::Codex => self.codex_refreshed_at,
-            UsageAgent::ZCode => self.zcode_refreshed_at,
-        };
-        refreshed_at.is_some_and(|at| at.elapsed() < max_age)
+        self.refreshed_at[agent.index()].is_some_and(|at| at.elapsed() < max_age)
     }
 
     /// Stores one agent's freshly fetched snapshot. `refreshed_at` moves
@@ -149,16 +184,8 @@ impl UsageCache {
     /// event. Returns true when the stored snapshot changed.
     pub(crate) fn store(&mut self, agent: UsageAgent, snapshot: UsageSnapshot) -> bool {
         let changed = self.snapshot(agent) != Some(snapshot);
-        match agent {
-            UsageAgent::Codex => {
-                self.codex = Some(snapshot);
-                self.codex_refreshed_at = Some(Instant::now());
-            }
-            UsageAgent::ZCode => {
-                self.zcode = Some(snapshot);
-                self.zcode_refreshed_at = Some(Instant::now());
-            }
-        }
+        self.snapshots[agent.index()] = Some(snapshot);
+        self.refreshed_at[agent.index()] = Some(Instant::now());
         changed
     }
 }
@@ -168,6 +195,7 @@ pub(crate) fn fetch_usage(agent: UsageAgent) -> UsageSnapshot {
     match agent {
         UsageAgent::Codex => fetch_codex_usage(),
         UsageAgent::ZCode => fetch_zcode_usage(),
+        UsageAgent::Claude => fetch_claude_usage(),
     }
 }
 
@@ -345,6 +373,313 @@ fn parse_zcode_quota(body: &Value) -> UsageSnapshot {
     usage
 }
 
+/// Claude Code's config directory: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
+fn claude_config_dir() -> std::path::PathBuf {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::path::Path::new(&home_dir()).join(".claude"),
+    }
+}
+
+/// Claude Code's OAuth client and token endpoint (from its own config).
+const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+
+fn read_json_file(path: &std::path::Path) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Returns a usable Claude Code access token from `.credentials.json`,
+/// refreshing it the same way Claude Code does when it has expired. Sessions
+/// hosted by the desktop app authenticate through the app and never renew
+/// this file, so without the refresh the token goes stale within hours.
+fn claude_access_token(now_ms: u64) -> Option<String> {
+    let path = claude_config_dir().join(".credentials.json");
+    let credentials = read_json_file(&path)?;
+    if let Some(token) = claude_access_token_from(&credentials, now_ms) {
+        return Some(token);
+    }
+    refresh_claude_token(&path, &credentials, now_ms)
+}
+
+/// Hash of the last refresh token the server rejected, so a revoked login is
+/// not retried every refresh tick (the token itself is not kept around).
+static REJECTED_REFRESH_TOKEN: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+fn token_fingerprint(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Exchanges the stored refresh token for a new access token and writes the
+/// result back so Claude Code (which watches the file) picks it up too.
+fn refresh_claude_token(path: &std::path::Path, credentials: &Value, now_ms: u64) -> Option<String> {
+    let (refresh_token, body) = claude_refresh_request(credentials)?;
+    let fingerprint = token_fingerprint(&refresh_token);
+    if *REJECTED_REFRESH_TOKEN.lock().ok()? == Some(fingerprint) {
+        return None;
+    }
+    let response = match ureq::post(CLAUDE_OAUTH_TOKEN_URL)
+        .set("Content-Type", "application/json")
+        .set("User-Agent", "claude-code")
+        .timeout(Duration::from_secs(15))
+        .send_json(body)
+    {
+        Ok(response) => response.into_json::<Value>().ok()?,
+        Err(ureq::Error::Status(status, response)) => {
+            // Only the OAuth error code and description are logged; error
+            // bodies carry no tokens, but nothing else is echoed regardless.
+            let reason = response
+                .into_json::<Value>()
+                .ok()
+                .map(|body| {
+                    ["error", "error_description"]
+                        .iter()
+                        .filter_map(|key| body.get(*key).and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(": ")
+                })
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or_else(|| "no reason given".to_owned());
+            eprintln!("Claude token refresh rejected (HTTP {status}): {reason}");
+            crate::diaglog::log(&format!("claude token refresh rejected: HTTP {status} {reason}"));
+            if matches!(status, 400 | 401 | 403) {
+                if let Ok(mut rejected) = REJECTED_REFRESH_TOKEN.lock() {
+                    *rejected = Some(fingerprint);
+                }
+            }
+            return None;
+        }
+        Err(error) => {
+            eprintln!("Claude token refresh failed: {error}");
+            return None;
+        }
+    };
+    // Claude Code may have refreshed while the request was in flight: if the
+    // file moved on to a token that works, keep that one untouched.
+    let current = read_json_file(path).unwrap_or_else(|| credentials.clone());
+    let stored_refresh = current
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("refreshToken"))
+        .and_then(Value::as_str);
+    if stored_refresh != Some(refresh_token.as_str()) {
+        if let Some(token) = claude_access_token_from(&current, now_ms) {
+            return Some(token);
+        }
+    }
+    let updated = apply_claude_refresh(&current, &response, now_ms)?;
+    let token = updated["claudeAiOauth"]["accessToken"].as_str()?.to_owned();
+    if let Err(error) = write_credentials_atomically(path, &updated) {
+        // The new token still works for this fetch; the next tick retries the
+        // write with the (possibly rotated) refresh token it can still read.
+        eprintln!("Claude credentials write-back failed: {error}");
+    }
+    Some(token)
+}
+
+/// Builds Claude Code's refresh-token grant: the stored refresh token, its
+/// OAuth client id, and the scopes the login was granted.
+fn claude_refresh_request(credentials: &Value) -> Option<(String, Value)> {
+    let oauth = credentials.get("claudeAiOauth")?;
+    let refresh_token = oauth.get("refreshToken")?.as_str()?.trim().to_owned();
+    if refresh_token.is_empty() {
+        return None;
+    }
+    let mut body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+    });
+    let scopes: Vec<&str> = oauth
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|scopes| scopes.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !scopes.is_empty() {
+        body["scope"] = Value::from(scopes.join(" "));
+    }
+    Some((refresh_token, body))
+}
+
+/// Merges a token-endpoint response into the credentials, keeping every
+/// other field. A response without a new refresh token keeps the old one.
+fn apply_claude_refresh(credentials: &Value, response: &Value, now_ms: u64) -> Option<Value> {
+    let access_token = response.get("access_token")?.as_str()?.trim();
+    let expires_in = response.get("expires_in").and_then(Value::as_u64)?;
+    if access_token.is_empty() {
+        return None;
+    }
+    let mut updated = credentials.clone();
+    let oauth = updated.get_mut("claudeAiOauth")?.as_object_mut()?;
+    oauth.insert("accessToken".to_owned(), Value::from(access_token));
+    if let Some(refresh) = response.get("refresh_token").and_then(Value::as_str) {
+        if !refresh.trim().is_empty() {
+            oauth.insert("refreshToken".to_owned(), Value::from(refresh.trim()));
+        }
+    }
+    oauth.insert(
+        "expiresAt".to_owned(),
+        Value::from(now_ms.saturating_add(expires_in.saturating_mul(1000))),
+    );
+    if let Some(scope) = response.get("scope").and_then(Value::as_str) {
+        let scopes: Vec<Value> = scope.split_whitespace().map(Value::from).collect();
+        if !scopes.is_empty() {
+            oauth.insert("scopes".to_owned(), Value::Array(scopes));
+        }
+    }
+    Some(updated)
+}
+
+/// Replaces the credentials file in one step (write a sibling temp file,
+/// then rename over the original) so a reader never sees a partial file.
+fn write_credentials_atomically(path: &std::path::Path, credentials: &Value) -> Result<(), String> {
+    let temp = path.with_extension("json.micro-emu-tmp");
+    let text = serde_json::to_string(credentials).map_err(|error| error.to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        use std::io::Write;
+        let mut file = options.open(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(|error| error.to_string())
+}
+
+fn claude_access_token_from(credentials: &Value, now_ms: u64) -> Option<String> {
+    let oauth = credentials.get("claudeAiOauth")?;
+    // One minute of slack so a token is not sent seconds before it expires.
+    if oauth
+        .get("expiresAt")
+        .and_then(Value::as_u64)
+        .is_some_and(|expires_at| expires_at <= now_ms.saturating_add(60_000))
+    {
+        return None;
+    }
+    let token = oauth.get("accessToken")?.as_str()?.trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
+/// Fetches live Claude plan usage from the Anthropic OAuth usage endpoint.
+pub(crate) fn fetch_claude_usage() -> UsageSnapshot {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let Some(token) = claude_access_token(now_ms) else {
+        return UsageSnapshot::default();
+    };
+    let response = match ureq::get("https://api.anthropic.com/api/oauth/usage")
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("anthropic-beta", "oauth-2025-04-20")
+        .set("User-Agent", "claude-code")
+        .set("Accept", "application/json")
+        .timeout(Duration::from_secs(10))
+        .call()
+    {
+        Ok(response) => response,
+        Err(_) => return UsageSnapshot::default(),
+    };
+    match response.into_json::<Value>() {
+        Ok(body) => parse_claude_usage(&body),
+        Err(_) => UsageSnapshot::default(),
+    }
+}
+
+/// Parses an `/api/oauth/usage` payload: `five_hour` is the session window,
+/// `seven_day` the weekly one; `utilization` is percent used (0-100).
+fn parse_claude_usage(body: &Value) -> UsageSnapshot {
+    let window = |key: &str| -> (Option<u8>, Option<u64>) {
+        let Some(window) = body.get(key).filter(|window| window.is_object()) else {
+            return (None, None);
+        };
+        let remaining = window
+            .get("utilization")
+            .and_then(Value::as_f64)
+            .map(remaining_from_used);
+        let reset_at = window
+            .get("resets_at")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_epoch_secs);
+        (remaining, reset_at)
+    };
+    let (five_hour_remaining, five_hour_reset_at) = window("five_hour");
+    let (weekly_remaining, weekly_reset_at) = window("seven_day");
+    UsageSnapshot {
+        five_hour_remaining,
+        weekly_remaining,
+        five_hour_reset_at,
+        weekly_reset_at,
+    }
+}
+
+/// Parses an RFC 3339 / ISO 8601 timestamp such as
+/// `2026-11-19T21:00:00.123456+00:00` or `...Z` into epoch seconds.
+fn parse_rfc3339_epoch_secs(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    if !matches!(bytes[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let text = value.get(range)?;
+        text.bytes().all(|b| b.is_ascii_digit()).then(|| text.parse().ok())?
+    };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Skip fractional seconds, then read the zone designator.
+    let mut rest = &value[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        rest = &fraction[digits..];
+    }
+    let offset_secs = match rest {
+        "Z" | "z" | "" => 0,
+        zone => {
+            let sign = match zone.as_bytes().first()? {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let zone = zone[1..].replace(':', "");
+            if zone.len() != 4 || !zone.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let hours: i64 = zone[..2].parse().ok()?;
+            let minutes: i64 = zone[2..].parse().ok()?;
+            sign * (hours * 3600 + minutes * 60)
+        }
+    };
+    // Days from civil (Howard Hinnant's algorithm).
+    let shifted_year = if month <= 2 { year - 1 } else { year };
+    let era = shifted_year.div_euclid(400);
+    let year_of_era = shifted_year - era * 400;
+    let month_index = (month + 9) % 12;
+    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs;
+    u64::try_from(secs).ok()
+}
+
 /// Converts a used percentage into a clamped remaining percentage.
 fn remaining_from_used(used_percent: f64) -> u8 {
     (100.0 - used_percent).round().clamp(0.0, 100.0) as u8
@@ -368,8 +703,132 @@ mod tests {
     fn parses_usage_agents() {
         assert_eq!(UsageAgent::parse("codex"), Some(UsageAgent::Codex));
         assert_eq!(UsageAgent::parse(" ZCode "), Some(UsageAgent::ZCode));
+        assert_eq!(UsageAgent::parse("Claude"), Some(UsageAgent::Claude));
         assert_eq!(UsageAgent::parse("hermes"), None);
         assert_eq!(UsageAgent::Codex.as_str(), "codex");
+        assert_eq!(UsageAgent::Claude.as_str(), "claude");
+        assert_eq!(
+            UsageAgent::from_agent(crate::routing::AgentId::Claude),
+            Some(UsageAgent::Claude)
+        );
+        assert_eq!(UsageAgent::from_agent(crate::routing::AgentId::Hermes), None);
+    }
+
+    #[test]
+    fn parses_claude_usage_payload() {
+        // Shape of `/api/oauth/usage` as Claude Code models it: each window
+        // has a nullable `utilization` (percent used) and ISO `resets_at`.
+        let body = json!({
+            "five_hour": {"utilization": 41.6, "resets_at": "2026-11-19T21:00:00.512345+00:00"},
+            "seven_day": {"utilization": 12.0, "resets_at": "2026-11-24T08:00:00Z"},
+            "seven_day_opus": null,
+            "extra_usage": {"is_enabled": false}
+        });
+        let usage = parse_claude_usage(&body);
+        assert_eq!(usage.five_hour_remaining, Some(58));
+        assert_eq!(usage.five_hour_reset_at, Some(1_795_122_000));
+        assert_eq!(usage.weekly_remaining, Some(88));
+        assert_eq!(usage.weekly_reset_at, Some(1_795_507_200));
+    }
+
+    #[test]
+    fn claude_usage_tolerates_missing_and_null_windows() {
+        assert_eq!(parse_claude_usage(&json!({})), UsageSnapshot::default());
+        let usage = parse_claude_usage(&json!({
+            "five_hour": {"utilization": null, "resets_at": null},
+            "seven_day": null
+        }));
+        assert_eq!(usage, UsageSnapshot::default());
+    }
+
+    #[test]
+    fn parses_rfc3339_offsets() {
+        assert_eq!(parse_rfc3339_epoch_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339_epoch_secs("2026-11-19T23:00:00+02:00"),
+            Some(1_795_122_000)
+        );
+        assert_eq!(
+            parse_rfc3339_epoch_secs("2024-02-29T12:00:00-05:30"),
+            Some(1_709_227_800)
+        );
+        assert_eq!(parse_rfc3339_epoch_secs("not a date"), None);
+        assert_eq!(parse_rfc3339_epoch_secs("2026-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn builds_claude_refresh_grant_from_stored_login() {
+        let credentials = json!({"claudeAiOauth": {
+            "accessToken": "old", "refreshToken": " r1 ", "expiresAt": 1,
+            "scopes": ["user:inference", "user:profile"]
+        }});
+        let (refresh, body) = claude_refresh_request(&credentials).unwrap();
+        assert_eq!(refresh, "r1");
+        assert_eq!(body["grant_type"], "refresh_token");
+        assert_eq!(body["refresh_token"], "r1");
+        assert_eq!(body["client_id"], CLAUDE_OAUTH_CLIENT_ID);
+        assert_eq!(body["scope"], "user:inference user:profile");
+        let no_scopes = json!({"claudeAiOauth": {"refreshToken": "r1"}});
+        assert!(claude_refresh_request(&no_scopes).unwrap().1.get("scope").is_none());
+        assert!(claude_refresh_request(&json!({"claudeAiOauth": {"refreshToken": ""}})).is_none());
+        assert!(claude_refresh_request(&json!({})).is_none());
+    }
+
+    #[test]
+    fn claude_refresh_response_merges_into_credentials() {
+        let credentials = json!({
+            "claudeAiOauth": {
+                "accessToken": "old", "refreshToken": "r1", "expiresAt": 1,
+                "scopes": ["user:inference"], "subscriptionType": "max"
+            },
+            "mcpOAuth": {"kept": true}
+        });
+        let response = json!({
+            "access_token": "new", "refresh_token": "r2", "expires_in": 28_800,
+            "scope": "user:inference user:profile"
+        });
+        let updated = apply_claude_refresh(&credentials, &response, 1_000).unwrap();
+        let oauth = &updated["claudeAiOauth"];
+        assert_eq!(oauth["accessToken"], "new");
+        assert_eq!(oauth["refreshToken"], "r2");
+        assert_eq!(oauth["expiresAt"], 1_000 + 28_800_000);
+        assert_eq!(oauth["scopes"], json!(["user:inference", "user:profile"]));
+        assert_eq!(oauth["subscriptionType"], "max");
+        assert_eq!(updated["mcpOAuth"]["kept"], true);
+        // No rotated refresh token or scope: the stored ones stay.
+        let updated =
+            apply_claude_refresh(&credentials, &json!({"access_token": "new", "expires_in": 60}), 0)
+                .unwrap();
+        assert_eq!(updated["claudeAiOauth"]["refreshToken"], "r1");
+        assert_eq!(updated["claudeAiOauth"]["scopes"], json!(["user:inference"]));
+        // Malformed responses never produce credentials.
+        assert!(apply_claude_refresh(&credentials, &json!({"expires_in": 60}), 0).is_none());
+        assert!(apply_claude_refresh(&credentials, &json!({"access_token": "new"}), 0).is_none());
+    }
+
+    #[test]
+    fn credentials_are_replaced_atomically() {
+        let dir = std::env::temp_dir().join(format!("micro-emu-cred-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+        std::fs::write(&path, r#"{"claudeAiOauth":{"accessToken":"old"}}"#).unwrap();
+        write_credentials_atomically(&path, &json!({"claudeAiOauth": {"accessToken": "new"}}))
+            .unwrap();
+        assert_eq!(read_json_file(&path).unwrap()["claudeAiOauth"]["accessToken"], "new");
+        assert!(!path.with_extension("json.micro-emu-tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn expired_claude_tokens_are_never_sent() {
+        let credentials = json!({"claudeAiOauth": {"accessToken": "tok", "expiresAt": 2_000_000}});
+        assert_eq!(
+            claude_access_token_from(&credentials, 1_000_000).as_deref(),
+            Some("tok")
+        );
+        assert_eq!(claude_access_token_from(&credentials, 1_990_000), None);
+        assert_eq!(claude_access_token_from(&credentials, 3_000_000), None);
+        assert_eq!(claude_access_token_from(&json!({}), 0), None);
     }
 
     #[test]

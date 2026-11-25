@@ -220,20 +220,32 @@ mod native {
         let Some(session) = super::desktop_session_id(task_id) else {
             return;
         };
-        let url = format!("claude://code/continue?session={session}");
-        // `start` returns once the protocol handler is launched; spawning keeps
-        // the daemon loop from waiting on it.
-        if let Err(error) = Command::new("cmd.exe")
-            .args(["/C", "start", "", &url])
+        if let Err(error) = open_deep_link(&format!("claude://code/continue?session={session}")) {
+            eprintln!("Claude session selection failed: {error}");
+            crate::diaglog::log(&format!("claude session selection failed: {error}"));
+        }
+    }
+
+    /// Opens a new Code-tab session in the Claude desktop app through its
+    /// `claude://code/new` deep link, the route the app registers for
+    /// "Open in Claude".
+    pub fn start_new_session() -> Result<(), String> {
+        open_deep_link("claude://code/new")
+    }
+
+    /// Hands a fixed `claude://` URL to the app's protocol handler. `start`
+    /// returns once the handler is launched; spawning keeps the daemon loop
+    /// from waiting on it. Callers only pass URLs built from validated parts.
+    fn open_deep_link(url: &str) -> Result<(), String> {
+        Command::new("cmd.exe")
+            .args(["/C", "start", "", url])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-        {
-            eprintln!("Claude session selection failed: {error}");
-            crate::diaglog::log(&format!("claude session selection failed: {error}"));
-        }
+            .map(drop)
+            .map_err(|error| error.to_string())
     }
 
     pub fn minimize() -> Result<(), String> {
@@ -400,7 +412,7 @@ mod native {
 #[cfg(windows)]
 pub use native::{
     desktop_running, is_foreground, microphone_active, minimize, request_session_selection,
-    set_microphone, show_and_focus,
+    set_microphone, show_and_focus, start_new_session,
 };
 
 /// Extracts the desktop host session id from a `claude:<id>` task id. The app
@@ -448,6 +460,10 @@ pub fn show_and_focus() -> Result<(), String> {
 }
 #[cfg(not(windows))]
 pub fn request_session_selection(_task_id: &str) {}
+#[cfg(not(windows))]
+pub fn start_new_session() -> Result<(), String> {
+    Err("Claude window control is only available on Windows".to_owned())
+}
 #[cfg(not(windows))]
 pub fn microphone_active() -> bool {
     false

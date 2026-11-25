@@ -218,15 +218,17 @@ export class DaemonClient extends EventEmitter {
         this.send({ type: "event", kind: "model-cycle" });
     }
 
-    /** Selects which agent's usage limits feed the usage displays. */
-    sendUsageAgent(agent: "codex" | "zcode"): void {
+    /** Selects which agent's usage limits feed the usage displays. The
+     * bridge also switches on its own whenever a task card is pressed. */
+    sendUsageAgent(agent: "codex" | "zcode" | "claude"): void {
         this.send({ type: "event", kind: "usage-agent", agent });
     }
 
-    /** Asks the daemon to start a new task in the ZCode desktop app.
-     * Resolves true when ZCode is the foreground app and the daemon queued
-     * the creation; resolves false when ZCode is not focused, the daemon is
-     * unreachable, or the reply times out (older bridges never answer). */
+    /** Asks the daemon to start a new task in the focused ZCode, Hermes or
+     * Claude desktop app. Resolves true when one of them is the foreground
+     * app and the daemon started the creation; resolves false when none is
+     * focused, the daemon is unreachable, or the reply times out (older
+     * bridges never answer). */
     requestZcodeNewTask(timeoutMs = 3_000): Promise<boolean> {
         if (!this.connected) {
             return Promise.resolve(false);

@@ -18,13 +18,20 @@ import {
     sendClick,
     type CruxDialSettings,
 } from "./dial-common";
-import { isPendingApproval, normalizeUsageAgent, sendApprovalDecision, type UsageAgent } from "./context";
+import {
+    isPendingApproval,
+    normalizeUsageAgent,
+    sendApprovalDecision,
+    upgradeUsageAgentSettings,
+    type UsageAgent,
+} from "./context";
 
 /** Crux V settings: the dial click assignment plus the usage source shown
- * on the touch strip (independent per dial, so two dials can show codex and
- * zcode side by side). */
+ * on the touch strip: "auto" follows the last pressed agent, or a pinned
+ * agent per dial so several can be shown side by side. */
 export interface CruxVSettings extends CruxDialSettings {
     usageAgent?: UsageAgent;
+    usageAgentVersion?: number;
 }
 
 /**
@@ -32,7 +39,7 @@ export interface CruxVSettings extends CruxDialSettings {
  * Micro crux. Rotation sends `EncoderTurn` index 2 (radial Y); press
  * sends an assignable action from the shared action catalog (default: the
  * native encoder-2 press, ACT10 / Mic). The touch strip shows the usage
- * limits (5-hourly and weekly) of the configured source agent as bars with
+ * limits (5-hourly and weekly) of the selected or pinned agent as bars with
  * exact percentages.
  */
 @action({ UUID: "com.micro-emu.codex.crux-v" })
@@ -51,7 +58,7 @@ export class CruxVerticalAction extends SingletonAction<CruxVSettings> {
         if (action.isDial()) {
             action.setFeedbackLayout("layouts/canvas.json");
         }
-        this.refresh(action, ev.payload.settings);
+        this.refresh(action, upgradeUsageAgentSettings(action, ev.payload.settings));
     }
 
     onDidReceiveSettings(ev: DidReceiveSettingsEvent<CruxVSettings>): void {
@@ -103,9 +110,9 @@ export class CruxVerticalAction extends SingletonAction<CruxVSettings> {
             action.setFeedback({ canvas: renderStripOffline("CRUX V") });
             return;
         }
-        // Each dial renders its own configured source, so codex and zcode
-        // usage can be displayed at the same time on separate dials.
-        const agent = normalizeUsageAgent(settings.usageAgent);
+        // Auto follows the last pressed agent; a pinned dial renders its own
+        // source, so several agents can be displayed side by side.
+        const agent = this.ctx.resolveUsageAgent(normalizeUsageAgent(settings.usageAgent));
         const ctx: StripContext = {
             ...this.ctx.getSelectedDisplayContext(),
             ...this.ctx.getUsageFields(agent),

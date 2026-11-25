@@ -95,14 +95,56 @@ source checkout.
   focuses its message composer and opens Windows dictation (`Win+H`); release
   closes the dictation bar — the same hold-to-talk behaviour as ZCode and
   Hermes.
+- **Open** (and the Context key's Task press) on a selected Claude card
+  opens that session in Claude Desktop through the same deep link; a
+  terminal-only session just brings the app forward.
+- **New task** while Claude Desktop is the foreground window opens a new
+  Code-tab session through `claude://code/new`.
 - **Copy path / Copy prompt / Copy response** on a selected Claude card read
-  the local transcript; other agent actions fail closed and are never sent to
-  Codex.
+  the local transcript. Retry, Fork, Archive, Review, Run tests, Compact and
+  Settings have no Claude integration; they fail closed and are never sent
+  to Codex.
+
+## Usage limits
+
+The usage screens (Context key in Usage mode, the Crux V strip, the Stream
+Deck + / AJAZZ strips) show the limits of the **last agent whose task card
+was pressed** or navigated to. Pressing a Claude card switches them to
+Claude's 5-hour and weekly windows; pressing a Codex or ZCode card switches
+back. Hermes has no usage source, so pressing a Hermes card leaves the
+previous agent's limits on screen (the strip label always names the agent).
+
+In the Stream Deck property inspector, **Usage Source** defaults to *Last
+pressed agent*. Picking Codex, ZCode or Claude pins that key or dial to one
+agent instead. Keys saved before this option existed may still be pinned to
+Codex; switch them to *Last pressed agent* to follow the selection.
+
+Claude usage comes from the same endpoint Claude Code's `/usage` screen
+reads, `GET https://api.anthropic.com/api/oauth/usage`, authorized with the
+access token Claude Code stores in `~/.claude/.credentials.json`
+(`$CLAUDE_CONFIG_DIR` if set).
+
+Sessions hosted by the desktop app authenticate through the app and never
+renew that file, so the bridge renews it itself. Once the stored access
+token has expired it makes Claude Code's own refresh-token grant
+(`POST https://platform.claude.com/v1/oauth/token`, Claude Code's client id
+and the login's stored scopes) and writes the new tokens back:
+
+- Only the `claudeAiOauth` token fields change; every other field is kept.
+- The file is replaced in one step (temp file, then rename), so readers
+  never see a partial file. Claude Code watches the file and picks up the
+  new tokens.
+- If Claude Code renewed the file while the request was in flight, its
+  token is used and the bridge's result is dropped.
+- A refresh token the server rejects is not retried until the file
+  changes; the reason is logged (`Claude token refresh rejected ...`).
+
+`rp2040-bridge --print-usage claude` runs one fetch the way the daemon
+does and prints only the parsed percentages.
 
 ## Not supported yet
 
-- The **New task** key with Claude focused still falls back to the Codex
-  new-task screen.
-- Claude usage limits (5-hour / weekly) on the Context key: the desktop app
-  keeps its OAuth tokens in encrypted storage, so the bridge has no
-  credential-free source for them.
+- A login whose refresh token the server no longer accepts (signed out,
+  revoked, or replaced by a newer login) cannot be renewed: run `claude`
+  in a terminal and sign in with `/login` once, after which the bridge keeps
+  it renewed.

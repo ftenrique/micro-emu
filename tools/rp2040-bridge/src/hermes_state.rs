@@ -304,6 +304,10 @@ fn build_cached_task(session: &Value) -> Option<Value> {
     };
     // Unknown turn dates must remain unknown, including across refresh/restart.
     // The caller enriches these from a current cached transcript when available.
+    let activity_ms = {
+        let secs = cached_session_activity(session);
+        (secs > 0.0).then(|| seconds_to_ms(secs))
+    };
     Some(json!({
         "task_id": task_id,
         "title": title,
@@ -314,6 +318,7 @@ fn build_cached_task(session: &Value) -> Option<Value> {
         "timing_authoritative": true,
         "started_at_ms": null,
         "finished_at_ms": null,
+        "updated_at_ms": activity_ms,
         "priority": priority,
         "context": {
             "project": project,
@@ -494,6 +499,12 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value 
     } else {
         TASK_PRIORITY_IDLE
     };
+    let updated_at_ms = activity
+        .latest_at
+        .filter(|ts| *ts > 0.0)
+        .map(seconds_to_ms)
+        .or(finished_at_ms)
+        .or(started_at_ms);
     json!({
         "task_id": task_id,
         "title": row.title,
@@ -505,6 +516,7 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value 
         "priority": priority,
         "started_at_ms": started_at_ms,
         "finished_at_ms": finished_at_ms,
+        "updated_at_ms": updated_at_ms,
         "timing_authoritative": true,
         "context": {
             "project": project,

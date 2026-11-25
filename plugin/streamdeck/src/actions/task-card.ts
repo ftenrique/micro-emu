@@ -17,7 +17,7 @@ export interface TaskCardSettings {
     /** Task-board slot index (0-based). */
     slot?: number | string;
     /** Fixed owner for this card, or auto for daemon-managed allocation. */
-    agent?: "auto" | "codex" | "claude" | "zcode" | "hermes";
+    agent?: "auto" | "codex" | "claude" | "zcode" | "hermes" | "t3";
 }
 
 type TaskCardInstance = KeyAction<TaskCardSettings> | DialAction<TaskCardSettings>;
@@ -68,6 +68,7 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
         const slot = Number(settings.slot ?? 0);
         const agent = settings.agent === "codex" || settings.agent === "claude"
             || settings.agent === "zcode" || settings.agent === "hermes"
+            || settings.agent === "t3"
             ? settings.agent : "auto";
         if (Number.isInteger(slot) && slot >= 0 && slot < TASK_SLOT_COUNT) {
             this.ctx.daemon.setTaskSlotAgent(slot, agent);
@@ -201,7 +202,9 @@ export class TaskCardAction extends SingletonAction<TaskCardSettings> {
         const enabled = taskCard ? Number(taskCard.e ?? 1) !== 0 : false;
         const status = taskCard ? statusForCard(taskCard) : "";
         const agent = taskCard
-            ? ((taskCard.agent as string) ?? null)
+            ? (typeof taskCard.agent_label === "string" && taskCard.agent_label.trim().length > 0
+                ? taskCard.agent_label.trim()
+                : ((taskCard.agent as string) ?? null))
             : null;
         const color = taskCard?.color ?? taskCard?.c;
         const selected = this.ctx.getSelectedTaskSlot() === slot;

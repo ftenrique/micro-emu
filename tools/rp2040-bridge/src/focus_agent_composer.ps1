@@ -32,9 +32,9 @@ function Find-ComposerCandidates {
                 $controlType -eq [System.Windows.Automation.ControlType]::Document
             if (-not $isTextInput) { continue }
 
-            # Search fields and sidebar filters are also Edit controls. They
-            # must never win over the message composer.
-            if ($name -match "(?i)search|filter|session|project|find") { continue }
+            # Search fields, sidebar filters, terminals, and preview URL bars
+            # are also Edit controls. They must never win over the message composer.
+            if ($name -match "(?i)search|filter|session|project|find|terminal|url|address") { continue }
 
             $rect = $current.BoundingRectangle
             if ($rect.Width -le 0 -or $rect.Height -le 0) { continue }

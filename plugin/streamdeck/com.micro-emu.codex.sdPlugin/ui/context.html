@@ -13,9 +13,11 @@
         </sdpi-select>
     </sdpi-item>
     <sdpi-item label="Usage Source">
-        <sdpi-select setting="usageAgent" default="codex">
+        <sdpi-select setting="usageAgent" default="auto">
+            <option value="auto">Last pressed agent</option>
             <option value="codex">Codex</option>
             <option value="zcode">ZCode</option>
+            <option value="claude">Claude</option>
         </sdpi-select>
     </sdpi-item>
     <sdpi-item label="Behavior">

@@ -41,13 +41,25 @@
                 <option value="task.copy-path" data-icon="clipboard" data-executor="Codex" data-description="Copy the selected Codex task's workspace path.">Copy workspace path</option>
             </optgroup>
             <optgroup label="Codex workflow">
-                <option value="agent.new-task" data-icon="new-chat" data-executor="Codex" data-description="Open the Codex new-task screen.">New task</option>
-                <option value="agent.search" data-icon="search" data-executor="Bridge" data-description="Focus Codex and open task search.">Search tasks</option>
+                <option value="agent.new-task" data-icon="new-chat" data-executor="Codex" data-description="Start a new task in the focused ZCode, Hermes, Claude or T3 Code app; otherwise open Codex.">New task</option>
+                <option value="agent.search" data-icon="search" data-executor="Bridge" data-description="Focus the selected agent (Codex, Hermes, or T3 Code) and open search.">Search tasks</option>
                 <option value="agent.review-changes" data-icon="review" data-executor="Codex" data-description="Start a Codex review of uncommitted workspace changes.">Review changes</option>
                 <option value="agent.run-tests" data-icon="tests" data-executor="Codex" data-description="Start a Codex turn that runs and diagnoses the relevant tests.">Run tests</option>
-                <option value="agent.open-terminal" data-icon="terminal" data-executor="Bridge" data-description="Focus Codex and toggle its bottom terminal.">Open terminal</option>
+                <option value="agent.open-terminal" data-icon="terminal" data-executor="Bridge" data-description="Focus the selected agent (Codex, Hermes, or T3 Code) and toggle its terminal.">Open terminal</option>
                 <option value="agent.compact-context" data-icon="compact" data-executor="Codex" data-description="Start Codex context compaction for the selected task.">Compact context</option>
                 <option value="agent.settings" data-icon="settings" data-executor="Codex" data-description="Open Codex settings.">Codex settings</option>
+            </optgroup>
+            <optgroup label="T3 Code">
+                <option value="t3.new-thread" data-icon="new-chat" data-executor="T3" data-description="Open a new thread in T3 Code Desktop (t3code://new).">T3: New thread</option>
+                <option value="t3.command-palette" data-icon="search" data-executor="T3" data-description="Focus T3 Code Desktop and open the command palette (Ctrl+K).">T3: Command palette</option>
+                <option value="t3.model-picker" data-icon="model" data-executor="T3" data-description="Focus T3 Code Desktop and open the model picker (Ctrl+Shift+M).">T3: Pick model</option>
+                <option value="t3.settle-thread" data-icon="approve" data-executor="T3" data-description="Focus T3 Code Desktop and toggle settled state for the active thread (Ctrl+Shift+S).">T3: Settle thread</option>
+                <option value="t3.pin-thread" data-icon="pin" data-executor="T3" data-description="Focus T3 Code Desktop and pin or unpin the active thread (Ctrl+Shift+P).">T3: Pin thread</option>
+                <option value="t3.toggle-preview" data-icon="browser" data-executor="T3" data-description="Focus T3 Code Desktop and toggle the built-in preview panel (Ctrl+Shift+J).">T3: Toggle preview</option>
+                <option value="t3.toggle-sidebar" data-icon="grid" data-executor="T3" data-description="Focus T3 Code Desktop and toggle the thread sidebar (Ctrl+B).">T3: Toggle sidebar</option>
+                <option value="t3.toggle-terminal" data-icon="terminal" data-executor="T3" data-description="Focus T3 Code Desktop and toggle the integrated terminal (Ctrl+J).">T3: Toggle terminal</option>
+                <option value="t3.copy-reference" data-icon="copy" data-executor="T3" data-description="Focus T3 Code Desktop and copy the active thread reference (Ctrl+Shift+C).">T3: Copy thread ref</option>
+                <option value="t3.open-usage" data-icon="info" data-executor="T3" data-description="Focus T3 Code Desktop and open the usage view (Ctrl+U).">T3: Open usage</option>
             </optgroup>
         </sdpi-select>
     </sdpi-item>

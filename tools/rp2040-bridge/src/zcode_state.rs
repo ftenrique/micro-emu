@@ -191,6 +191,7 @@ fn build_task(connection: &Connection, row: &SessionRow, now_ms: u128) -> Value 
         "workspace_path": row.directory,
         "state": state,
         "priority": priority,
+        "updated_at_ms": u64::try_from(row.time_updated).ok(),
         // A running turn without a finished request yet has no request start
         // timestamp; the session's last update is the closest stable anchor.
         "started_at_ms": (state != "queued").then_some(started_at_ms),

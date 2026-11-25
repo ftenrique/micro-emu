@@ -717,7 +717,8 @@ impl PhysicalController for StreamDeckDevice {
             } else {
                 colors[index] = Some((color & 0x00ff_ffff, (brightness * 100.0) as u8));
                 agents[index] = entry
-                    .get("agent")
+                    .get("agent_label")
+                    .or_else(|| entry.get("agent"))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
             }
@@ -842,6 +843,7 @@ fn render_usage_image(
     let limits_label = match context.usage_agent.as_deref() {
         Some("zcode") => "LIMITS ZCODE",
         Some("codex") => "LIMITS CODEX",
+        Some("claude") => "LIMITS CLAUDE",
         _ => "LIMITS",
     };
     draw_text(
@@ -1456,45 +1458,20 @@ fn encode_image_with_agent(
 }
 
 fn draw_agent_label(image: &mut RgbImage, agent: &str) {
-    let text = agent.to_ascii_lowercase();
-    let scale = (image.width().min(image.height()) / 32).max(2);
-    let width = text.chars().count() as u32 * (4 * scale);
+    let text = agent.to_ascii_uppercase();
+    let char_count = text.chars().count() as u32;
+    let max_width = image.width().saturating_sub(4);
+    let preferred_scale = (image.width().min(image.height()) / 48).max(1);
+    let mut scale = preferred_scale;
+    while scale > 1 && char_count.saturating_mul(6 * scale) > max_width {
+        scale -= 1;
+    }
+    let pitch = 6 * scale;
+    let max_chars = (max_width / pitch).max(1) as usize;
+    let drawn: String = text.chars().take(max_chars).collect();
+    let width = drawn.chars().count() as u32 * pitch;
     let start_x = image.width().saturating_sub(width) / 2;
-    for (index, ch) in text.chars().enumerate() {
-        let glyph = agent_glyph(ch);
-        for row in 0..5 {
-            for column in 0..3 {
-                if glyph[row * 3 + column] == 0 {
-                    continue;
-                }
-                for y in 0..scale {
-                    for x in 0..scale {
-                        image.put_pixel(
-                            start_x + index as u32 * 4 * scale + column as u32 * scale + x,
-                            4 + row as u32 * scale + y,
-                            Rgb([196, 194, 255]),
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn agent_glyph(ch: char) -> [u8; 15] {
-    match ch {
-        'c' => [0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 1],
-        'd' => [1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0],
-        'e' => [1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 1],
-        'h' => [1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1],
-        'm' => [1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1],
-        'o' => [0, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0],
-        'r' => [1, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1],
-        's' => [0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0],
-        'x' => [1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1],
-        'z' => [1, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1],
-        _ => [0; 15],
-    }
+    draw_text(image, &drawn, start_x, 4, scale, [196, 194, 255]);
 }
 #[cfg(test)]
 mod tests {

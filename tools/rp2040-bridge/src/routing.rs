@@ -1,10 +1,11 @@
 //! Agent routing, dynamic event partitioning and LCD slot fusion.
 //!
-//! The bridge serves up to four agents simultaneously: Codex (ChatGPT via
+//! The bridge serves up to five agents simultaneously: Codex (ChatGPT via
 //! HID + MCP), Claude (Claude Code / Claude Desktop, MCP only), ZCode (Z.ai
-//! ADE, MCP only) and Hermes (Nous Research desktop agent, MCP only). Physical controller events are partitioned dynamically
-//! based on which agents are currently active, and LCD status slots are fused
-//! so each agent only writes its assigned slots.
+//! ADE, MCP only), Hermes (Nous Research desktop agent, MCP only) and T3
+//! (T3 Code desktop app, MCP / read-only SQLite). Physical controller events
+//! are partitioned dynamically based on which agents are currently active, and
+//! LCD status slots are fused so each agent only writes its assigned slots.
 
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -13,19 +14,18 @@ use std::collections::VecDeque;
 pub const LCD_SLOTS: usize = 6;
 
 /// Number of agents supported by the bridge.
-pub const AGENT_COUNT: usize = 4;
+pub const AGENT_COUNT: usize = 5;
 
 /// Maximum buffered events per agent before the oldest are dropped.
 pub const EVENT_QUEUE_CAPACITY: usize = 256;
 
-/// Agents in priority order. Used for partition computation and repartition
-/// event ordering. Codex has the highest priority, then Claude, then ZCode,
-/// then Hermes.
+/// All supported agents in deterministic enumeration order.
 pub const AGENTS: [AgentId; AGENT_COUNT] = [
     AgentId::Codex,
     AgentId::Claude,
     AgentId::ZCode,
     AgentId::Hermes,
+    AgentId::T3,
 ];
 
 /// Identifies which agent a session represents.
@@ -35,6 +35,7 @@ pub enum AgentId {
     ZCode,
     Hermes,
     Claude,
+    T3,
 }
 
 impl AgentId {
@@ -44,8 +45,9 @@ impl AgentId {
             "zcode" => Ok(Self::ZCode),
             "hermes" => Ok(Self::Hermes),
             "claude" => Ok(Self::Claude),
+            "t3" => Ok(Self::T3),
             _ => Err(format!(
-                "agent must be codex, claude, zcode, or hermes (got {value})"
+                "agent must be codex, claude, zcode, hermes, or t3 (got {value})"
             )),
         }
     }
@@ -56,6 +58,7 @@ impl AgentId {
             Self::ZCode => "zcode",
             Self::Hermes => "hermes",
             Self::Claude => "claude",
+            Self::T3 => "t3",
         }
     }
 
@@ -66,6 +69,7 @@ impl AgentId {
             Self::ZCode => 1,
             Self::Hermes => 2,
             Self::Claude => 3,
+            Self::T3 => 4,
         }
     }
 }
@@ -151,6 +155,8 @@ impl Partition {
             owners[3..].fill(Some(AgentId::ZCode));
         } else if active.contains(AgentId::Hermes) {
             owners[3..].fill(Some(AgentId::Hermes));
+        } else if active.contains(AgentId::T3) {
+            owners[3..].fill(Some(AgentId::T3));
         }
 
         Self { owners }
@@ -287,6 +293,7 @@ impl EventRouting {
     pub fn new() -> Self {
         Self {
             queues: [
+                EventQueue::new(),
                 EventQueue::new(),
                 EventQueue::new(),
                 EventQueue::new(),
@@ -448,6 +455,19 @@ mod tests {
         assert_eq!(AgentId::ZCode.index(), 1);
         assert_eq!(AgentId::Hermes.index(), 2);
         assert_eq!(AgentId::Claude.index(), 3);
+        assert_eq!(AgentId::T3.index(), 4);
+    }
+
+    #[test]
+    fn t3_parses_and_claims_legacy_second_half_when_alone() {
+        assert_eq!(AgentId::parse("t3"), Ok(AgentId::T3));
+        assert_eq!(AgentId::T3.as_str(), "t3");
+        let partition = Partition::compute(ActiveSet::from_single(AgentId::T3));
+        assert_eq!(partition.slots_for(AgentId::T3), vec![3, 4, 5]);
+        assert_eq!(partition.owner_of(0), None);
+        let mut routing = EventRouting::new();
+        routing.route_button(3, true, 1, &partition);
+        assert_eq!(routing.queue(AgentId::T3).len(), 1);
     }
 
     #[test]

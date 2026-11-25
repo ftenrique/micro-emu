@@ -41,6 +41,10 @@ pub const CODEX_HID_SLOTS: usize = 6;
 pub const TASK_PRIORITY_ACTIVE: u64 = 75;
 /// Priority auto-fed task cards use while their agent is idle.
 pub const TASK_PRIORITY_IDLE: u64 = 40;
+/// Priority used for settled/archived-style threads (such as settled T3 Code
+/// threads) that should occupy free slots when available but be the first
+/// buttons reused when active or fresher tasks need a slot.
+pub const TASK_PRIORITY_SETTLED: u64 = 20;
 
 /// Returns the task title as it should appear on the Stream Deck strip.
 ///
@@ -166,6 +170,12 @@ pub struct TaskCard {
     pub task_id: String,
     pub owner_session: usize,
     pub owner_agent: AgentId,
+    /// Underlying provider harness identifier for multi-provider hosts such as
+    /// T3 Code (e.g. `"codex"`, `"claudeAgent"`, `"acpRegistry_google_antigravity"`).
+    pub provider: Option<String>,
+    /// Optional display label overriding the bare agent name on task buttons
+    /// (e.g. `"T3-Codex"`, `"T3-Claude"`, `"T3-Antigravity"`).
+    pub agent_label: Option<String>,
     pub title: String,
     pub project: Option<String>,
     pub workspace_path: Option<String>,
@@ -601,6 +611,8 @@ impl TaskBoard {
         if legacy_key.as_deref() == Some(title.as_str()) {
             title.clear();
         }
+        let provider = text_field("provider");
+        let agent_label = text_field("agent_label");
         let project = text_field("project");
         let workspace_path = text_field("workspace_path");
         let model = text_field("model");
@@ -658,6 +670,8 @@ impl TaskBoard {
             });
         let explicit_started_at = parse_timestamp_ms(object.get("started_at_ms"))?;
         let explicit_finished_at = parse_timestamp_ms(object.get("finished_at_ms"))?;
+        let explicit_updated_at = parse_timestamp_ms(object.get("updated_at_ms"))?
+            .or(parse_timestamp_ms(object.get("recency_at_ms"))?);
         let timing_authoritative = object
             .get("timing_authoritative")
             .and_then(Value::as_bool)
@@ -668,6 +682,8 @@ impl TaskBoard {
             task_id,
             owner_session: session,
             owner_agent: agent,
+            provider,
+            agent_label,
             title,
             project,
             workspace_path,
@@ -682,7 +698,10 @@ impl TaskBoard {
             legacy_key,
             source_slot,
             timing_authoritative,
-            updated_at_ms: now_ms,
+            updated_at_ms: explicit_updated_at
+                .or(explicit_finished_at)
+                .or(explicit_started_at)
+                .unwrap_or(now_ms),
             started_at_ms: explicit_started_at.or_else(|| (!timing_authoritative && state.active()).then_some(now_ms)),
             finished_at_ms: explicit_finished_at
                 .or_else(|| (!timing_authoritative && state == TaskState::Completed).then_some(now_ms)),
@@ -1068,6 +1087,8 @@ impl TaskBoard {
                     "progress": task.progress,
                     "task_id": task.task_id,
                     "agent": task.owner_agent.as_str(),
+                    "provider": task.provider,
+                    "agent_label": task.agent_label,
                     "started_at_ms": task.started_at_ms,
                     "finished_at_ms": task.finished_at_ms,
                     "source_slot": task.source_slot,
@@ -1115,11 +1136,22 @@ impl TaskBoard {
     pub fn status_json(&self) -> Value {
         let tasks = self.tasks.values().map(|task| {
             let assignment = self.assignment(&task.task_id).map(|a| json!({"device_id": a.slot.device_id, "slot": a.slot.slot}));
-            json!({"task_id": task.task_id, "owner_session": task.owner_session, "owner_agent": task.owner_agent.as_str(), "title": task.title, "project": task.project, "workspace_path": task.workspace_path, "model": task.model, "effort": task.effort, "state": task.state.as_str(), "priority": task.priority, "progress": task.progress, "started_at_ms": task.started_at_ms, "finished_at_ms": task.finished_at_ms, "source_slot": task.source_slot, "assignment": assignment, "reconnect_until_ms": task.reconnect_until_ms})
+            json!({"task_id": task.task_id, "owner_session": task.owner_session, "owner_agent": task.owner_agent.as_str(), "provider": task.provider, "agent_label": task.agent_label, "title": task.title, "project": task.project, "workspace_path": task.workspace_path, "model": task.model, "effort": task.effort, "state": task.state.as_str(), "priority": task.priority, "progress": task.progress, "started_at_ms": task.started_at_ms, "finished_at_ms": task.finished_at_ms, "source_slot": task.source_slot, "assignment": assignment, "reconnect_until_ms": task.reconnect_until_ms})
         }).collect::<Vec<_>>();
         json!({"selected_task_id": self.selected, "tasks": tasks})
     }
 
+    /// Dynamic equal-priority task slot allocator.
+    ///
+    /// * Explicit per-slot overrides (`slot_owners[i] == Some(agent)`) remain
+    ///   strictly pinned to that agent.
+    /// * All unpinned slots (`None`) form a shared dynamic pool with no
+    ///   per-agent priority bias: whichever agents are used allocate unused
+    ///   task buttons as needed.
+    /// * When all compatible slots are occupied, active tasks (`waiting`,
+    ///   `error`, `running`, `thinking`) and fresher tasks reuse buttons held
+    ///   by settled or older finished/idle tasks so active work is always
+    ///   prioritized without churning already-assigned active cards.
     fn reallocate(&mut self) {
         if self
             .selected
@@ -1131,145 +1163,204 @@ impl TaskBoard {
         }
         let available: Vec<DeviceSlot> = self.devices.values().flatten().cloned().collect();
         let available_set: HashSet<DeviceSlot> = available.iter().cloned().collect();
+
+        // 1. Retain existing assignments that are still eligible, connected,
+        // and compatible with any explicit per-slot agent pin.
         let partitioned_device_id = self.partitioned_device_id.clone();
         let slot_owners = self.slot_owners.clone();
         self.assignments.retain(|task_id, assignment| {
             self.tasks.get(task_id).is_some_and(|task| {
+                let pinned_owner = if partitioned_device_id.as_deref()
+                    == Some(assignment.slot.device_id.as_str())
+                {
+                    slot_owners.get(assignment.slot.slot).copied().flatten()
+                } else {
+                    None
+                };
                 (task.state.eligible() || task.reconnect_until_ms.is_some())
                     && available_set.contains(&assignment.slot)
-                    && (partitioned_device_id.as_deref()
-                        != Some(assignment.slot.device_id.as_str())
-                        || slot_owners
-                            .get(assignment.slot.slot)
-                            .copied()
-                            .is_none_or(|owner| owner == Some(task.owner_agent)
-                                || (owner.is_none() && assignment.slot.slot >= crate::routing::LCD_SLOTS)))
+                    && pinned_owner.is_none_or(|owner| owner == task.owner_agent)
             })
         });
-        // Sticky pass: an unassigned task returns to the slot it last held
-        // when that slot is still free and owner-compatible. This keeps the
-        // board coherent across transient evictions (repartitions, state
-        // flickers, brief disconnects).
-        let sticky: Vec<(String, DeviceSlot)> = self
+
+        // 2. Pin legacy synthetic `codex-hid:N` cards to their matching
+        // physical hardware slot when compatible.
+        self.pin_codex_hid_primary_slots();
+
+        // 3. Sticky pass: unassigned eligible tasks reclaim their previous slot
+        // when it is still free and pin-compatible, processed in urgency order
+        // so higher-urgency tasks win any tie.
+        let mut sticky_candidates: Vec<&TaskCard> = self
             .tasks
             .values()
             .filter(|task| task.state.eligible() && !self.assignments.contains_key(&task.task_id))
-            .filter_map(|task| {
-                let preferred = self.primary_preferences.get(&task.task_id).and_then(|slot| {
-                    self.partitioned_device_id.as_ref().map(|id| DeviceSlot { device_id: id.clone(), slot: *slot })
-                });
-                let slot = preferred.as_ref().or_else(|| self.last_slots.get(&task.task_id))?;
-                let free = available_set.contains(slot)
-                    && !self.assignments.values().any(|a| a.slot == *slot);
-                let compatible = self
-                    .slot_owner(slot)
-                    .map_or(true, |owner| owner == Some(task.owner_agent));
-                (free && compatible).then(|| (task.task_id.clone(), slot.clone()))
-            })
             .collect();
-        for (task_id, slot) in sticky {
-            if !self.assignments.values().any(|a| a.slot == slot) {
-                self.assignments.insert(task_id, TaskAssignment { slot });
+        sticky_candidates.sort_by(|a, b| task_order(a, b));
+        let sticky_ids: Vec<String> = sticky_candidates
+            .into_iter()
+            .map(|task| task.task_id.clone())
+            .collect();
+        for task_id in sticky_ids {
+            let Some(task) = self.tasks.get(&task_id) else {
+                continue;
+            };
+            let preferred = self.primary_preferences.get(&task_id).and_then(|slot| {
+                self.partitioned_device_id
+                    .as_ref()
+                    .map(|id| DeviceSlot {
+                        device_id: id.clone(),
+                        slot: *slot,
+                    })
+            });
+            let Some(slot) = preferred
+                .as_ref()
+                .or_else(|| self.last_slots.get(&task_id))
+                .cloned()
+            else {
+                continue;
+            };
+            let free = available_set.contains(&slot)
+                && !self.assignments.values().any(|a| a.slot == slot);
+            let compatible = self
+                .slot_owner(&slot)
+                .is_none_or(|owner| owner == task.owner_agent);
+            if free && compatible {
+                self.assignments
+                    .insert(task_id, TaskAssignment { slot });
             }
         }
-        self.pin_codex_hid_primary_slots();
+
+        // 4. Fill remaining free slots: allocate explicitly pinned slots first
+        // (so pinned agents consume their own dedicated buttons before taking
+        // shared Auto buttons), then fill Auto slots purely by urgency &
+        // recency with zero agent priority bias.
         let mut free: Vec<DeviceSlot> = available
             .into_iter()
             .filter(|slot| !self.assignments.values().any(|a| a.slot == *slot))
             .collect();
         free.sort_by(|a, b| {
+            let a_pinned = self.slot_owner(a).is_some();
+            let b_pinned = self.slot_owner(b).is_some();
             let a_primary = self.partitioned_device_id.as_deref() == Some(a.device_id.as_str());
             let b_primary = self.partitioned_device_id.as_deref() == Some(b.device_id.as_str());
-            b_primary
-                .cmp(&a_primary)
+            b_pinned
+                .cmp(&a_pinned)
+                .then(b_primary.cmp(&a_primary))
                 .then(a.device_id.cmp(&b.device_id))
                 .then(a.slot.cmp(&b.slot))
         });
 
-        let mut candidates: Vec<&TaskCard> = self
-            .tasks
-            .values()
-            .filter(|task| task.state.eligible() && !self.assignments.contains_key(&task.task_id))
-            .collect();
-        candidates.sort_by(|a, b| task_order(a, b));
-        let mut by_session: BTreeMap<usize, Vec<&TaskCard>> = BTreeMap::new();
-        for task in candidates {
-            by_session.entry(task.owner_session).or_default().push(task);
-        }
-        let mut visible_by_session: BTreeMap<usize, usize> = BTreeMap::new();
-        let mut visible_by_agent = [0usize; crate::routing::AGENT_COUNT];
-        for assignment_id in self.assignments.keys() {
-            if let Some(task) = self.tasks.get(assignment_id) {
-                *visible_by_session.entry(task.owner_session).or_default() += 1;
-                visible_by_agent[task.owner_agent.index()] += 1;
-            }
-        }
+        let mut unassigned: Vec<String> = {
+            let mut list: Vec<&TaskCard> = self
+                .tasks
+                .values()
+                .filter(|task| {
+                    task.state.eligible() && !self.assignments.contains_key(&task.task_id)
+                })
+                .collect();
+            list.sort_by(|a, b| task_order(a, b));
+            list.into_iter().map(|task| task.task_id.clone()).collect()
+        };
+
         for slot in free {
             let required_owner = self.slot_owner(&slot);
-            let Some((&session, _)) = by_session
-                .iter()
-                .filter(|(_, tasks)| {
-                    !tasks.is_empty()
-                        && required_owner.map_or(true, |owner| owner == Some(tasks[0].owner_agent))
+            let Some(pos) = unassigned.iter().position(|task_id| {
+                self.tasks.get(task_id).is_some_and(|task| {
+                    required_owner.is_none_or(|owner| owner == task.owner_agent)
                 })
-                .min_by(|(session_a, tasks_a), (session_b, tasks_b)| {
-                    visible_by_agent[tasks_a[0].owner_agent.index()]
-                        .cmp(&visible_by_agent[tasks_b[0].owner_agent.index()])
-                        .then(
-                            visible_by_session
-                                .get(session_a)
-                                .unwrap_or(&0)
-                                .cmp(visible_by_session.get(session_b).unwrap_or(&0)),
-                        )
-                        .then(task_order(tasks_a[0], tasks_b[0]))
-                        .then(session_a.cmp(session_b))
-                })
-            else {
-                // This owner has no eligible work; its slot remains reserved.
+            }) else {
                 continue;
             };
-            let task = by_session
-                .get_mut(&session)
-                .expect("session exists")
-                .remove(0);
-            self.assignments
-                .insert(task.task_id.clone(), TaskAssignment { slot });
-            *visible_by_session.entry(session).or_default() += 1;
-            visible_by_agent[task.owner_agent.index()] += 1;
+            let task_id = unassigned.remove(pos);
+            self.assignments.insert(task_id, TaskAssignment { slot });
         }
+
+        // 5. Eviction / button-reuse pass: when all compatible buttons are full
+        // and eligible unassigned tasks remain, reuse the least-urgent / oldest
+        // finished, idle, or settled button for active or fresher work.
+        // Already-assigned active tasks are never displaced by non-active work
+        // and never churn against equally active tasks.
+        for incoming_id in unassigned {
+            let Some(incoming) = self.tasks.get(&incoming_id).cloned() else {
+                continue;
+            };
+            let incoming_tier = urgency_tier(&incoming);
+            let victim = self
+                .assignments
+                .iter()
+                .filter_map(|(assigned_id, assignment)| {
+                    let occupant = self.tasks.get(assigned_id)?;
+                    // Never disturb a task holding a reconnect grace lease.
+                    if occupant.reconnect_until_ms.is_some() {
+                        return None;
+                    }
+                    // Respect explicit slot pins.
+                    if self
+                        .slot_owner(&assignment.slot)
+                        .is_some_and(|owner| owner != incoming.owner_agent)
+                    {
+                        return None;
+                    }
+                    let occupant_tier = urgency_tier(occupant);
+                    let can_evict = if !is_active_tier(occupant) {
+                        // Reuse settled / finished / idle buttons whenever the
+                        // incoming task is active, unsettled over settled, or
+                        // strictly fresher within the same inactive tier.
+                        incoming_tier < occupant_tier
+                            || task_order(&incoming, occupant) == Ordering::Less
+                    } else {
+                        // Only let a needs-attention task (waiting/error)
+                        // displace a running task when no inactive slots exist.
+                        incoming_tier == 0 && occupant_tier > 0
+                    };
+                    can_evict.then_some((assigned_id.clone(), occupant, assignment.slot.clone()))
+                })
+                // Evict the least-urgent / oldest occupant first (e.g. settled
+                // threads before unsettled completed/idle tasks, oldest first,
+                // preferring higher-numbered slots on ties).
+                .max_by(|(_, occ_a, slot_a), (_, occ_b, slot_b)| {
+                    task_order(occ_a, occ_b).then_with(|| slot_a.slot.cmp(&slot_b.slot))
+                })
+                .map(|(id, _, slot)| (id, slot));
+
+            if let Some((victim_id, slot)) = victim {
+                self.assignments.remove(&victim_id);
+                self.assignments
+                    .insert(incoming_id, TaskAssignment { slot });
+            }
+        }
+
         for (task_id, assignment) in &self.assignments {
             self.last_slots
                 .insert(task_id.clone(), assignment.slot.clone());
             if self.partitioned_device_id.as_deref() == Some(assignment.slot.device_id.as_str()) {
-                self.primary_preferences.insert(task_id.clone(), assignment.slot.slot);
+                self.primary_preferences
+                    .insert(task_id.clone(), assignment.slot.slot);
             }
         }
         if self.primary_preferences.len() > 256 {
-            self.primary_preferences.retain(|id, _| self.tasks.contains_key(id));
+            self.primary_preferences
+                .retain(|id, _| self.tasks.contains_key(id));
         }
         self.last_slots.retain(|task_id, _| {
             self.tasks.contains_key(task_id) || self.assignments.contains_key(task_id)
         });
     }
 
-    fn slot_owner(&self, slot: &DeviceSlot) -> Option<Option<AgentId>> {
+    /// Returns the explicitly pinned owner of `slot`, or `None` when the slot
+    /// belongs to the shared dynamic Auto pool.
+    fn slot_owner(&self, slot: &DeviceSlot) -> Option<AgentId> {
         if self.partitioned_device_id.as_deref() != Some(slot.device_id.as_str())
             || self.slot_owners.is_empty()
         {
             return None;
         }
-        // The partition describes the six Micro positions. A larger primary
-        // controller may have additional task-only slots; keep those slots
-        // unrestricted instead of reserving them as unowned.
-        match self.slot_owners.get(slot.slot).copied() {
-            Some(None) if slot.slot >= crate::routing::LCD_SLOTS => None,
-            owner => owner,
-        }
+        self.slot_owners.get(slot.slot).copied().flatten()
     }
 
-    /// Codex HID task IDs are logical hardware positions, not scheduler work
-    /// items. Keeping each one on its matching primary slot preserves button
-    /// muscle memory while other agents use their own partitioned slots.
+    /// Codex HID task IDs (`codex-hid:N`) are logical hardware positions from
+    /// RP2040 serial fallback mode. Keep each one on its matching primary slot
+    /// when that slot is compatible and not held by a more urgent active task.
     fn pin_codex_hid_primary_slots(&mut self) {
         let Some(primary_device_id) = self.partitioned_device_id.clone() else {
             return;
@@ -1281,29 +1372,20 @@ impl TaskBoard {
             .tasks
             .values()
             .filter_map(|task| {
-                // Desktop source positions follow UI recency. They are routing
-                // metadata, not permission to move an already assigned card.
                 if !task.task_id.starts_with("codex-hid:") {
-                    if self.assignments.contains_key(&task.task_id) { return None; }
-                    if task.source_slot.is_some_and(|source| self.assignments.values().any(|a|
-                        a.slot.device_id == primary_device_id && a.slot.slot == source)) { return None; }
+                    return None;
                 }
                 (task.owner_agent == AgentId::Codex)
                     .then_some(task.source_slot)
                     .flatten()
                     .and_then(|slot| {
-                        // The first half remains reserved for the logical
-                        // Codex HID positions while Codex is temporarily
-                        // inactive. `None` must not let a ZCode refresh
-                        // dislodge an already-running Codex card.
-                        let owned_by_codex = self.slot_owners.is_empty()
-                            || self
-                                .slot_owners
-                                .get(slot)
-                                .copied()
-                                .flatten()
-                                .map_or(true, |owner| owner == AgentId::Codex);
-                        owned_by_codex
+                        let compatible = self
+                            .slot_owners
+                            .get(slot)
+                            .copied()
+                            .flatten()
+                            .is_none_or(|owner| owner == AgentId::Codex);
+                        compatible
                             .then(|| primary_slots.get(slot).cloned())
                             .flatten()
                     })
@@ -1312,6 +1394,17 @@ impl TaskBoard {
             .collect();
         pins.sort_by(|(left, _), (right, _)| left.cmp(right));
         for (task_id, slot) in pins {
+            let blocked_by_other_active = self.assignments.iter().any(|(assigned_id, assignment)| {
+                assigned_id != &task_id
+                    && assignment.slot == slot
+                    && self
+                        .tasks
+                        .get(assigned_id)
+                        .is_some_and(|occupant| occupant.owner_agent != AgentId::Codex && is_active_tier(occupant))
+            });
+            if blocked_by_other_active {
+                continue;
+            }
             self.assignments.retain(|assigned_task, assignment| {
                 assigned_task == &task_id || assignment.slot != slot
             });
@@ -1326,12 +1419,45 @@ fn is_selection_transition(previous: TaskState, observed: TaskState) -> bool {
         && (observed == TaskState::Queued || observed.active())
 }
 
+/// Coarse urgency tier used for equal-priority dynamic allocation and button
+/// reuse:
+/// * `0`: Waiting / unsettled Error (needs immediate user attention)
+/// * `1`: Running / Thinking (actively working right now)
+/// * `2`: Unsettled Completed / Queued / Paused (inactive or freshly finished)
+/// * `3`: Settled / low-priority threads (`priority <= TASK_PRIORITY_SETTLED`)
+/// * `4`: Reconnecting
+fn urgency_tier(task: &TaskCard) -> u8 {
+    match task.state {
+        TaskState::Reconnecting => 4,
+        TaskState::Waiting => 0,
+        TaskState::Error => {
+            if u64::from(task.priority) <= TASK_PRIORITY_SETTLED {
+                3
+            } else {
+                0
+            }
+        }
+        TaskState::Running | TaskState::Thinking => 1,
+        TaskState::Queued | TaskState::Paused | TaskState::Completed => {
+            if u64::from(task.priority) <= TASK_PRIORITY_SETTLED {
+                3
+            } else {
+                2
+            }
+        }
+    }
+}
+
+fn is_active_tier(task: &TaskCard) -> bool {
+    urgency_tier(task) <= 1
+}
+
 fn task_order(a: &TaskCard, b: &TaskCard) -> Ordering {
-    a.state
-        .rank()
-        .cmp(&b.state.rank())
+    urgency_tier(a)
+        .cmp(&urgency_tier(b))
         .then(b.priority.cmp(&a.priority))
         .then(b.updated_at_ms.cmp(&a.updated_at_ms))
+        .then(a.state.rank().cmp(&b.state.rank()))
         .then(a.task_id.cmp(&b.task_id))
 }
 
@@ -1944,7 +2070,9 @@ mod tests {
     fn publish_before_repartition_is_retained_and_becomes_visible() {
         let mut board = TaskBoard::new();
         board.set_device("primary", 6, true);
-        board.set_slot_owners("primary", vec![None; 6]);
+        // When all slots are explicitly pinned to another agent, Hermes tasks
+        // are retained in overflow and become visible once slots open up.
+        board.set_slot_owners("primary", vec![Some(AgentId::Codex); 6]);
         board
             .publish_tasks(
                 7,
@@ -1957,9 +2085,218 @@ mod tests {
         assert_eq!(board.tasks().count(), 1);
         assert!(board.assignment("early").is_none());
 
-        board.set_slot_owners("primary", vec![Some(AgentId::Hermes); 6]);
+        board.set_slot_owners("primary", vec![None; 6]);
 
         assert_eq!(board.rendered_slots("primary", 6)[0]["task_id"], "early");
+    }
+
+    #[test]
+    fn dynamic_auto_pool_allocates_unused_buttons_with_equal_agent_priority() {
+        let mut board = TaskBoard::new();
+        board.set_device("primary", 4, true);
+        board.set_slot_owners("primary", vec![None; 4]);
+
+        board
+            .publish_tasks(
+                1,
+                AgentId::T3,
+                &json!({"tasks": [{
+                    "task_id": "t3:1",
+                    "title": "T3 Work",
+                    "provider": "antigravity",
+                    "agent_label": "T3-Antigravity",
+                    "state": "running",
+                    "priority": 100,
+                    "updated_at_ms": 1_000
+                }]}),
+                1_000,
+            )
+            .unwrap();
+        board
+            .publish_tasks(
+                2,
+                AgentId::Codex,
+                &json!({"tasks": [{
+                    "task_id": "codex:1",
+                    "title": "Codex Work",
+                    "state": "running",
+                    "priority": 100,
+                    "updated_at_ms": 2_000
+                }]}),
+                2_000,
+            )
+            .unwrap();
+        board
+            .publish_tasks(
+                3,
+                AgentId::Claude,
+                &json!({"tasks": [{
+                    "task_id": "claude:1",
+                    "title": "Claude Work",
+                    "state": "running",
+                    "priority": 100,
+                    "updated_at_ms": 3_000
+                }]}),
+                3_000,
+            )
+            .unwrap();
+
+        // Each agent allocates the next unused button in arrival order; no agent
+        // steals another active agent's slot.
+        assert_eq!(board.assignment("t3:1").unwrap().slot.slot, 0);
+        assert_eq!(board.assignment("codex:1").unwrap().slot.slot, 1);
+        assert_eq!(board.assignment("claude:1").unwrap().slot.slot, 2);
+        let rendered = board.rendered_slots("primary", 4);
+        assert_eq!(rendered[0]["agent"], "t3");
+        assert_eq!(rendered[0]["provider"], "antigravity");
+        assert_eq!(rendered[0]["agent_label"], "T3-Antigravity");
+    }
+
+    #[test]
+    fn active_tasks_evict_settled_then_finished_buttons_across_agents() {
+        let mut board = TaskBoard::new();
+        board.set_device("primary", 3, true);
+        board.set_slot_owners("primary", vec![None; 3]);
+
+        // Fill all 3 buttons: one settled T3 thread, one completed Codex task,
+        // and one running Claude task.
+        board
+            .publish_tasks(
+                1,
+                AgentId::T3,
+                &json!({"tasks": [{
+                    "task_id": "t3:settled",
+                    "title": "Old settled",
+                    "provider": "codex",
+                    "agent_label": "T3-Codex",
+                    "state": "queued",
+                    "priority": TASK_PRIORITY_SETTLED,
+                    "updated_at_ms": 5_000
+                }]}),
+                5_000,
+            )
+            .unwrap();
+        board
+            .publish_tasks(
+                2,
+                AgentId::Codex,
+                &json!({"tasks": [{
+                    "task_id": "codex:done",
+                    "title": "Finished codex",
+                    "state": "completed",
+                    "priority": 50,
+                    "updated_at_ms": 4_000
+                }]}),
+                5_000,
+            )
+            .unwrap();
+        board
+            .publish_tasks(
+                3,
+                AgentId::Claude,
+                &json!({"tasks": [{
+                    "task_id": "claude:live",
+                    "title": "Live claude",
+                    "state": "running",
+                    "priority": 100,
+                    "updated_at_ms": 1_000
+                }]}),
+                5_000,
+            )
+            .unwrap();
+        assert_eq!(board.assignment("t3:settled").unwrap().slot.slot, 0);
+        assert_eq!(board.assignment("codex:done").unwrap().slot.slot, 1);
+        assert_eq!(board.assignment("claude:live").unwrap().slot.slot, 2);
+
+        // A new active Hermes task arrives: it must reuse the settled T3 button
+        // first, even though the settled thread has a newer timestamp than the
+        // completed Codex task.
+        board
+            .publish_tasks(
+                4,
+                AgentId::Hermes,
+                &json!({"tasks": [{
+                    "task_id": "hermes:live",
+                    "title": "Live hermes",
+                    "state": "running",
+                    "priority": 100,
+                    "updated_at_ms": 6_000
+                }]}),
+                6_000,
+            )
+            .unwrap();
+        assert!(board.assignment("t3:settled").is_none());
+        assert_eq!(board.assignment("hermes:live").unwrap().slot.slot, 0);
+        assert_eq!(board.assignment("codex:done").unwrap().slot.slot, 1);
+        assert_eq!(board.assignment("claude:live").unwrap().slot.slot, 2);
+
+        // A second active T3 task arrives: now the completed Codex button is
+        // reused, while both running tasks stay pinned in place.
+        board
+            .publish_tasks(
+                1,
+                AgentId::T3,
+                &json!({"tasks": [
+                    {
+                        "task_id": "t3:settled",
+                        "title": "Old settled",
+                        "state": "queued",
+                        "priority": TASK_PRIORITY_SETTLED,
+                        "updated_at_ms": 5_000
+                    },
+                    {
+                        "task_id": "t3:live",
+                        "title": "Active T3",
+                        "provider": "claudeAgent",
+                        "agent_label": "T3-Claude",
+                        "state": "running",
+                        "priority": 100,
+                        "updated_at_ms": 7_000
+                    }
+                ]}),
+                7_000,
+            )
+            .unwrap();
+        assert!(board.assignment("codex:done").is_none());
+        assert_eq!(board.assignment("t3:live").unwrap().slot.slot, 1);
+        assert_eq!(board.assignment("hermes:live").unwrap().slot.slot, 0);
+        assert_eq!(board.assignment("claude:live").unwrap().slot.slot, 2);
+    }
+
+    #[test]
+    fn explicit_slot_pin_is_respected_alongside_dynamic_auto_pool() {
+        let mut board = TaskBoard::new();
+        board.set_device("primary", 3, true);
+        // Pin slot 2 explicitly to T3; slots 0 and 1 remain in the shared Auto pool.
+        board.set_slot_owners("primary", vec![None, None, Some(AgentId::T3)]);
+
+        board
+            .publish_tasks(
+                1,
+                AgentId::Codex,
+                &json!({"tasks": [
+                    task("c1", "running", 100),
+                    task("c2", "running", 100),
+                    task("c3", "running", 100)
+                ]}),
+                1_000,
+            )
+            .unwrap();
+        // Codex may only occupy Auto slots 0 and 1, never the T3-pinned slot 2.
+        assert_eq!(board.assignment("c1").unwrap().slot.slot, 0);
+        assert_eq!(board.assignment("c2").unwrap().slot.slot, 1);
+        assert!(board.assignment("c3").is_none());
+
+        board
+            .publish_tasks(
+                2,
+                AgentId::T3,
+                &json!({"tasks": [task("t3:1", "queued", 20)]}),
+                2_000,
+            )
+            .unwrap();
+        // Even a settled T3 task claims its explicitly pinned slot 2.
+        assert_eq!(board.assignment("t3:1").unwrap().slot.slot, 2);
     }
 
     #[test]

@@ -138,6 +138,16 @@ pub enum CatalogAction {
     AgentOpenEditor,
     AgentCompactContext,
     AgentSettings,
+    T3NewThread,
+    T3CommandPalette,
+    T3ModelPicker,
+    T3SettleThread,
+    T3PinThread,
+    T3TogglePreview,
+    T3ToggleSidebar,
+    T3ToggleTerminal,
+    T3CopyReference,
+    T3OpenUsage,
 }
 
 impl CatalogAction {
@@ -168,6 +178,16 @@ impl CatalogAction {
             "agent.open-editor" => Self::AgentOpenEditor,
             "agent.compact-context" => Self::AgentCompactContext,
             "agent.settings" => Self::AgentSettings,
+            "t3.new-thread" => Self::T3NewThread,
+            "t3.command-palette" => Self::T3CommandPalette,
+            "t3.model-picker" => Self::T3ModelPicker,
+            "t3.settle-thread" => Self::T3SettleThread,
+            "t3.pin-thread" => Self::T3PinThread,
+            "t3.toggle-preview" => Self::T3TogglePreview,
+            "t3.toggle-sidebar" => Self::T3ToggleSidebar,
+            "t3.toggle-terminal" => Self::T3ToggleTerminal,
+            "t3.copy-reference" => Self::T3CopyReference,
+            "t3.open-usage" => Self::T3OpenUsage,
             _ => return None,
         })
     }
@@ -199,6 +219,16 @@ impl CatalogAction {
             Self::AgentOpenEditor => "agent.open-editor",
             Self::AgentCompactContext => "agent.compact-context",
             Self::AgentSettings => "agent.settings",
+            Self::T3NewThread => "t3.new-thread",
+            Self::T3CommandPalette => "t3.command-palette",
+            Self::T3ModelPicker => "t3.model-picker",
+            Self::T3SettleThread => "t3.settle-thread",
+            Self::T3PinThread => "t3.pin-thread",
+            Self::T3TogglePreview => "t3.toggle-preview",
+            Self::T3ToggleSidebar => "t3.toggle-sidebar",
+            Self::T3ToggleTerminal => "t3.toggle-terminal",
+            Self::T3CopyReference => "t3.copy-reference",
+            Self::T3OpenUsage => "t3.open-usage",
         }
     }
 }

@@ -105,7 +105,8 @@ export function renderTaskCardImage(
     const digitH = 5 * cell;
     const originX = Math.floor((w - digitW) / 2);
     const originY = 42;
-    const agentLabel = agent ? agent.toUpperCase() : "";
+    const agentLabel = agent ? truncate(agent.toUpperCase(), 15) : "";
+    const agentFontSize = agentLabel.length <= 8 ? 14 : agentLabel.length <= 11 ? 12 : 10;
     const elapsed = isWorking || isFinished
         ? formatElapsed(startedAtMs, finishedAtMs, isFinished)
         : undefined;
@@ -114,7 +115,7 @@ export function renderTaskCardImage(
     return svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
   <rect x="4" y="4" width="${w - 8}" height="${h - 8}" rx="12" fill="${color}" stroke="#000" stroke-opacity="0.2" stroke-width="1"/>
   ${selected ? `<rect x="${w - 9}" y="12" width="5" height="${h - 24}" rx="2.5" fill="#fff"/>` : ""}
-  <text x="${w / 2}" y="19" font-family="sans-serif" font-size="14" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(agentLabel)}</text>
+  <text x="${w / 2}" y="19" font-family="sans-serif" font-size="${agentFontSize}" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(agentLabel)}</text>
   ${renderDigit(slot + 1, originX, originY, cell, "#c4c2ff")}
   ${elapsed ? `<text x="${w / 2}" y="135" font-family="monospace" font-size="26" font-weight="bold" fill="${timerColor}" text-anchor="middle">${elapsed}</text>` : ""}
 </svg>`);
@@ -310,13 +311,14 @@ export function renderKnobStrip(ctx: StripContext): string {
   <text x="${STRIP_W / 2}" y="84" font-family="sans-serif" font-size="12" font-weight="bold" fill="#ffe0b2" text-anchor="middle">PRESS: OPEN CODEX</text>`);
     }
     const taskId = ctx.task_number ?? ctx.task_id ?? "—";
-    const agent = truncate((ctx.agent ?? agentFromTaskId(ctx.task_id) ?? "—").toUpperCase(), 12);
+    const agent = truncate((ctx.agent ?? agentFromTaskId(ctx.task_id) ?? "—").toUpperCase(), 15);
+    const agentFontSize = agent.length <= 11 ? 16 : 13;
     const project = truncate(ctx.project ?? "—", 18);
     const task = truncate(ctx.task ?? "—", 24);
     return stripSvg(`<text x="10" y="26" font-family="monospace" font-size="13" font-weight="bold" fill="#90caf9">#${escapeXml(String(taskId))}</text>
   <text x="${STRIP_W - 10}" y="26" font-family="sans-serif" font-size="12" fill="#a5d6a7" text-anchor="end">${escapeXml(project)}</text>
   <text x="${STRIP_W / 2}" y="58" font-family="sans-serif" font-size="14" font-weight="bold" fill="#fff" text-anchor="middle">${escapeXml(task)}</text>
-  <text x="${STRIP_W / 2}" y="84" font-family="sans-serif" font-size="16" font-weight="bold" fill="#6366f1" text-anchor="middle">${escapeXml(agent)}</text>`);
+  <text x="${STRIP_W / 2}" y="84" font-family="sans-serif" font-size="${agentFontSize}" font-weight="bold" fill="#6366f1" text-anchor="middle">${escapeXml(agent)}</text>`);
 }
 
 /** Crux horizontal strip: model / effort, or status / progress as fallback. */

@@ -57,6 +57,12 @@ const CLAUDE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// app runs, Claude keeps its deck half and auto-fed cards even without a
 /// live MCP proxy, mirroring the ZCode and Hermes probes.
 const CLAUDE_DESKTOP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+/// T3 Code's projection SQLite database is local and WAL-backed. One second
+/// keeps thread status transitions responsive while avoiding DB contention.
+const T3_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the daemon probes for the T3 Code desktop app's window. While the
+/// app runs, T3 keeps its auto-fed cards even without a live MCP proxy.
+const T3_DESKTOP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// Codex desktop state is local and cheap to poll. A 250 ms interval keeps
 /// focus and lifecycle responsive without reading SQLite in the 10 ms loop.
 const CODEX_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -74,6 +80,8 @@ pub const ZCODE_POLL_SESSION: usize = 999;
 pub const HERMES_POLL_SESSION: usize = 998;
 /// Synthetic owner for cards mirrored from Claude Code's session registry.
 pub const CLAUDE_POLL_SESSION: usize = 997;
+/// Synthetic owner for cards mirrored from T3 Code's read-only state database.
+pub const T3_POLL_SESSION: usize = 996;
 
 // Catalog actions without a concrete owning MCP session are routed to the
 // newest live session for their intended agent. These sentinels cannot collide
@@ -82,6 +90,7 @@ const CODEX_CATALOG_SESSION: usize = usize::MAX;
 const ZCODE_CATALOG_SESSION: usize = usize::MAX - 1;
 const HERMES_CATALOG_SESSION: usize = usize::MAX - 2;
 const CLAUDE_CATALOG_SESSION: usize = usize::MAX - 3;
+const T3_CATALOG_SESSION: usize = usize::MAX - 4;
 
 pub(crate) fn catalog_action_session(agent: AgentId) -> usize {
     match agent {
@@ -89,6 +98,7 @@ pub(crate) fn catalog_action_session(agent: AgentId) -> usize {
         AgentId::ZCode => ZCODE_CATALOG_SESSION,
         AgentId::Hermes => HERMES_CATALOG_SESSION,
         AgentId::Claude => CLAUDE_CATALOG_SESSION,
+        AgentId::T3 => T3_CATALOG_SESSION,
     }
 }
 
@@ -98,6 +108,7 @@ fn catalog_action_agent(session_id: usize) -> Option<AgentId> {
         ZCODE_CATALOG_SESSION => Some(AgentId::ZCode),
         HERMES_CATALOG_SESSION => Some(AgentId::Hermes),
         CLAUDE_CATALOG_SESSION => Some(AgentId::Claude),
+        T3_CATALOG_SESSION => Some(AgentId::T3),
         _ => None,
     }
 }
@@ -197,15 +208,16 @@ fn retry_serial_connection(
 
 /// Computes the effective active set: agents with live MCP sessions, plus
 /// Codex if the RP2040 serial link is up (ChatGPT drives Codex over HID
-/// without an MCP session), plus ZCode, Hermes and Claude while their desktop
-/// apps are running (the task feeds mirror the apps' databases directly and must
-/// survive MCP proxy blips and daemon restarts).
+/// without an MCP session), plus ZCode, Hermes, Claude, and T3 while their
+/// desktop apps are running (the task feeds mirror the apps' databases
+/// directly and must survive MCP proxy blips and daemon restarts).
 fn effective_active_set(
     session_agents: ActiveSet,
     codex_hardware_active: bool,
     zcode_desktop_active: bool,
     hermes_desktop_active: bool,
     claude_desktop_active: bool,
+    t3_desktop_active: bool,
 ) -> ActiveSet {
     let mut set = session_agents;
     if codex_hardware_active {
@@ -220,63 +232,21 @@ fn effective_active_set(
     if claude_desktop_active {
         set.insert(AgentId::Claude);
     }
+    if t3_desktop_active {
+        set.insert(AgentId::T3);
+    }
     set
 }
 
-/// Builds task-card ownership for the primary Stream Deck. Explicit Task Card
-/// preferences win per slot; missing preferences use the automatic layout.
-/// The first six slots keep the Micro-friendly three-agent layout, while slots
-/// 7-8 remain overflow slots and are intentionally left to the scheduler.
+/// Builds explicit per-slot agent pins for the primary controller.
+/// Unpinned slots (`None`) belong to the shared dynamic Auto pool where every
+/// agent competes equally and active tasks are prioritized over settled or
+/// finished buttons.
 fn task_slot_owners(
     slot_count: usize,
-    active: ActiveSet,
     overrides: Option<Vec<(usize, AgentId)>>,
 ) -> Vec<Option<AgentId>> {
     let mut owners = vec![None; slot_count];
-    let codex = active.contains(AgentId::Codex);
-    let zcode = active.contains(AgentId::ZCode);
-    let hermes = active.contains(AgentId::Hermes);
-    let claude = active.contains(AgentId::Claude);
-    if codex && zcode && hermes && !claude {
-        for slot in [0, 1] {
-            if slot < slot_count {
-                owners[slot] = Some(AgentId::Codex);
-            }
-        }
-        for slot in [2, 5] {
-            if slot < slot_count {
-                owners[slot] = Some(AgentId::Hermes);
-            }
-        }
-        for slot in [3, 4] {
-            if slot < slot_count {
-                owners[slot] = Some(AgentId::ZCode);
-            }
-        }
-    } else {
-        let active_agents = crate::routing::AGENTS
-            .into_iter()
-            .filter(|agent| active.contains(*agent))
-            .collect::<Vec<_>>();
-        if active_agents.len() == 1 {
-            owners
-                .iter_mut()
-                .for_each(|owner| *owner = Some(active_agents[0]));
-        } else if active_agents.len() >= 2 {
-            let split = slot_count / active_agents.len();
-            for (index, agent) in active_agents.iter().enumerate() {
-                let start = index * split;
-                let end = if index + 1 == active_agents.len() {
-                    slot_count
-                } else {
-                    (index + 1) * split
-                };
-                for owner in owners[start..end].iter_mut() {
-                    *owner = Some(*agent);
-                }
-            }
-        }
-    }
     if let Some(overrides) = overrides {
         for (slot, agent) in overrides {
             if slot < owners.len() {
@@ -294,16 +264,26 @@ fn primary_slot_overrides(bridge: &crate::BridgeRuntime) -> Option<Vec<(usize, A
         .and_then(|device| device.task_slot_agent_overrides())
 }
 
+fn effective_task_slot_count(bridge: &crate::BridgeRuntime) -> usize {
+    let aux_max = bridge
+        .aux_controllers
+        .iter()
+        .map(|(_, _, slots)| *slots)
+        .max()
+        .unwrap_or(0);
+    bridge.task_slot_count.max(aux_max)
+}
+
+/// Maximum number of task cards `agent` can currently occupy (all Auto slots
+/// plus any slots explicitly pinned to `agent`).
 fn task_slots_for_agent(
     slot_count: usize,
-    active: ActiveSet,
     overrides: Option<Vec<(usize, AgentId)>>,
     agent: AgentId,
 ) -> usize {
-    task_slot_owners(slot_count, active, overrides)
+    task_slot_owners(slot_count, overrides)
         .into_iter()
-        .flatten()
-        .filter(|owner| *owner == agent)
+        .filter(|owner| owner.is_none() || *owner == Some(agent))
         .count()
 }
 
@@ -318,19 +298,17 @@ fn refresh_wanted_usage(
 ) -> bool {
     use crate::usage::UsageAgent;
     let selected = bridge.usage_agent;
-    let codex_wanted = selected == UsageAgent::Codex
-        || session_agents.contains(AgentId::Codex)
-        || plugin_connected;
-    let zcode_wanted = selected == UsageAgent::ZCode
-        || session_agents.contains(AgentId::ZCode)
-        || plugin_connected;
-    if codex_wanted {
-        bridge.usage_cache.request_refresh(UsageAgent::Codex);
+    let mut any_wanted = false;
+    for agent in UsageAgent::ALL {
+        let session_live = [AgentId::Codex, AgentId::ZCode, AgentId::Claude]
+            .into_iter()
+            .any(|id| UsageAgent::from_agent(id) == Some(agent) && session_agents.contains(id));
+        if selected == agent || session_live || plugin_connected {
+            bridge.usage_cache.request_refresh(agent);
+            any_wanted = true;
+        }
     }
-    if zcode_wanted {
-        bridge.usage_cache.request_refresh(UsageAgent::ZCode);
-    }
-    codex_wanted || zcode_wanted
+    any_wanted
 }
 
 /// Runs the daemon: owns the hardware via a single `BridgeRuntime` and
@@ -407,6 +385,13 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         crate::diaglog::log("claude desktop app detected at daemon start");
     }
     let mut next_claude_desktop_probe_at = Instant::now() + CLAUDE_DESKTOP_PROBE_INTERVAL;
+    // Same liveness probe for the T3 Code desktop app: its auto-feed mirrors
+    // T3's SQLite state database directly and must survive MCP proxy blips.
+    let mut t3_desktop_active = crate::t3_window::desktop_running();
+    if t3_desktop_active {
+        crate::diaglog::log("t3 desktop app detected at daemon start");
+    }
+    let mut next_t3_desktop_probe_at = Instant::now() + T3_DESKTOP_PROBE_INTERVAL;
     let mut pending_repartition_at: Option<Instant> = None;
     let mut next_usage_refresh_at: Option<Instant> = None;
     {
@@ -416,15 +401,12 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             zcode_desktop_active,
             hermes_desktop_active,
             claude_desktop_active,
+            t3_desktop_active,
         );
         bridge.partition = Partition::compute(active);
         bridge.task_board.set_slot_owners(
             bridge.task_device_id.clone(),
-            task_slot_owners(
-                bridge.task_slot_count,
-                active,
-                primary_slot_overrides(&bridge),
-            ),
+            task_slot_owners(bridge.task_slot_count, primary_slot_overrides(&bridge)),
         );
     }
     eprintln!("{}", crate::bridge_status(&bridge, "daemon"));
@@ -446,12 +428,13 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     let mut plugin_sessions: Vec<(usize, String)> = Vec::new();
 
     let mut last_thstatus_at: Option<Instant> = None;
-    // ZCode and Hermes auto-feed bookkeeping.  The daemon periodically polls
-    // their on-disk session databases and publishes active sessions as task
-    // cards, mirroring how Codex activity arrives via `v.oai.thstatus`.
+    // ZCode, Hermes, Claude, and T3 auto-feed bookkeeping.  The daemon
+    // periodically polls their on-disk session databases and publishes
+    // sessions as task cards, mirroring how Codex activity arrives.
     let mut next_zcode_poll_at: Option<Instant> = None;
     let mut next_hermes_poll_at: Option<Instant> = None;
     let mut next_claude_poll_at: Option<Instant> = None;
+    let mut next_t3_poll_at: Option<Instant> = None;
 
     // Acceptor thread.
     let accept_tx = session_tx.clone();
@@ -498,10 +481,12 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     // Codex owns the CLI/session-derived fallback context; a
                     // ZCode hello also warrants re-derivation so a ZCode-only
                     // machine still populates the strip (and its usage data).
+                    // Any agent with a usage source gets its snapshot warmed
+                    // so pressing one of its cards shows usage immediately.
+                    if let Some(usage_agent) = crate::usage::UsageAgent::from_agent(agent) {
+                        bridge.usage_cache.request_refresh(usage_agent);
+                    }
                     if matches!(agent, AgentId::Codex | AgentId::ZCode) {
-                        if let Some(usage_agent) = crate::usage::UsageAgent::from_agent(agent) {
-                            bridge.usage_cache.request_refresh(usage_agent);
-                        }
                         crate::auto_derive_display_context(&mut bridge);
                         let _ = crate::refresh_task_board(&mut bridge);
                     }
@@ -579,9 +564,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                         if becomes_primary {
                             bridge.task_board.set_slot_owners(
                                 device_id.clone(),
-                                (0..slots)
-                                    .map(|slot| bridge.partition.owner_of(slot as u8))
-                                    .collect(),
+                                task_slot_owners(slots, primary_slot_overrides(&bridge)),
                             );
                         }
                     }
@@ -807,9 +790,16 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         // and exact timer timestamps independently of LCD presentation frames.
         if now >= next_codex_poll_at {
             next_codex_poll_at = now + CODEX_TASK_POLL_INTERVAL;
-            // Match the ZCode/Hermes feeds: publish only as many recent
-            // threads as Codex can display on its partition slots.
-            let codex_slots = bridge.partition.slots_for(AgentId::Codex).len();
+            let total_slots = effective_task_slot_count(&bridge);
+            let codex_slots = if total_slots == 0 {
+                crate::tasks::CODEX_TASK_SLOTS
+            } else {
+                task_slots_for_agent(
+                    total_slots,
+                    primary_slot_overrides(&bridge),
+                    AgentId::Codex,
+                )
+            };
             if let Some(snapshot) = crate::codex_state::read_codex_snapshot(codex_slots) {
                 match bridge
                     .task_board
@@ -835,18 +825,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
         // Capacity messages from the Stream Deck carry Task Card ownership
         // preferences. Apply them immediately, even when agent liveness did
         // not change and therefore no repartition was scheduled.
-        let active = effective_active_set(
-            session_agents,
-            codex_hardware_active,
-            zcode_desktop_active,
-            hermes_desktop_active,
-            claude_desktop_active,
-        );
-        let owners = task_slot_owners(
-            bridge.task_slot_count,
-            active,
-            primary_slot_overrides(&bridge),
-        );
+        let owners = task_slot_owners(bridge.task_slot_count, primary_slot_overrides(&bridge));
         bridge
             .task_board
             .set_slot_owners(bridge.task_device_id.clone(), owners);
@@ -881,6 +860,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             } else if let Some(feed_agent) = match session_id {
                 HERMES_POLL_SESSION => Some(AgentId::Hermes),
                 CLAUDE_POLL_SESSION => Some(AgentId::Claude),
+                T3_POLL_SESSION => Some(AgentId::T3),
                 _ => None,
             } {
                 let targets: Vec<usize> = sessions
@@ -963,21 +943,8 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             if let Some(poll_at) = next_zcode_poll_at {
                 if now >= poll_at {
                     next_zcode_poll_at = Some(now + ZCODE_POLL_INTERVAL);
-                    // Publish only as many recent sessions as ZCode can display
-                    // on the partitioned primary controller. Publishing a fixed
-                    // six-card snapshot while ZCode owns three slots leaves old
-                    // sticky assignments in place and sends newly started tasks
-                    // to overflow with no visible change on the device.
-                    let active = effective_active_set(
-                        session_agents,
-                        codex_hardware_active,
-                        zcode_desktop_active,
-                        hermes_desktop_active,
-                        claude_desktop_active,
-                    );
                     let zcode_slots = task_slots_for_agent(
-                        bridge.task_slot_count,
-                        active,
+                        effective_task_slot_count(&bridge),
                         primary_slot_overrides(&bridge),
                         AgentId::ZCode,
                     );
@@ -1037,16 +1004,8 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             }
             if next_hermes_poll_at.is_some_and(|poll_at| now >= poll_at) {
                 next_hermes_poll_at = Some(now + HERMES_POLL_INTERVAL);
-                let active = effective_active_set(
-                    session_agents,
-                    codex_hardware_active,
-                    zcode_desktop_active,
-                    hermes_desktop_active,
-                    claude_desktop_active,
-                );
                 let hermes_slots = task_slots_for_agent(
-                    bridge.task_slot_count,
-                    active,
+                    effective_task_slot_count(&bridge),
                     primary_slot_overrides(&bridge),
                     AgentId::Hermes,
                 );
@@ -1105,16 +1064,8 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             }
             if next_claude_poll_at.is_some_and(|poll_at| now >= poll_at) {
                 next_claude_poll_at = Some(now + CLAUDE_POLL_INTERVAL);
-                let active = effective_active_set(
-                    session_agents,
-                    codex_hardware_active,
-                    zcode_desktop_active,
-                    hermes_desktop_active,
-                    claude_desktop_active,
-                );
                 let claude_slots = task_slots_for_agent(
-                    bridge.task_slot_count,
-                    active,
+                    effective_task_slot_count(&bridge),
                     primary_slot_overrides(&bridge),
                     AgentId::Claude,
                 );
@@ -1134,6 +1085,61 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                             crate::diaglog::log(&format!(
                                 "claude auto-feed publish failed: {error}"
                             ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Mirror T3 Code's read-only SQLite projection while a T3 proxy is
+        // connected or T3 Code Desktop is running. An explicit T3 publication
+        // is authoritative and suppresses this synthetic owner.
+        let t3_proxy_active = sessions
+            .iter()
+            .any(|session| session.agent == Some(AgentId::T3));
+        let t3_active = t3_proxy_active || t3_desktop_active;
+        let t3_has_manual_tasks = bridge
+            .task_board
+            .has_agent_tasks_except(AgentId::T3, T3_POLL_SESSION);
+        if !t3_active || t3_has_manual_tasks {
+            if bridge.task_board.has_session_tasks(T3_POLL_SESSION) {
+                bridge.task_board.clear_session(T3_POLL_SESSION);
+                crate::diaglog::log(&format!(
+                    "t3 auto-feed cleared (proxy={}, desktop={}, manual={})",
+                    t3_proxy_active, t3_desktop_active, t3_has_manual_tasks
+                ));
+                let _ = crate::refresh_task_board(&mut bridge);
+            }
+            next_t3_poll_at = None;
+        } else {
+            if next_t3_poll_at.is_none() {
+                next_t3_poll_at = Some(now);
+                crate::diaglog::log(&format!(
+                    "t3 auto-feed active (proxy={}, desktop={})",
+                    t3_proxy_active, t3_desktop_active
+                ));
+            }
+            if next_t3_poll_at.is_some_and(|poll_at| now >= poll_at) {
+                next_t3_poll_at = Some(now + T3_POLL_INTERVAL);
+                let t3_slots = task_slots_for_agent(
+                    effective_task_slot_count(&bridge),
+                    primary_slot_overrides(&bridge),
+                    AgentId::T3,
+                );
+                if let Some(snapshot) = crate::t3_state::read_t3_snapshot(t3_slots) {
+                    match bridge.task_board.publish_tasks(
+                        T3_POLL_SESSION,
+                        AgentId::T3,
+                        &snapshot,
+                        now_ms(),
+                    ) {
+                        Ok(_) => {
+                            bridge.has_explicit_task_state = true;
+                            let _ = crate::refresh_task_board(&mut bridge);
+                        }
+                        Err(error) => {
+                            eprintln!("t3 poll publish failed: {error}");
+                            crate::diaglog::log(&format!("t3 auto-feed publish failed: {error}"));
                         }
                     }
                 }
@@ -1208,6 +1214,25 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             }
         }
 
+        // Same liveness probe for T3 Code Desktop: its auto-feed mirrors
+        // statev2.sqlite directly, so cards survive proxy blips.
+        if now >= next_t3_desktop_probe_at {
+            next_t3_desktop_probe_at = now + T3_DESKTOP_PROBE_INTERVAL;
+            let running = crate::t3_window::desktop_running();
+            if running != t3_desktop_active {
+                t3_desktop_active = running;
+                crate::diaglog::log(&format!(
+                    "t3 desktop app {}",
+                    if running {
+                        "detected"
+                    } else {
+                        "no longer running"
+                    }
+                ));
+                pending_repartition_at = Some(now + REPARTITION_DEBOUNCE);
+            }
+        }
+
         // Apply a debounced repartition if the active set has changed.
         if let Some(repartition_at) = pending_repartition_at {
             if now >= repartition_at {
@@ -1218,6 +1243,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     zcode_desktop_active,
                     hermes_desktop_active,
                     claude_desktop_active,
+                    t3_desktop_active,
                 );
                 let new_partition = Partition::compute(active);
                 eprintln!(
@@ -1233,11 +1259,7 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                 bridge.partition = new_partition.clone();
                 bridge.task_board.set_slot_owners(
                     bridge.task_device_id.clone(),
-                    task_slot_owners(
-                        bridge.task_slot_count,
-                        active,
-                        primary_slot_overrides(&bridge),
-                    ),
+                    task_slot_owners(bridge.task_slot_count, primary_slot_overrides(&bridge)),
                 );
                 // Re-render through the centralized desired-state path.  An
                 // empty fused buffer is not an explicit Codex update; sending
@@ -1857,6 +1879,7 @@ fn call_tool_for(
                 AgentId::ZCode => Some(ZCODE_POLL_SESSION),
                 AgentId::Hermes => Some(HERMES_POLL_SESSION),
                 AgentId::Claude => Some(CLAUDE_POLL_SESSION),
+                AgentId::T3 => Some(T3_POLL_SESSION),
                 AgentId::Codex => None,
             };
             if let Some(poll_session) = auto_feed_session.filter(|&s| s != session_id) {
@@ -2120,6 +2143,13 @@ mod tests {
             parse_hello_info(line).map(|i| i.agent),
             Some(AgentId::ZCode)
         );
+        let line = r#"{"bridge":"hello","agent":"claude"}"#;
+        assert_eq!(
+            parse_hello_info(line).map(|i| i.agent),
+            Some(AgentId::Claude)
+        );
+        let line = r#"{"bridge":"hello","agent":"t3"}"#;
+        assert_eq!(parse_hello_info(line).map(|i| i.agent), Some(AgentId::T3));
         let line = r#"{"jsonrpc":"2.0","method":"initialize","id":1}"#;
         assert_eq!(parse_hello_info(line).map(|i| i.agent), None);
     }
@@ -2130,7 +2160,7 @@ mod tests {
         sessions.insert(AgentId::ZCode);
         sessions.insert(AgentId::Hermes);
 
-        let active = effective_active_set(sessions, false, false, false, false);
+        let active = effective_active_set(sessions, false, false, false, false, false);
         assert!(!active.contains(AgentId::Codex));
         assert_eq!(
             Partition::compute(active).owners_json(),
@@ -2146,7 +2176,7 @@ mod tests {
     }
     #[test]
     fn hermes_desktop_probe_claims_the_shared_half_without_zcode() {
-        let active = effective_active_set(ActiveSet::new(), false, false, true, false);
+        let active = effective_active_set(ActiveSet::new(), false, false, true, false, false);
         assert!(active.contains(AgentId::Hermes));
         assert_eq!(
             Partition::compute(active).owners_json(),
@@ -2162,7 +2192,7 @@ mod tests {
         // ZCode keeps priority on the shared half when both desktops run.
         let mut sessions = ActiveSet::new();
         sessions.insert(AgentId::ZCode);
-        let active = effective_active_set(sessions, false, false, true, false);
+        let active = effective_active_set(sessions, false, false, true, false, false);
         assert_eq!(
             Partition::compute(active).owners_json(),
             vec![
@@ -2177,62 +2207,51 @@ mod tests {
     }
 
     #[test]
-    fn claude_desktop_probe_takes_priority_on_the_shared_half() {
-        let active = effective_active_set(ActiveSet::new(), false, false, false, true);
+    fn claude_and_t3_desktop_probes_and_dynamic_auto_slots() {
+        let active = effective_active_set(ActiveSet::new(), false, false, false, true, false);
         assert!(active.contains(AgentId::Claude));
         assert_eq!(
             Partition::compute(active).slots_for(AgentId::Claude),
             vec![3, 4, 5]
         );
-        // Claude outranks ZCode and Hermes; Codex keeps its own half.
-        let mut sessions = ActiveSet::new();
-        sessions.insert(AgentId::ZCode);
-        let active = effective_active_set(sessions, true, true, true, true);
+        let active_t3 = effective_active_set(ActiveSet::new(), false, false, false, false, true);
+        assert!(active_t3.contains(AgentId::T3));
         assert_eq!(
-            Partition::compute(active).owners_json(),
-            vec![
-                json!("codex"),
-                json!("codex"),
-                json!("codex"),
-                json!("claude"),
-                json!("claude"),
-                json!("claude")
-            ]
+            Partition::compute(active_t3).slots_for(AgentId::T3),
+            vec![3, 4, 5]
         );
-        // With four agents the 8-slot task layout shares slots in priority order.
-        let owners = task_slot_owners(8, active, None);
-        assert_eq!(owners[0], Some(AgentId::Codex));
-        assert_eq!(owners[2], Some(AgentId::Claude));
-        assert_eq!(owners[7], Some(AgentId::Hermes));
-        assert_eq!(task_slots_for_agent(8, active, None, AgentId::Claude), 2);
-        assert_eq!(catalog_action_agent(catalog_action_session(AgentId::Claude)), Some(AgentId::Claude));
+        // Auto task slots have no fixed agent partition: every unpinned slot
+        // is `None` (shared equal-priority pool), and every agent may poll up
+        // to the full pool capacity.
+        let owners = task_slot_owners(8, None);
+        assert_eq!(owners, vec![None; 8]);
+        assert_eq!(task_slots_for_agent(8, None, AgentId::Claude), 8);
+        assert_eq!(task_slots_for_agent(8, None, AgentId::T3), 8);
+        assert_eq!(
+            catalog_action_agent(catalog_action_session(AgentId::Claude)),
+            Some(AgentId::Claude)
+        );
+        assert_eq!(
+            catalog_action_agent(catalog_action_session(AgentId::T3)),
+            Some(AgentId::T3)
+        );
     }
 
     #[test]
-    fn auto_task_slots_use_the_requested_three_agent_layout() {
-        let mut active = ActiveSet::new();
-        active.insert(AgentId::Codex);
-        active.insert(AgentId::ZCode);
-        active.insert(AgentId::Hermes);
-        assert_eq!(
-            task_slot_owners(8, active, None),
-            vec![
-                Some(AgentId::Codex),
-                Some(AgentId::Codex),
-                Some(AgentId::Hermes),
-                Some(AgentId::ZCode),
-                Some(AgentId::ZCode),
-                Some(AgentId::Hermes),
-                None,
-                None,
-            ]
-        );
-        assert_eq!(
-            task_slot_owners(8, active, Some(vec![(6, AgentId::Hermes)]))[6],
-            Some(AgentId::Hermes)
-        );
-        assert_eq!(task_slots_for_agent(8, active, None, AgentId::Hermes), 2);
-        assert_eq!(task_slots_for_agent(8, active, None, AgentId::ZCode), 2);
+    fn auto_task_slots_keep_only_explicit_overrides() {
+        assert_eq!(task_slot_owners(8, None), vec![None; 8]);
+        let overrides = Some(vec![(6, AgentId::Hermes), (7, AgentId::T3)]);
+        let owners = task_slot_owners(8, overrides.clone());
+        assert_eq!(owners[0], None);
+        assert_eq!(owners[5], None);
+        assert_eq!(owners[6], Some(AgentId::Hermes));
+        assert_eq!(owners[7], Some(AgentId::T3));
+        // Hermes can use the 6 Auto slots + its 1 pinned slot = 7;
+        // ZCode can use only the 6 Auto slots = 6;
+        // T3 can use the 6 Auto slots + its 1 pinned slot = 7.
+        assert_eq!(task_slots_for_agent(8, overrides.clone(), AgentId::Hermes), 7);
+        assert_eq!(task_slots_for_agent(8, overrides.clone(), AgentId::ZCode), 6);
+        assert_eq!(task_slots_for_agent(8, overrides, AgentId::T3), 7);
     }
 
     #[test]

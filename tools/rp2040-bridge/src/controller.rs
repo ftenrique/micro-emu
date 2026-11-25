@@ -14,7 +14,8 @@ pub struct DisplayContext {
     pub five_hour_remaining: Option<u8>,
     pub weekly_reset_at: Option<u64>,
     pub five_hour_reset_at: Option<u64>,
-    /// Which agent the usage fields above belong to ("codex" or "zcode").
+    /// Which agent the usage fields above belong to ("codex", "zcode" or
+    /// "claude").
     /// Bridge-derived only: `set_display_context` does not accept it.
     pub usage_agent: Option<String>,
     /// Per-agent usage snapshots ({"codex": {...}, "zcode": {...}}) so

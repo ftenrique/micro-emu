@@ -3,6 +3,8 @@ import { CodexActionExecutor } from "./codex-action-executor";
 import { ZCodeActionExecutor } from "./zcode-action-executor";
 import { HermesActionExecutor } from "./hermes-action-executor";
 import { ClaudeActionExecutor } from "./claude-action-executor";
+import { T3ActionExecutor } from "./t3-action-executor";
+import type { PinnedUsageAgent, UsageAgent } from "./actions/context";
 
 /** Display context enriched with the selected task physical number. */
 export interface SelectedDisplayContext extends DisplayContext {
@@ -20,13 +22,12 @@ export class PluginContext {
     readonly zcode: ZCodeActionExecutor;
     readonly hermes: HermesActionExecutor;
     readonly claude: ClaudeActionExecutor;
+    readonly t3: T3ActionExecutor;
     private threadStatus: unknown[] = [];
     private taskCards: unknown[] = [];
     private displayContext: DisplayContext | null = null;
     private selectedTaskSlot: number | null = null;
     private connected = false;
-    /** Usage source selected from the Context key; codex by default. */
-    private usageAgent: "codex" | "zcode" = "codex";
 
     /** Callbacks invoked when render state changes. */
     private listeners: Set<() => void> = new Set();
@@ -37,18 +38,19 @@ export class PluginContext {
         zcode = new ZCodeActionExecutor(),
         hermes = new HermesActionExecutor(),
         claude = new ClaudeActionExecutor(),
+        t3 = new T3ActionExecutor(),
     ) {
         this.daemon = daemon;
         this.codex = codex;
         this.zcode = zcode;
         this.hermes = hermes;
         this.claude = claude;
+        this.t3 = t3;
 
         daemon.on("connect", () => {
             this.connected = true;
-            // The daemon may have restarted and lost the selection; restate
-            // it so usage keeps reporting the chosen agent.
-            this.daemon.sendUsageAgent(this.usageAgent);
+            // The usage source is owned by the bridge, which follows the last
+            // pressed agent; the plugin never pins it.
             this.notifyListeners();
         });
         daemon.on("disconnect", () => {
@@ -87,27 +89,28 @@ export class PluginContext {
         return this.connected;
     }
 
-    /** Selects the usage source and notifies the daemon. */
-    setUsageAgent(agent: "codex" | "zcode"): void {
-        if (this.usageAgent === agent) return;
-        this.usageAgent = agent;
-        this.daemon.sendUsageAgent(agent);
-        this.notifyListeners();
+    /** The agent whose usage the bridge currently reports: the last agent
+     * whose task was pressed (Hermes, which has no usage source, leaves it
+     * unchanged). Codex until the bridge says otherwise. */
+    getUsageAgent(): PinnedUsageAgent {
+        return asPinnedUsageAgent(this.displayContext?.usage_agent) ?? "codex";
     }
 
-    getUsageAgent(): "codex" | "zcode" {
-        return this.usageAgent;
+    /** Resolves a key's usage setting: "auto" follows the bridge's
+     * selection, anything else is the pinned agent. */
+    resolveUsageAgent(setting: UsageAgent): PinnedUsageAgent {
+        return setting === "auto" ? this.getUsageAgent() : setting;
     }
 
     /** Usage fields for one agent, regardless of the globally selected
      * source. Prefers the bridge's per-agent snapshots; falls back to the
      * top-level fields when they already report this agent (older bridges
      * only send those for the selected source). */
-    getUsageFields(agent: "codex" | "zcode"): AgentUsageFields {
+    getUsageFields(agent: PinnedUsageAgent): AgentUsageFields {
         const ctx = this.displayContext;
         const fromMap = ctx?.agents_usage?.[agent];
         if (fromMap) return fromMap;
-        const topLevelOwner = ctx?.usage_agent ?? this.usageAgent;
+        const topLevelOwner = asPinnedUsageAgent(ctx?.usage_agent) ?? "codex";
         if (topLevelOwner === agent) {
             return {
                 five_hour_remaining: ctx?.five_hour_remaining,
@@ -131,10 +134,10 @@ export class PluginContext {
         const merged: SelectedDisplayContext = { ...(this.displayContext ?? {}) };
         // Fall back to the local selection when the daemon has not labeled
         // the usage fields (older bridge or unlabeled explicit context).
-        merged.usage_agent = nonEmptyText(merged.usage_agent) ?? this.usageAgent;
+        merged.usage_agent = nonEmptyText(merged.usage_agent) ?? this.getUsageAgent();
         const card = this.getSelectedTaskCard();
         if (!card) return merged;
-        merged.agent = nonEmptyText(card.agent) ?? merged.agent;
+        merged.agent = nonEmptyText(card.agent_label) ?? nonEmptyText(card.agent) ?? merged.agent;
         merged.task_id = nonEmptyText(card.task_id) ?? merged.task_id;
         const sourceSlot = Number(card.source_slot ?? card.id ?? card.slot ?? card.i);
         if (Number.isFinite(sourceSlot)) merged.task_number = sourceSlot + 1;
@@ -178,11 +181,11 @@ export class PluginContext {
         const selectedTask = this.getSelectedTaskCard();
         const taskId = this.displayContext?.task_id;
         if (actionId === "agent.new-task") {
-            // ZCode has no deep link for starting a task: when its window is
-            // the foreground app the daemon drives the desktop app directly.
-            // Every other case (ZCode unfocused, no daemon, timeout) falls
-            // back to the Codex new-task screen, regardless of which task
-            // card is selected.
+            // When ZCode, Hermes, Claude Desktop or T3 Code is the foreground
+            // app the daemon starts the task there (UI automation, Ctrl+N,
+            // `claude://code/new`, or `t3code://new`). Every other case (none
+            // of them focused, no daemon, timeout) falls back to the Codex
+            // new-task screen, regardless of which task card is selected.
             if (this.isConnected() && await this.daemon.requestZcodeNewTask()) {
                 return;
             }
@@ -192,7 +195,8 @@ export class PluginContext {
         const owner = selectedTask?.agent
             ?? (taskId?.startsWith("zcode:") ? "zcode"
                 : taskId?.startsWith("hermes:") ? "hermes"
-                : taskId?.startsWith("claude:") ? "claude" : undefined);
+                : taskId?.startsWith("claude:") ? "claude"
+                : taskId?.startsWith("t3:") ? "t3" : undefined);
         if (owner === "zcode") {
             await this.zcode.execute(actionId, { selectedTask, taskId });
             return;
@@ -203,6 +207,10 @@ export class PluginContext {
         }
         if (owner === "claude") {
             await this.claude.execute(actionId, { selectedTask, taskId });
+            return;
+        }
+        if (owner === "t3") {
+            await this.t3.execute(actionId, { selectedTask, taskId });
             return;
         }
         if (owner && owner !== "codex") {
@@ -259,6 +267,10 @@ function descriptiveCardTitle(card: Record<string, unknown>): string | undefined
     const fallback = nonEmptyText(card.t);
     if (!fallback || /^AG0[0-5]$/i.test(fallback)) return undefined;
     return fallback;
+}
+
+function asPinnedUsageAgent(value: unknown): PinnedUsageAgent | undefined {
+    return value === "codex" || value === "zcode" || value === "claude" ? value : undefined;
 }
 
 function nonEmptyText(value: unknown): string | undefined {

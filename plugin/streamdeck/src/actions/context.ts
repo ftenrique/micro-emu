@@ -3,13 +3,53 @@ import type { JsonValue } from "@elgato/utils";
 import { PluginContext } from "../context";
 import { renderContextKeyImage, type ContextKeyMode } from "../images";
 
-/** Agent whose usage limits the Usage mode reports. */
-export type UsageAgent = "codex" | "zcode";
+/** Agent with a usage source the bridge can report on. */
+export type PinnedUsageAgent = "codex" | "zcode" | "claude";
+
+/** Usage source setting: "auto" follows the last pressed agent (the
+ * bridge's selection); any other value pins the key to that agent. */
+export type UsageAgent = "auto" | PinnedUsageAgent;
 
 export interface ContextKeySettings {
     [key: string]: JsonValue;
     mode?: ContextKeyMode;
     usageAgent?: UsageAgent;
+    usageAgentVersion?: number;
+}
+
+/** Settings version that introduced "Last pressed agent". */
+export const USAGE_AGENT_SETTINGS_VERSION = 2;
+
+/**
+ * Keys and dials saved before "Last pressed agent" existed carry the old
+ * panel default "codex" without anyone having chosen it, which pins them to
+ * Codex. Moves that default to "auto" once and stamps the version, so a
+ * Codex pin chosen afterwards sticks. Deliberate non-default pins (ZCode)
+ * are kept. Returns null when the settings are already current.
+ */
+export function migrateUsageAgentSettings<T extends { usageAgent?: unknown; usageAgentVersion?: unknown }>(
+    settings: T,
+): T | null {
+    if (settings.usageAgentVersion === USAGE_AGENT_SETTINGS_VERSION) return null;
+    return {
+        ...settings,
+        usageAgent: settings.usageAgent === "codex" || settings.usageAgent == null
+            ? "auto"
+            : settings.usageAgent,
+        usageAgentVersion: USAGE_AGENT_SETTINGS_VERSION,
+    };
+}
+
+/** Applies the migration on appear: persists it and returns the settings to
+ * render with. */
+export function upgradeUsageAgentSettings<T extends { usageAgent?: unknown; usageAgentVersion?: unknown }>(
+    action: { setSettings(settings: T): Promise<void> },
+    settings: T,
+): T {
+    const migrated = migrateUsageAgentSettings(settings);
+    if (!migrated) return settings;
+    void action.setSettings(migrated).catch(() => undefined);
+    return migrated;
 }
 
 export function isPendingApproval(ctx: { status?: string | null; wait_reason?: string | null }): boolean {
@@ -40,12 +80,11 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
     }
 
     onWillAppear(ev: WillAppearEvent<ContextKeySettings>): void {
-        this.syncUsageAgent(ev.payload.settings);
-        this.refresh(ev.action as KeyAction<ContextKeySettings>, ev.payload.settings);
+        const action = ev.action as KeyAction<ContextKeySettings>;
+        this.refresh(action, upgradeUsageAgentSettings(action, ev.payload.settings));
     }
 
     onDidReceiveSettings(ev: DidReceiveSettingsEvent<ContextKeySettings>): void {
-        this.syncUsageAgent(ev.payload.settings);
         this.refresh(ev.action as KeyAction<ContextKeySettings>, ev.payload.settings);
     }
 
@@ -75,14 +114,6 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
         if (mode === "task") await this.ctx.executeSelectedAgentAction("task.open");
         else this.ctx.daemon.sendModelCycle();
     }
-    /** Pushes the configured usage source to the daemon whenever a key in
-     * Usage mode appears or its settings change. Task/Model keys leave the
-     * current selection untouched. */
-    private syncUsageAgent(settings: ContextKeySettings): void {
-        if (normalizeMode(settings.mode) !== "usage") return;
-        this.ctx.setUsageAgent(normalizeUsageAgent(settings.usageAgent));
-    }
-
     private refreshAll(): void {
         for (const action of this.actions) {
             action.getSettings().then((settings) =>
@@ -94,9 +125,9 @@ export class ContextKeyAction extends SingletonAction<ContextKeySettings> {
         const mode = normalizeMode(settings.mode);
         let ctx = this.ctx.getSelectedDisplayContext();
         if (mode === "usage") {
-            // This key always renders its own configured source, independent
-            // of the global selection it pushes to the daemon.
-            const agent = normalizeUsageAgent(settings.usageAgent);
+            // Auto follows the last pressed agent; a pinned key renders its
+            // own source from the bridge's per-agent snapshots.
+            const agent = this.ctx.resolveUsageAgent(normalizeUsageAgent(settings.usageAgent));
             ctx = { ...ctx, ...this.ctx.getUsageFields(agent), usage_agent: agent };
         }
         action.setImage(renderContextKeyImage(mode, ctx, this.ctx.isConnected(), this.showResetTimes.get(action) ?? false));
@@ -109,7 +140,7 @@ export function normalizeMode(value: unknown): ContextKeyMode {
     return value === "model" || value === "usage" ? value : "task";
 }
 
-/** Codex is the default usage source; anything else resolves to it. */
+/** Following the last pressed agent is the default; only known agents pin. */
 export function normalizeUsageAgent(value: unknown): UsageAgent {
-    return value === "zcode" ? "zcode" : "codex";
+    return value === "codex" || value === "zcode" || value === "claude" ? value : "auto";
 }

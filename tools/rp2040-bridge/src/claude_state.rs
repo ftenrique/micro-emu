@@ -205,6 +205,12 @@ fn build_task(record: &Value, model: Option<String>) -> Option<Value> {
             task["timing_authoritative"] = json!(true);
         }
     }
+    let updated_at_ms = record_time(record, "updatedAt")
+        .max(record_time(record, "statusUpdatedAt"))
+        .max(record_time(record, "startedAt"));
+    if updated_at_ms > 0 {
+        task["updated_at_ms"] = json!(updated_at_ms);
+    }
     Some(task)
 }
 

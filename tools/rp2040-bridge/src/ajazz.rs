@@ -140,7 +140,8 @@ impl AjazzDevice {
             } else {
                 colors[index] = Some((color & 0x00ff_ffff, (brightness * 100.0) as u8));
                 agents[index] = entry
-                    .get("agent")
+                    .get("agent_label")
+                    .or_else(|| entry.get("agent"))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 titles[index] = entry.get("t").and_then(Value::as_str).map(str::to_owned);
@@ -526,12 +527,20 @@ fn encode_ajazz_image(image: RgbImage) -> Result<Vec<u8>, String> {
 }
 
 fn draw_agent_label(image: &mut RgbImage, agent: &str) {
-    let text = agent.to_ascii_lowercase();
-    let scale = 2_u32;
-    let width = text.chars().count() as u32 * 8;
-    let start_x = (SOURCE_SIZE.saturating_sub(width)) / 2;
-    for (index, ch) in text.chars().enumerate() {
-        let glyph = agent_glyph(ch);
+    let text = agent.to_ascii_uppercase();
+    let char_count = text.chars().count() as u32;
+    let scale = if char_count.saturating_mul(8) <= SOURCE_SIZE.saturating_sub(4) {
+        2_u32
+    } else {
+        1_u32
+    };
+    let pitch = 4 * scale;
+    let max_chars = (SOURCE_SIZE.saturating_sub(4) / pitch).max(1) as usize;
+    let chars: Vec<char> = text.chars().take(max_chars).collect();
+    let width = chars.len() as u32 * pitch;
+    let start_x = SOURCE_SIZE.saturating_sub(width) / 2;
+    for (index, ch) in chars.into_iter().enumerate() {
+        let glyph = metadata_glyph(ch);
         for row in 0..5 {
             for column in 0..3 {
                 if glyph[row * 3 + column] == 0 {
@@ -539,31 +548,15 @@ fn draw_agent_label(image: &mut RgbImage, agent: &str) {
                 }
                 for y in 0..scale {
                     for x in 0..scale {
-                        image.put_pixel(
-                            start_x + index as u32 * 8 + column as u32 * scale + x,
-                            2 + row as u32 * scale + y,
-                            Rgb(DIGIT_COLOR),
-                        );
+                        let px = start_x + index as u32 * pitch + column as u32 * scale + x;
+                        let py = 2 + row as u32 * scale + y;
+                        if px < image.width() && py < image.height() {
+                            image.put_pixel(px, py, Rgb(DIGIT_COLOR));
+                        }
                     }
                 }
             }
         }
-    }
-}
-
-fn agent_glyph(ch: char) -> [u8; 15] {
-    match ch {
-        'c' => [0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 1],
-        'd' => [1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0],
-        'e' => [1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 1],
-        'h' => [1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1],
-        'm' => [1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1],
-        'o' => [0, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0],
-        'r' => [1, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1],
-        's' => [0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0],
-        'x' => [1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1],
-        'z' => [1, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1],
-        _ => [0; 15],
     }
 }
 #[cfg(test)]

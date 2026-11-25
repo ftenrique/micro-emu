@@ -13,18 +13,30 @@ export interface ClaudeActionContext {
  *
  * Everything runs against Claude Code's local state: the workspace path comes
  * from the task card, and the last prompt/response are read from the session
- * transcript (`~/.claude/projects/<project>/<session-id>.jsonl`). Actions
- * Claude Code offers no local integration for fail closed and are never
- * forwarded to Codex.
+ * transcript (`~/.claude/projects/<project>/<session-id>.jsonl`). Open drives
+ * the Claude desktop app through its own `claude://code/continue` deep link
+ * (New task is handled by the bridge while Claude is focused). Actions Claude Code offers no local integration for fail
+ * closed and are never forwarded to Codex.
  */
 export class ClaudeActionExecutor {
     private readonly home: string;
 
-    constructor(home: string = claudeHome()) {
+    private readonly openUrl: (url: string) => Promise<void>;
+
+    constructor(home: string = claudeHome(), openUrl: (url: string) => Promise<void> = openDeepLink) {
         this.home = home;
+        this.openUrl = openUrl;
     }
 
     async execute(actionId: string, context: ClaudeActionContext): Promise<void> {
+        if (actionId === "task.open") {
+            // Desktop-hosted sessions open directly; a terminal session has no
+            // desktop route, so just bring the app forward.
+            const session = desktopSessionId(claudeTaskId(context));
+            await this.openUrl(session ? `claude://code/continue?session=${session}` : "claude://");
+            return;
+        }
+
         if (actionId === "task.copy-path") {
             const path = context.selectedTask?.workspace_path;
             if (typeof path !== "string" || !path.trim()) {
@@ -96,6 +108,27 @@ export class ClaudeActionExecutor {
 
 function claudeHome(): string {
     return process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+}
+
+/** Desktop host ids are `local_` plus 1-64 letters, digits or dashes; any
+ * other id (CLI sessions, injected URL text) is never put into a URL. */
+export function desktopSessionId(id: string | null): string | null {
+    return id != null && /^local_[A-Za-z0-9-]{1,64}$/.test(id) ? id : null;
+}
+
+/** Hands a fixed `claude://` URL to the registered protocol handler. */
+function openDeepLink(url: string): Promise<void> {
+    const [command, args] = process.platform === "win32"
+        ? ["cmd.exe", ["/C", "start", "", url]]
+        : ["open", [url]];
+    return new Promise((resolve, reject) => {
+        const child = spawn(command, args, { stdio: "ignore", windowsHide: true });
+        child.once("error", reject);
+        child.once("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error("Could not open " + url + " (exit " + (code ?? "unknown") + ")"));
+        });
+    });
 }
 
 function claudeTaskId(context: ClaudeActionContext): string | null {

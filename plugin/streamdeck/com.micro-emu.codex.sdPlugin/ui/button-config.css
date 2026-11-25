@@ -51,6 +51,7 @@ body {
 .executor-badge[data-executor="Bridge"] { color: var(--bridge); }
 .executor-badge[data-executor="Agent"] { color: var(--agent); }
 .executor-badge[data-executor="Codex"] { color: var(--agent); }
+.executor-badge[data-executor="T3"] { color: #5eead4; }
 .executor-badge[data-executor="Legacy"] { color: #ffbb6e; }
 
 .summary-description,

@@ -15,14 +15,15 @@ export interface ActionCatalogItem {
     title: string;
     description: string;
     icon: string;
-    executor: "Micro" | "Bridge" | "Codex" | "Unavailable";
+    executor: "Micro" | "Bridge" | "Codex" | "T3" | "Unavailable";
     dispatch: ActionDispatch;
 }
 
 /**
  * Stream Deck action catalog. Micro entries execute immediately; task
- * navigation and desktop shortcuts are handled by the daemon; Codex workflow
- * entries execute through deep links and the local Codex app-server.
+ * navigation, T3 Code controls, and desktop shortcuts are handled by the
+ * daemon; Codex/Claude/T3/Hermes/ZCode workflow entries route through their
+ * respective local executors.
  */
 export const ACTION_CATALOG: readonly ActionCatalogItem[] = [
     // Physical Codex Micro controls. AG00-AG05 intentionally stay out of this
@@ -30,7 +31,7 @@ export const ACTION_CATALOG: readonly ActionCatalogItem[] = [
     { id: "micro.act06", category: "Codex Micro", label: "ACT06", title: "ACT06", description: "Press the physical ACT06 command. Its meaning remains configurable in Codex Micro.", icon: "action", executor: "Micro", dispatch: { kind: "micro-key", key: "ACT06" } },
     { id: "micro.act07", category: "Codex Micro", label: "ACT07", title: "ACT07", description: "Press the physical ACT07 command. Its meaning remains configurable in Codex Micro.", icon: "action", executor: "Micro", dispatch: { kind: "micro-key", key: "ACT07" } },
     { id: "micro.act08", category: "Codex Micro", label: "ACT08", title: "ACT08", description: "Press the physical ACT08 command. Its meaning remains configurable in Codex Micro.", icon: "action", executor: "Micro", dispatch: { kind: "micro-key", key: "ACT08" } },
-    { id: "micro.mic", category: "Codex Micro", label: "Microphone (ACT10)", title: "Mic", description: "Hold to talk: Codex push-to-talk, or Windows dictation into the focused ZCode, Hermes or Claude app.", icon: "mic", executor: "Micro", dispatch: { kind: "encoder-button", index: 2 } },
+    { id: "micro.mic", category: "Codex Micro", label: "Microphone (ACT10)", title: "Mic", description: "Hold to talk: Codex push-to-talk, or Windows dictation into the focused ZCode, Hermes, Claude or T3 Code app.", icon: "mic", executor: "Micro", dispatch: { kind: "encoder-button", index: 2 } },
     { id: "micro.send", category: "Codex Micro", label: "Send (ACT12)", title: "Send", description: "Press the Codex Micro send control (ACT12).", icon: "send", executor: "Micro", dispatch: { kind: "encoder-button", index: 0 } },
     { id: "micro.rotor-click", category: "Codex Micro", label: "Rotor click (ENC_CLK)", title: "Click", description: "Press the Codex Micro rotor.", icon: "rotor", executor: "Micro", dispatch: { kind: "encoder-button", index: 1 } },
     { id: "micro.rotor-cw", category: "Codex Micro", label: "Rotor clockwise (ENC_CW)", title: "CW", description: "Turn the Codex Micro rotor one step clockwise.", icon: "clockwise", executor: "Micro", dispatch: { kind: "encoder-turn", index: 1, delta: 1 } },
@@ -47,22 +48,34 @@ export const ACTION_CATALOG: readonly ActionCatalogItem[] = [
     { id: "task.last", category: "Task navigation", label: "Last task", title: "Last", description: "Select the last occupied Task Card.", icon: "last", executor: "Bridge", dispatch: { kind: "catalog-action" } },
 
     // Codex actions below have concrete desktop or app-server executors.
-    { id: "task.open", category: "Task lifecycle", label: "Open selected task", title: "Open", description: "Open and focus the selected Codex task.", icon: "open", executor: "Codex", dispatch: { kind: "codex-action" } },
+    { id: "task.open", category: "Task lifecycle", label: "Open selected task", title: "Open", description: "Open and focus the selected task (Codex, Claude Desktop, or T3 Code).", icon: "open", executor: "Codex", dispatch: { kind: "codex-action" } },
     { id: "task.retry", category: "Task lifecycle", label: "Retry task", title: "Retry", description: "Replay the selected task's latest prompt as a new Codex turn.", icon: "retry", executor: "Codex", dispatch: { kind: "codex-action" } },
     { id: "task.fork", category: "Task lifecycle", label: "Fork task", title: "Fork", description: "Fork the selected Codex task and open the new task.", icon: "fork", executor: "Codex", dispatch: { kind: "codex-action" } },
     { id: "task.archive", category: "Task lifecycle", label: "Archive task", title: "Archive", description: "Archive the selected Codex task.", icon: "archive", executor: "Codex", dispatch: { kind: "codex-action" } },
 
-    { id: "task.copy-prompt", category: "Task interaction", label: "Copy prompt", title: "Copy Prompt", description: "Copy the selected Codex task's latest user prompt.", icon: "copy-prompt", executor: "Codex", dispatch: { kind: "codex-action" } },
-    { id: "task.copy-response", category: "Task interaction", label: "Copy last response", title: "Copy Reply", description: "Copy the selected Codex task's latest agent response.", icon: "copy", executor: "Codex", dispatch: { kind: "codex-action" } },
-    { id: "task.copy-path", category: "Task interaction", label: "Copy workspace path", title: "Copy Path", description: "Copy the selected Codex task's workspace path.", icon: "clipboard", executor: "Codex", dispatch: { kind: "codex-action" } },
+    { id: "task.copy-prompt", category: "Task interaction", label: "Copy prompt", title: "Copy Prompt", description: "Copy the selected task's latest user prompt (Codex, Claude, Hermes, ZCode or T3 Code).", icon: "copy-prompt", executor: "Codex", dispatch: { kind: "codex-action" } },
+    { id: "task.copy-response", category: "Task interaction", label: "Copy last response", title: "Copy Reply", description: "Copy the selected task's latest agent response (Codex, Claude, Hermes, ZCode or T3 Code).", icon: "copy", executor: "Codex", dispatch: { kind: "codex-action" } },
+    { id: "task.copy-path", category: "Task interaction", label: "Copy workspace path", title: "Copy Path", description: "Copy the selected task's workspace path.", icon: "clipboard", executor: "Codex", dispatch: { kind: "codex-action" } },
 
-    { id: "agent.new-task", category: "Codex workflow", label: "New task", title: "New Task", description: "Start a new task in the focused ZCode or Hermes app; otherwise open the Codex new-task screen.", icon: "new-chat", executor: "Codex", dispatch: { kind: "codex-action" } },
-    { id: "agent.search", category: "Codex workflow", label: "Search tasks", title: "Search", description: "Focus Codex and open task search.", icon: "search", executor: "Bridge", dispatch: { kind: "catalog-action" } },
+    { id: "agent.new-task", category: "Codex workflow", label: "New task", title: "New Task", description: "Start a new task in the focused ZCode, Hermes, Claude or T3 Code app; otherwise open the Codex new-task screen.", icon: "new-chat", executor: "Codex", dispatch: { kind: "codex-action" } },
+    { id: "agent.search", category: "Codex workflow", label: "Search tasks", title: "Search", description: "Focus the selected agent (Codex, Hermes, or T3 Code) and open search.", icon: "search", executor: "Bridge", dispatch: { kind: "catalog-action" } },
     { id: "agent.review-changes", category: "Codex workflow", label: "Review changes", title: "Review", description: "Start a Codex review of uncommitted workspace changes.", icon: "review", executor: "Codex", dispatch: { kind: "codex-action" } },
     { id: "agent.run-tests", category: "Codex workflow", label: "Run tests", title: "Tests", description: "Start a Codex turn that runs and diagnoses the relevant tests.", icon: "tests", executor: "Codex", dispatch: { kind: "codex-action" } },
-    { id: "agent.open-terminal", category: "Codex workflow", label: "Open terminal", title: "Terminal", description: "Focus Codex and toggle its bottom terminal.", icon: "terminal", executor: "Bridge", dispatch: { kind: "catalog-action" } },
+    { id: "agent.open-terminal", category: "Codex workflow", label: "Open terminal", title: "Terminal", description: "Focus the selected agent (Codex, Hermes, or T3 Code) and toggle its terminal.", icon: "terminal", executor: "Bridge", dispatch: { kind: "catalog-action" } },
     { id: "agent.compact-context", category: "Codex workflow", label: "Compact context", title: "Compact", description: "Start Codex context compaction for the selected task.", icon: "compact", executor: "Codex", dispatch: { kind: "codex-action" } },
     { id: "agent.settings", category: "Codex workflow", label: "Codex settings", title: "Settings", description: "Open Codex settings.", icon: "settings", executor: "Codex", dispatch: { kind: "codex-action" } },
+
+    // Custom T3 Code desktop controls executed by the rp2040-bridge daemon.
+    { id: "t3.new-thread", category: "T3 Code", label: "T3: New thread", title: "New T3", description: "Open a new thread in T3 Code Desktop (t3code://new).", icon: "new-chat", executor: "T3", dispatch: { kind: "catalog-action" } },
+    { id: "t3.command-palette", category: "T3 Code", label: "T3: Command palette", title: "Palette", description: "Focus T3 Code Desktop and open the command palette (Ctrl+K).", icon: "search", executor: "T3", dispatch: { kind: "catalog-action" } },
+    { id: "t3.model-picker", category: "T3 Code", label: "T3: Pick model", title: "T3 Model", description: "Focus T3 Code Desktop and open the model picker (Ctrl+Shift+M).", icon: "model", executor: "T3", dispatch: { kind: "catalog-action" } },
+    { id: "t3.settle-thread", category: "T3 Code", label: "T3: Settle thread", title: "Settle", description: "Focus T3 Code Desktop and toggle settled state for the active thread (Ctrl+Shift+S).", icon: "approve", executor: "T3", dispatch: { kind: "catalog-action" } },
+    { id: "t3.pin-thread", category: "T3 Code", label: "T3: Pin thread", title: "Pin T3", description: "Focus T3 Code Desktop and pin or unpin the active thread (Ctrl+Shift+P).", icon: "pin", executor: "T3", dispatch: { kind: "catalog-action" } },
+    { id: "t3.toggle-preview", category: "T3 Code", label: "T3: Toggle preview", title: "Preview", description: "Focus T3 Code Desktop and toggle the built-in preview panel (Ctrl+Shift+J).", icon: "browser", executor: "T3", dispatch: { kind: "catalog-action" } },
+    { id: "t3.toggle-sidebar", category: "T3 Code", label: "T3: Toggle sidebar", title: "Sidebar", description: "Focus T3 Code Desktop and toggle the thread sidebar (Ctrl+B).", icon: "grid", executor: "T3", dispatch: { kind: "catalog-action" } },
+    { id: "t3.toggle-terminal", category: "T3 Code", label: "T3: Toggle terminal", title: "T3 Term", description: "Focus T3 Code Desktop and toggle the integrated terminal (Ctrl+J).", icon: "terminal", executor: "T3", dispatch: { kind: "catalog-action" } },
+    { id: "t3.copy-reference", category: "T3 Code", label: "T3: Copy thread ref", title: "Copy Ref", description: "Focus T3 Code Desktop and copy the active thread reference (Ctrl+Shift+C).", icon: "copy", executor: "T3", dispatch: { kind: "catalog-action" } },
+    { id: "t3.open-usage", category: "T3 Code", label: "T3: Open usage", title: "T3 Usage", description: "Focus T3 Code Desktop and open the usage view (Ctrl+U).", icon: "info", executor: "T3", dispatch: { kind: "catalog-action" } },
 ];
 
 const RETIRED_ACTIONS: readonly ActionCatalogItem[] = [

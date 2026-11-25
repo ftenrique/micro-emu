@@ -17,6 +17,8 @@ mod proxy;
 mod routing;
 mod serial;
 mod streamdeck;
+mod t3_state;
+mod t3_window;
 mod tasks;
 mod usage;
 mod wire;
@@ -157,9 +159,9 @@ fn parse_options() -> Result<Options, String> {
             }
             "--mcp-proxy" => mcp_proxy = true,
             "--agent" => {
-                let value = arguments
-                    .next()
-                    .ok_or_else(|| "--agent requires codex, claude, zcode, or hermes".to_owned())?;
+                let value = arguments.next().ok_or_else(|| {
+                    "--agent requires codex, claude, zcode, hermes, or t3".to_owned()
+                })?;
                 agent = Some(crate::routing::AgentId::parse(&value)?);
             }
             "--connect" => {
@@ -168,6 +170,34 @@ fn parse_options() -> Result<Options, String> {
                     .ok_or_else(|| "--connect requires an address".to_owned())?;
             }
             "--autostart" => autostart = true,
+            // Diagnostic: fetch one agent's usage the way the daemon does and
+            // print the parsed percentages (never any credential).
+            "--print-usage" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--print-usage requires codex|zcode|claude".to_owned())?;
+                let agent = crate::usage::UsageAgent::parse(&value)
+                    .ok_or_else(|| format!("unknown usage agent: {value}"))?;
+                println!("{}", crate::usage::fetch_usage(agent).to_value());
+                std::process::exit(0);
+            }
+            // Read-only helper used by the Stream Deck plugin (Node 20) to copy
+            // the latest prompt or response from T3 Code's SQLite projection.
+            "--read-t3-message" => {
+                let thread_id = arguments
+                    .next()
+                    .ok_or_else(|| "--read-t3-message requires <thread_id> <user|assistant>".to_owned())?;
+                let role = arguments
+                    .next()
+                    .ok_or_else(|| "--read-t3-message requires <thread_id> <user|assistant>".to_owned())?;
+                match crate::t3_state::read_t3_last_message(&thread_id, &role) {
+                    Ok(text) => {
+                        println!("{}", json!({"text": text}));
+                        std::process::exit(0);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             "--daemon-args" => {
                 let value = arguments
                     .next()
@@ -176,7 +206,7 @@ fn parse_options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "rp2040-bridge --port none|auto|COMx [--device KIND[,serial=SERIAL][,task-slots=N]]... [--controller ajazz|streamdeck-plus|streamdeck-plus-xl|streamdeck-xl|none] [--controller-serial SERIAL] [--no-ajazz] [--listen 0..3600] [--emit AG00] [--emit-after 0..3600] [--mcp|--legacy|--daemon [--bind 127.0.0.1:48360] | --mcp-proxy --agent codex|claude|zcode|hermes [--connect 127.0.0.1:48360] [--autostart] [--daemon-args \"...\"]]"
+                    "rp2040-bridge --port none|auto|COMx [--device KIND[,serial=SERIAL][,task-slots=N]]... [--controller ajazz|streamdeck-plus|streamdeck-plus-xl|streamdeck-xl|none] [--controller-serial SERIAL] [--no-ajazz] [--listen 0..3600] [--emit AG00] [--emit-after 0..3600] [--mcp|--legacy|--daemon [--bind 127.0.0.1:48360] | --mcp-proxy --agent codex|claude|zcode|hermes|t3 [--connect 127.0.0.1:48360] [--autostart] [--daemon-args \"...\"]]"
                 );
                 std::process::exit(0);
             }
@@ -220,7 +250,7 @@ fn parse_options() -> Result<Options, String> {
         .unwrap_or(ControllerKind::None);
     let controller_serial = device_specs.first().and_then(|spec| spec.serial.clone());
     if mcp_proxy && agent.is_none() {
-        return Err("--mcp-proxy requires --agent codex|claude|zcode|hermes".to_owned());
+        return Err("--mcp-proxy requires --agent codex|claude|zcode|hermes|t3".to_owned());
     }
     if let Some(key) = &emit_key {
         messages_for_synthetic_key(key)?;
@@ -1243,6 +1273,11 @@ pub(crate) fn bridge_status(bridge: &BridgeRuntime, mode: &str) -> Value {
                 "events": bridge.routing.queue(crate::routing::AgentId::Claude).len(),
                 "keys": bridge.partition.keys_for(crate::routing::AgentId::Claude),
                 "slots": bridge.partition.slots_for(crate::routing::AgentId::Claude)
+            },
+            "t3": {
+                "events": bridge.routing.queue(crate::routing::AgentId::T3).len(),
+                "keys": bridge.partition.keys_for(crate::routing::AgentId::T3),
+                "slots": bridge.partition.slots_for(crate::routing::AgentId::T3)
             }
         },
         "partition": {
@@ -1313,6 +1348,7 @@ fn route_task_button(
                 .pending_task_events
                 .push((task.owner_session, selection));
         }
+        follow_usage_to_task(bridge, &task);
         // Auto-fed ZCode cards have no MCP session that could act on the
         // selection event, so switch the desktop app to the pressed session
         // directly through UI automation. The request is queued and runs off
@@ -1336,6 +1372,13 @@ fn route_task_button(
             && task.owner_session == crate::daemon::CLAUDE_POLL_SESSION
         {
             crate::claude_window::request_session_selection(&task.task_id);
+        }
+        // Auto-fed T3 Code cards switch T3 Desktop to the pressed thread
+        // through `t3code://threads/<envId>/<threadId>`.
+        if task.owner_agent == crate::routing::AgentId::T3
+            && task.owner_session == crate::daemon::T3_POLL_SESSION
+        {
+            crate::t3_window::request_session_selection(&task.task_id);
         }
     }
 
@@ -1555,12 +1598,44 @@ fn route_task_toggle(
                 }
             }
         },
+        crate::routing::AgentId::T3 => match crate::t3_window::is_foreground() {
+            Ok(true) => {
+                if let Err(error) = crate::t3_window::minimize() {
+                    eprintln!("T3 window minimize failed: {error}");
+                }
+            }
+            Ok(false) | Err(_) => {
+                // Select the thread via `t3code://threads/<envId>/<threadId>`
+                // and bring T3 Code to the foreground.
+                route_task_button(
+                    bridge,
+                    device_id,
+                    slot_count,
+                    index,
+                    true,
+                    Some(&task.task_id),
+                    now_ms,
+                );
+                route_task_button(
+                    bridge,
+                    device_id,
+                    slot_count,
+                    index,
+                    false,
+                    Some(&task.task_id),
+                    now_ms,
+                );
+                if let Err(error) = crate::t3_window::show_and_focus() {
+                    eprintln!("T3 window focus failed: {error}");
+                }
+            }
+        },
     }
     true
 }
 
-/// ZCode, Hermes and Claude Desktop have no push-to-talk of their own. While
-/// one of their windows is the foreground app (or owns an open dictation
+/// ZCode, Hermes, Claude, and T3 Desktop have no push-to-talk of their own.
+/// While one of their windows is the foreground app (or owns an open dictation
 /// session) the mic key drives Windows dictation into it instead of
 /// ChatGPT/Codex. Returns whether the press/release was handled here.
 fn route_desktop_dictation(pressed: bool) -> bool {
@@ -1576,6 +1651,10 @@ fn route_desktop_dictation(pressed: bool) -> bool {
         || crate::claude_window::is_foreground().unwrap_or(false)
     {
         crate::claude_window::set_microphone(pressed)
+    } else if crate::t3_window::microphone_active()
+        || crate::t3_window::is_foreground().unwrap_or(false)
+    {
+        crate::t3_window::set_microphone(pressed)
     } else {
         return false;
     };
@@ -1596,7 +1675,8 @@ fn catalog_target_session(
             if session != 0
                 && session != crate::daemon::ZCODE_POLL_SESSION
                 && session != crate::daemon::HERMES_POLL_SESSION
-                && session != crate::daemon::CLAUDE_POLL_SESSION =>
+                && session != crate::daemon::CLAUDE_POLL_SESSION
+                && session != crate::daemon::T3_POLL_SESSION =>
         {
             session
         }
@@ -1650,6 +1730,28 @@ fn route_catalog_task_navigation(
         let (session, _) = catalog_target_session(Some(&task));
         bridge.pending_task_events.push((session, selection));
     }
+    follow_usage_to_task(bridge, &task);
+}
+
+/// Points the usage display at the provider/agent whose task was just pressed
+/// or navigated to, so the limits on screen always belong to the last pressed
+/// provider. For T3 Code cards, this resolves the thread's underlying provider
+/// harness (Codex -> Codex, Claude -> Claude, GLM -> ZCode). Providers without
+/// a usage source (Hermes, Antigravity, Devin, etc.) leave the current source
+/// in place rather than blanking it.
+fn follow_usage_to_task(bridge: &mut BridgeRuntime, task: &crate::tasks::TaskCard) {
+    let Some(usage_agent) =
+        crate::usage::UsageAgent::from_task(task.owner_agent, task.provider.as_deref())
+    else {
+        return;
+    };
+    if bridge.usage_agent != usage_agent
+        || !bridge
+            .usage_cache
+            .refreshed_within(usage_agent, crate::usage::USAGE_REFRESH_INTERVAL)
+    {
+        route_usage_select(bridge, usage_agent);
+    }
 }
 
 fn route_catalog_action(
@@ -1681,6 +1783,78 @@ fn route_catalog_action(
         CatalogAction::AgentOpenTerminal if agent == crate::routing::AgentId::Codex => {
             if let Err(error) = crate::codex_window::toggle_terminal() {
                 eprintln!("Codex terminal toggle failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::AgentSearch if agent == crate::routing::AgentId::T3 => {
+            if let Err(error) = crate::t3_window::search_projects() {
+                eprintln!("T3 search failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::AgentOpenTerminal if agent == crate::routing::AgentId::T3 => {
+            if let Err(error) = crate::t3_window::toggle_terminal() {
+                eprintln!("T3 terminal toggle failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::T3NewThread => {
+            if let Err(error) = crate::t3_window::start_new_session() {
+                eprintln!("T3 new thread failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::T3CommandPalette => {
+            if let Err(error) = crate::t3_window::toggle_command_palette() {
+                eprintln!("T3 command palette failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::T3ModelPicker => {
+            if let Err(error) = crate::t3_window::toggle_model_picker() {
+                eprintln!("T3 model picker failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::T3SettleThread => {
+            if let Err(error) = crate::t3_window::settle_thread() {
+                eprintln!("T3 settle thread failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::T3PinThread => {
+            if let Err(error) = crate::t3_window::pin_thread() {
+                eprintln!("T3 pin thread failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::T3TogglePreview => {
+            if let Err(error) = crate::t3_window::toggle_preview() {
+                eprintln!("T3 toggle preview failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::T3ToggleSidebar => {
+            if let Err(error) = crate::t3_window::toggle_sidebar() {
+                eprintln!("T3 toggle sidebar failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::T3ToggleTerminal => {
+            if let Err(error) = crate::t3_window::toggle_terminal() {
+                eprintln!("T3 toggle terminal failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::T3CopyReference => {
+            if let Err(error) = crate::t3_window::copy_thread_reference() {
+                eprintln!("T3 copy reference failed: {error}");
+            }
+            return;
+        }
+        CatalogAction::T3OpenUsage => {
+            if let Err(error) = crate::t3_window::open_usage() {
+                eprintln!("T3 open usage failed: {error}");
             }
             return;
         }
@@ -1743,6 +1917,16 @@ pub(crate) fn patch_display_context_usage(bridge: &mut BridgeRuntime) {
 
 fn route_model_cycle(bridge: &mut BridgeRuntime) {
     let task = bridge.task_board.selected_task().cloned();
+    if let Some(task) = task
+        .as_ref()
+        .filter(|task| task.owner_agent == crate::routing::AgentId::T3)
+    {
+        let _ = task;
+        if let Err(error) = crate::t3_window::toggle_model_picker() {
+            eprintln!("T3 model picker failed: {error}");
+        }
+        return;
+    }
     if let Some(task) = task
         .as_ref()
         .filter(|task| task.owner_agent != crate::routing::AgentId::Codex)
@@ -2847,6 +3031,68 @@ mod tests {
                 .five_hour_remaining,
             Some(62)
         );
+    }
+
+    #[test]
+    fn pressing_a_task_card_points_usage_at_its_agent() {
+        let rendered = Arc::new(Mutex::new(None));
+        let mut bridge = test_bridge(rendered);
+        bridge.task_mode = true;
+        let device_id = bridge.task_device_id.clone();
+        bridge
+            .task_board
+            .set_device(device_id.clone(), bridge.task_slot_count, true);
+        // Fresh snapshots keep the selection path off the network.
+        let claude = crate::usage::UsageSnapshot {
+            five_hour_remaining: Some(58),
+            weekly_remaining: Some(88),
+            ..crate::usage::UsageSnapshot::default()
+        };
+        bridge
+            .usage_cache
+            .store(crate::usage::UsageAgent::Claude, claude);
+        bridge
+            .usage_cache
+            .store(crate::usage::UsageAgent::Codex, crate::usage::UsageSnapshot::default());
+        bridge
+            .task_board
+            .publish_legacy_status(
+                9,
+                crate::routing::AgentId::Claude,
+                &json!([{"i": 0, "e": 1, "t": "Claude task"}]),
+                1,
+            )
+            .unwrap();
+        bridge
+            .task_board
+            .publish_legacy_status(
+                10,
+                crate::routing::AgentId::Hermes,
+                &json!([{"i": 1, "e": 1, "t": "Hermes task"}]),
+                1,
+            )
+            .unwrap();
+        let slot_of = |bridge: &BridgeRuntime, title: &str| -> u8 {
+            let task = bridge
+                .task_board
+                .tasks()
+                .find(|task| task.title == title)
+                .expect("published task");
+            bridge.task_board.assignment(&task.task_id).unwrap().slot.slot as u8
+        };
+
+        let claude_slot = slot_of(&bridge, "Claude task");
+        assert!(route_task_button(&mut bridge, &device_id, 8, claude_slot, true, None, 2));
+        assert_eq!(bridge.usage_agent, crate::usage::UsageAgent::Claude);
+        let context = bridge.last_display_context.clone().unwrap();
+        assert_eq!(context.usage_agent.as_deref(), Some("claude"));
+        assert_eq!(context.five_hour_remaining, Some(58));
+        assert_eq!(context.weekly_remaining, Some(88));
+
+        // Hermes has no usage source: the last agent's limits stay on screen.
+        let hermes_slot = slot_of(&bridge, "Hermes task");
+        assert!(route_task_button(&mut bridge, &device_id, 8, hermes_slot, true, None, 3));
+        assert_eq!(bridge.usage_agent, crate::usage::UsageAgent::Claude);
     }
 
     #[test]

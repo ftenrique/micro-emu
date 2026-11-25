@@ -107,6 +107,7 @@ impl PluginController {
                             "zcode" => Some(AgentId::ZCode),
                             "hermes" => Some(AgentId::Hermes),
                             "claude" => Some(AgentId::Claude),
+                            "t3" => Some(AgentId::T3),
                             _ => None,
                         }) else {
                             continue;
@@ -126,11 +127,13 @@ impl PluginController {
                 }
                 None
             }
-            // New task request from the plugin: when the ZCode or Hermes
-            // desktop app is the foreground window the new task is created
-            // there (ZCode through the sidebar automation, Hermes through
-            // its Ctrl+N accelerator); anything else is declined so the
-            // plugin falls back to the Codex new-task screen.
+            // New task request from the plugin: when the ZCode, Hermes, Claude,
+            // or T3 desktop app is the foreground window the new task is
+            // created there (ZCode through the sidebar automation, Hermes
+            // through its Ctrl+N accelerator, Claude through its
+            // `claude://code/new` deep link, T3 through `t3code://new`);
+            // anything else is declined so the plugin falls back to the Codex
+            // new-task screen.
             "new-task" => {
                 let handled = if crate::zcode_window::is_foreground().unwrap_or(false) {
                     crate::zcode_window::request_new_task();
@@ -140,6 +143,22 @@ impl PluginController {
                         Ok(()) => true,
                         Err(error) => {
                             eprintln!("Hermes new session shortcut failed: {error}");
+                            false
+                        }
+                    }
+                } else if crate::claude_window::is_foreground().unwrap_or(false) {
+                    match crate::claude_window::start_new_session() {
+                        Ok(()) => true,
+                        Err(error) => {
+                            eprintln!("Claude new session deep link failed: {error}");
+                            false
+                        }
+                    }
+                } else if crate::t3_window::is_foreground().unwrap_or(false) {
+                    match crate::t3_window::start_new_session() {
+                        Ok(()) => true,
+                        Err(error) => {
+                            eprintln!("T3 new session deep link failed: {error}");
                             false
                         }
                     }
