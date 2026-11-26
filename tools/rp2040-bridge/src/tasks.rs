@@ -174,7 +174,7 @@ pub struct TaskCard {
     /// T3 Code (e.g. `"codex"`, `"claudeAgent"`, `"acpRegistry_google_antigravity"`).
     pub provider: Option<String>,
     /// Optional display label overriding the bare agent name on task buttons
-    /// (e.g. `"T3-Codex"`, `"T3-Claude"`, `"T3-Antigravity"`).
+    /// (e.g. `"T3-Codex"`, `"T3-Claude"`, `"T3-AGY"`).
     pub agent_label: Option<String>,
     pub title: String,
     pub project: Option<String>,
@@ -2092,7 +2092,7 @@ mod tests {
                     "task_id": "t3:1",
                     "title": "T3 Work",
                     "provider": "antigravity",
-                    "agent_label": "T3-Antigravity",
+                    "agent_label": "T3-AGY",
                     "state": "running",
                     "priority": 100,
                     "updated_at_ms": 1_000
@@ -2137,7 +2137,7 @@ mod tests {
         let rendered = board.rendered_slots("primary", 4);
         assert_eq!(rendered[0]["agent"], "t3");
         assert_eq!(rendered[0]["provider"], "antigravity");
-        assert_eq!(rendered[0]["agent_label"], "T3-Antigravity");
+        assert_eq!(rendered[0]["agent_label"], "T3-AGY");
     }
 
     #[test]

@@ -30,7 +30,7 @@ Each T3 Code task card displays the underlying provider harness instead of a gen
 
 - `codex` → **`T3-Codex`**
 - `claudeAgent` → **`T3-Claude`**
-- `acpRegistry_google_antigravity` → **`T3-Antigravity`**
+- `acpRegistry_google_antigravity` → **`T3-AGY`**
 - `acpRegistry_devin` → **`T3-Devin`**
 - `acpRegistry_glm_*` → **`T3-GLM`**
 - Other ACP / custom providers → **`T3-<Provider>`**
@@ -40,7 +40,7 @@ The usage strip follows the **last provider pressed** on any task button:
 - Pressing a `T3-Codex` card switches the usage display to **Codex** limits.
 - Pressing a `T3-Claude` card switches the usage display to **Claude** limits.
 - Pressing a `T3-GLM` card switches the usage display to **ZCode / Z.ai** limits.
-- Pressing a provider without a usage fetcher (such as `T3-Antigravity` or `T3-Devin`) leaves the current usage source in place rather than blanking the display.
+- Pressing a provider without a usage fetcher (such as `T3-AGY` or `T3-Devin`) leaves the current usage source in place rather than blanking the display.
 
 ## Deck behaviour (Windows)
 

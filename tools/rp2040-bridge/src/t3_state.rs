@@ -4,7 +4,7 @@
 //! `~/.t3/userdata/statev2.sqlite` (or `$T3CODE_HOME/userdata/statev2.sqlite`).
 //! The daemon polls this database read-only to mirror active and recent
 //! top-level threads onto the shared task board, tagging each card with its
-//! underlying provider harness (`T3-Codex`, `T3-Claude`, `T3-Antigravity`,
+//! underlying provider harness (`T3-Codex`, `T3-Claude`, `T3-AGY`,
 //! etc.). The bridge never writes to T3 Code's database or config files.
 
 use rusqlite::{Connection, OpenFlags};
@@ -51,7 +51,7 @@ pub fn is_valid_t3_identifier(value: &str) -> bool {
 }
 
 /// Formats a T3 provider identifier into the concise harness label rendered on
-/// task cards and touch strips (`T3-Codex`, `T3-Claude`, `T3-Antigravity`,
+/// task cards and touch strips (`T3-Codex`, `T3-Claude`, `T3-AGY`,
 /// `T3-Devin`, `T3-GLM`, etc.).
 pub fn format_provider_harness(provider: &str) -> String {
     let trimmed = provider.trim();
@@ -64,7 +64,7 @@ pub fn format_provider_harness(provider: &str) -> String {
     } else if lower == "claudeagent" || lower == "claude" || lower.contains("claude") {
         "Claude".to_owned()
     } else if lower.contains("antigravity") {
-        "Antigravity".to_owned()
+        "AGY".to_owned()
     } else if lower.contains("devin") {
         "Devin".to_owned()
     } else if lower.contains("glm") || lower.contains("zcode") || lower.contains("zai") {
@@ -203,6 +203,8 @@ fn read_t3_snapshot_from_connection(connection: &Connection, max_tasks: usize) -
     if max_tasks == 0 {
         return Some(json!({"tasks": []}));
     }
+    // A queued follow-up has a higher ordinal than the run it is waiting for.
+    // Use the active run's state, harness, and timing until it finishes.
     let mut statement = connection
         .prepare(
             "SELECT t.thread_id,
@@ -223,12 +225,23 @@ fn read_t3_snapshot_from_connection(connection: &Connection, max_tasks: usize) -
                     rr.payload_json
              FROM orchestration_v2_projection_threads AS t
              LEFT JOIN projection_projects AS p ON p.project_id = t.project_id
-             LEFT JOIN orchestration_v2_projection_runs AS r ON r.run_id = (
-                 SELECT latest.run_id
-                 FROM orchestration_v2_projection_runs AS latest
-                 WHERE latest.thread_id = t.thread_id
-                 ORDER BY latest.ordinal DESC, latest.requested_at DESC
-                 LIMIT 1
+             LEFT JOIN orchestration_v2_projection_runs AS r ON r.run_id = COALESCE(
+                 (
+                     SELECT active.run_id
+                     FROM orchestration_v2_projection_runs AS active
+                     WHERE active.thread_id = t.thread_id
+                       AND active.status IN ('running', 'starting', 'in_progress')
+                       AND active.completed_at IS NULL
+                     ORDER BY active.ordinal DESC, active.requested_at DESC
+                     LIMIT 1
+                 ),
+                 (
+                     SELECT latest.run_id
+                     FROM orchestration_v2_projection_runs AS latest
+                     WHERE latest.thread_id = t.thread_id
+                     ORDER BY latest.ordinal DESC, latest.requested_at DESC
+                     LIMIT 1
+                 )
              )
              LEFT JOIN orchestration_v2_projection_runtime_requests AS rr ON rr.runtime_request_id = (
                  SELECT pending.runtime_request_id
@@ -752,7 +765,7 @@ mod tests {
         assert_eq!(format_provider_harness("claudeAgent"), "T3-Claude");
         assert_eq!(
             format_provider_harness("acpRegistry_google_antigravity"),
-            "T3-Antigravity"
+            "T3-AGY"
         );
         assert_eq!(format_provider_harness("acpRegistry_devin"), "T3-Devin");
         assert_eq!(format_provider_harness("acpRegistry_glm_agent"), "T3-GLM");
@@ -773,6 +786,56 @@ mod tests {
             Some(1_776_256_245_500)
         );
         assert_eq!(parse_iso8601_ms("not-a-date"), None);
+    }
+
+    #[test]
+    fn queued_follow_up_keeps_the_active_run_blue() {
+        let conn = create_test_db();
+        conn.execute_batch(
+            r#"INSERT INTO orchestration_v2_projection_threads VALUES
+             ('thr-queue', 'p1', 'Queue a follow-up', 'codex', NULL, NULL, NULL,
+              '2026-04-15T10:00:00Z', '2026-04-15T10:06:00Z', NULL, NULL, '{}');
+             INSERT INTO orchestration_v2_projection_runs VALUES
+             ('run-active', 'thr-queue', 1, 'codex', NULL, 'running',
+              '2026-04-15T10:00:00Z', NULL,
+              '{"startedAt":"2026-04-15T10:01:00Z","modelSelection":{"model":"active-model"}}'),
+             ('run-queued', 'thr-queue', 2, 'claudeAgent', NULL, 'queued',
+              '2026-04-15T10:06:00Z', NULL, '{}');"#,
+        )
+        .unwrap();
+
+        let mut board = crate::tasks::TaskBoard::new();
+        board.set_device("deck", 1, true);
+        let snapshot = read_t3_snapshot_from_connection(&conn, 1).unwrap();
+        board
+            .publish_tasks(
+                crate::daemon::T3_POLL_SESSION,
+                crate::routing::AgentId::T3,
+                &snapshot,
+                1,
+            )
+            .unwrap();
+
+        let card = &board.rendered_slots("deck", 1)[0];
+        assert_eq!(card["status"], "running");
+        assert_eq!(card["c"], 0x1565c0);
+        assert_eq!(card["provider"], "codex");
+        assert_eq!(card["model"], "active-model");
+        assert_eq!(
+            card["started_at_ms"].as_u64(),
+            parse_iso8601_ms("2026-04-15T10:01:00Z")
+        );
+
+        conn.execute(
+            "UPDATE orchestration_v2_projection_runs
+             SET status = 'completed', completed_at = '2026-04-15T10:07:00Z'
+             WHERE run_id = 'run-active'",
+            [],
+        )
+        .unwrap();
+        let snapshot = read_t3_snapshot_from_connection(&conn, 1).unwrap();
+        assert_eq!(snapshot["tasks"][0]["state"], "queued");
+        assert!(snapshot["tasks"][0]["started_at_ms"].is_null());
     }
 
     #[test]
@@ -882,7 +945,7 @@ mod tests {
 
         assert_eq!(tasks[1]["task_id"], "t3:thr-running");
         assert_eq!(tasks[1]["state"], "running");
-        assert_eq!(tasks[1]["agent_label"], "T3-Antigravity");
+        assert_eq!(tasks[1]["agent_label"], "T3-AGY");
         assert_eq!(tasks[1]["model"], "gemini-4-neon");
         assert_eq!(tasks[1]["priority"], TASK_PRIORITY_ACTIVE);
 
