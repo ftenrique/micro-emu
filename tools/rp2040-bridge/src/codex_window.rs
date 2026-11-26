@@ -100,6 +100,10 @@ mod native {
         Ok(unsafe { GetForegroundWindow() } == target)
     }
 
+    pub fn desktop_running() -> bool {
+        find_codex_window().is_ok_and(|window| unsafe { IsWindowVisible(window) != 0 })
+    }
+
     pub fn minimize() -> Result<(), String> {
         let target = find_codex_window()?;
         unsafe {
@@ -460,6 +464,10 @@ mod native {
     }
 
     fn process_is_codex_desktop(process_id: u32) -> bool {
+        crate::proc_cache::cached("codex", process_id, check_codex_desktop_process)
+    }
+
+    fn check_codex_desktop_process(process_id: u32) -> bool {
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
         if process == 0 {
             return false;
@@ -553,9 +561,14 @@ mod native {
 
 #[cfg(windows)]
 pub use native::{
-    cycle_model, is_foreground, minimize, search_tasks, set_microphone, show_and_focus,
+    cycle_model, desktop_running, is_foreground, minimize, search_tasks, set_microphone, show_and_focus,
     toggle_terminal,
 };
+
+#[cfg(not(windows))]
+pub fn desktop_running() -> bool {
+    false
+}
 
 #[cfg(not(windows))]
 pub fn is_foreground() -> Result<bool, String> {

@@ -66,6 +66,7 @@ const T3_DESKTOP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// Codex desktop state is local and cheap to poll. A 250 ms interval keeps
 /// focus and lifecycle responsive without reading SQLite in the 10 ms loop.
 const CODEX_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CODEX_DESKTOP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// The loop ticks every ~10 ms, but rebuilding and diffing every controller's
 /// cards on each tick is wasted work. Idle ticks refresh at most this often;
 /// a tick that handled a task press refreshes immediately.
@@ -113,8 +114,7 @@ fn catalog_action_agent(session_id: usize) -> Option<AgentId> {
     }
 }
 
-/// Owner session for the synthetic Codex HID cards published from `v.oai.thstatus`.
-/// Matches `publish_codex_hid_status`, which hardcodes session 0.
+/// Shared synthetic owner for Codex desktop snapshots and the HID fallback.
 const CODEX_HID_SESSION: usize = 0;
 
 /// How long after the last `v.oai.thstatus` frame the Codex HID cards are kept
@@ -287,6 +287,29 @@ fn task_slots_for_agent(
         .count()
 }
 
+fn sync_codex_desktop_feed(
+    board: &mut crate::tasks::TaskBoard,
+    desktop_running: bool,
+    snapshot_available: &mut bool,
+    now_ms: u128,
+    read_snapshot: impl FnOnce() -> Option<Value>,
+) -> Result<bool, String> {
+    if !desktop_running {
+        if std::mem::take(snapshot_available) {
+            board.clear_session(CODEX_HID_SESSION);
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    let Some(snapshot) = read_snapshot() else {
+        return Ok(false);
+    };
+    board.publish_codex_snapshot(&snapshot, now_ms)?;
+    *snapshot_available = true;
+    Ok(true)
+}
+
 /// Refreshes the usage snapshots the current setup may display: the selected
 /// source always; other agents while their sessions are live or while a
 /// plugin deck is connected (its strips can render either agent). Returns
@@ -346,20 +369,9 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     }
     let mut saved_preferences = bridge.task_board.slot_preferences();
     let mut codex_snapshot_available = false;
-    if let Some(snapshot) = crate::codex_state::read_codex_snapshot(crate::tasks::CODEX_TASK_SLOTS)
-    {
-        match bridge
-            .task_board
-            .publish_codex_snapshot(&snapshot, now_ms())
-        {
-            Ok(_) => {
-                bridge.has_explicit_task_state = true;
-                codex_snapshot_available = true;
-            }
-            Err(error) => eprintln!("Codex state snapshot rejected: {error}"),
-        }
-    }
-    let mut next_codex_poll_at = Instant::now() + CODEX_TASK_POLL_INTERVAL;
+    let mut codex_desktop_active = crate::codex_window::desktop_running();
+    let mut next_codex_desktop_probe_at = Instant::now() + CODEX_DESKTOP_PROBE_INTERVAL;
+    let mut next_codex_poll_at = Instant::now();
     let mut next_loop_refresh_at = Instant::now();
     // A connected RP2040 alone does not claim a share of the deck.
     let mut session_agents = ActiveSet::new();
@@ -786,8 +798,17 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
             }
         }
 
-        // Refresh authoritative Codex task identity, metadata, focus, lifecycle,
-        // and exact timer timestamps independently of LCD presentation frames.
+        if now >= next_codex_desktop_probe_at {
+            next_codex_desktop_probe_at = now + CODEX_DESKTOP_PROBE_INTERVAL;
+            let running = crate::codex_window::desktop_running();
+            if running != codex_desktop_active {
+                codex_desktop_active = running;
+                next_codex_poll_at = now;
+            }
+        }
+
+        // Only a live desktop can project saved Codex threads onto the board.
+        // A headless MCP session can still publish its own task state.
         if now >= next_codex_poll_at {
             next_codex_poll_at = now + CODEX_TASK_POLL_INTERVAL;
             let total_slots = effective_task_slot_count(&bridge);
@@ -800,17 +821,25 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                     AgentId::Codex,
                 )
             };
-            if let Some(snapshot) = crate::codex_state::read_codex_snapshot(codex_slots) {
-                match bridge
-                    .task_board
-                    .publish_codex_snapshot(&snapshot, now_ms())
-                {
-                    Ok(_) => {
-                        bridge.has_explicit_task_state = true;
-                        codex_snapshot_available = true;
+            match sync_codex_desktop_feed(
+                &mut bridge.task_board,
+                codex_desktop_active,
+                &mut codex_snapshot_available,
+                now_ms(),
+                || crate::codex_state::read_codex_snapshot(codex_slots),
+            ) {
+                Ok(true) => {
+                    bridge.has_explicit_task_state = true;
+                    if !codex_snapshot_available {
+                        // The old serial presentation must not reappear if
+                        // clearing the desktop snapshot empties the board.
+                        bridge.last_thread_status = None;
+                        bridge.fused_lcd.clear_agent(AgentId::Codex);
+                        let _ = crate::refresh_task_board(&mut bridge);
                     }
-                    Err(error) => eprintln!("Codex state snapshot rejected: {error}"),
                 }
+                Ok(false) => {}
+                Err(error) => eprintln!("Codex state snapshot rejected: {error}"),
             }
         }
 
@@ -2173,6 +2202,64 @@ mod tests {
                 json!("zcode")
             ]
         );
+    }
+
+    #[test]
+    fn closed_codex_desktop_releases_auto_slots_and_keeps_live_tasks() {
+        let mut board = crate::tasks::TaskBoard::new();
+        board.set_device("deck", 3, true);
+        board.set_slot_owners("deck", task_slot_owners(3, None));
+        let mut snapshot_available = false;
+
+        let read_while_closed = || panic!("closed Codex Desktop must not read saved threads");
+        assert!(
+            !sync_codex_desktop_feed(&mut board, false, &mut snapshot_available, 1, read_while_closed)
+                .unwrap()
+        );
+
+        let saved = json!({"tasks":[
+            {"task_id":"saved-a", "state":"queued", "priority":40},
+            {"task_id":"saved-b", "state":"queued", "priority":40}
+        ]});
+        assert!(
+            sync_codex_desktop_feed(&mut board, true, &mut snapshot_available, 20, || Some(saved))
+                .unwrap()
+        );
+        board
+            .publish_tasks(
+                1,
+                AgentId::Codex,
+                &json!({"tasks":[{"task_id":"live-codex", "state":"running"}]}),
+                21,
+            )
+            .unwrap();
+        board
+            .publish_tasks(
+                2,
+                AgentId::T3,
+                &json!({"tasks":[
+                    {"task_id":"t3-a", "state":"queued", "priority":40},
+                    {"task_id":"t3-b", "state":"queued", "priority":40}
+                ]}),
+                10,
+            )
+            .unwrap();
+        assert!(board.assignment("t3-a").is_none());
+
+        assert!(
+            !sync_codex_desktop_feed(&mut board, true, &mut snapshot_available, 22, || None).unwrap()
+        );
+        assert!(snapshot_available);
+        assert!(
+            sync_codex_desktop_feed(&mut board, false, &mut snapshot_available, 23, read_while_closed)
+                .unwrap()
+        );
+
+        assert!(!snapshot_available);
+        assert!(!board.has_session_tasks(CODEX_HID_SESSION));
+        assert_eq!(board.assignment("live-codex").unwrap().slot.slot, 2);
+        assert_eq!(board.assignment("t3-a").unwrap().slot.slot, 0);
+        assert_eq!(board.assignment("t3-b").unwrap().slot.slot, 1);
     }
     #[test]
     fn hermes_desktop_probe_claims_the_shared_half_without_zcode() {

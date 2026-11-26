@@ -366,6 +366,10 @@ impl FusedLcdState {
         Self::default()
     }
 
+    pub fn clear_agent(&mut self, agent: AgentId) {
+        self.entries[agent.index()].fill(None);
+    }
+
     /// Merges a `v.oai.thstatus` payload from `agent`, storing entries in
     /// the agent's local buffer (up to `LCD_SLOTS`). Returns the fused
     /// array rendered through the current partition.

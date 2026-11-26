@@ -1183,9 +1183,8 @@ impl TaskBoard {
             })
         });
 
-        // 2. Pin legacy synthetic `codex-hid:N` cards to their matching
-        // physical hardware slot when compatible.
-        self.pin_codex_hid_primary_slots();
+        // 2. Prefer matching hardware positions for new Codex HID cards.
+        self.prefer_codex_hid_primary_slots();
 
         // 3. Sticky pass: unassigned eligible tasks reclaim their previous slot
         // when it is still free and pin-compatible, processed in urgency order
@@ -1358,21 +1357,20 @@ impl TaskBoard {
         self.slot_owners.get(slot.slot).copied().flatten()
     }
 
-    /// Codex HID task IDs (`codex-hid:N`) are logical hardware positions from
-    /// RP2040 serial fallback mode. Keep each one on its matching primary slot
-    /// when that slot is compatible and not held by a more urgent active task.
-    fn pin_codex_hid_primary_slots(&mut self) {
+    /// Prefer the matching position for RP2040 fallback cards when it is free.
+    /// Occupied buttons can only be reused by the shared eviction rules.
+    fn prefer_codex_hid_primary_slots(&mut self) {
         let Some(primary_device_id) = self.partitioned_device_id.clone() else {
             return;
         };
         let Some(primary_slots) = self.devices.get(&primary_device_id).cloned() else {
             return;
         };
-        let mut pins: Vec<(String, DeviceSlot)> = self
+        let mut preferred: Vec<(String, DeviceSlot)> = self
             .tasks
             .values()
             .filter_map(|task| {
-                if !task.task_id.starts_with("codex-hid:") {
+                if !task.state.eligible() || !task.task_id.starts_with("codex-hid:") {
                     return None;
                 }
                 (task.owner_agent == AgentId::Codex)
@@ -1392,23 +1390,13 @@ impl TaskBoard {
                     .map(|slot| (task.task_id.clone(), slot))
             })
             .collect();
-        pins.sort_by(|(left, _), (right, _)| left.cmp(right));
-        for (task_id, slot) in pins {
-            let blocked_by_other_active = self.assignments.iter().any(|(assigned_id, assignment)| {
-                assigned_id != &task_id
-                    && assignment.slot == slot
-                    && self
-                        .tasks
-                        .get(assigned_id)
-                        .is_some_and(|occupant| occupant.owner_agent != AgentId::Codex && is_active_tier(occupant))
-            });
-            if blocked_by_other_active {
-                continue;
+        preferred.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (task_id, slot) in preferred {
+            if !self.assignments.contains_key(&task_id)
+                && !self.assignments.values().any(|assignment| assignment.slot == slot)
+            {
+                self.assignments.insert(task_id, TaskAssignment { slot });
             }
-            self.assignments.retain(|assigned_task, assignment| {
-                assigned_task == &task_id || assignment.slot != slot
-            });
-            self.assignments.insert(task_id, TaskAssignment { slot });
         }
     }
 }
@@ -2729,6 +2717,39 @@ mod tests {
 
         assert_eq!(board.assignment("codex-hid:0").unwrap().slot.slot, 0);
         assert_eq!(board.assignment("z").unwrap().slot.slot, 3);
+    }
+
+    #[test]
+    fn codex_hid_slot_preference_does_not_displace_a_newer_auto_card() {
+        let mut board = TaskBoard::new();
+        board.set_device("deck", 1, true);
+        board.set_slot_owners("deck", vec![None]);
+        board
+            .publish_tasks(
+                1,
+                AgentId::T3,
+                &json!({"tasks": [task("t3-finished", "completed", 50)]}),
+                20,
+            )
+            .unwrap();
+
+        board
+            .publish_codex_hid_status(
+                &json!([{"id": 0, "e": 1, "status": "queued", "priority": 50}]),
+                10,
+            )
+            .unwrap();
+        assert!(board.assignment("t3-finished").is_some());
+        assert!(board.assignment("codex-hid:0").is_none());
+
+        board
+            .publish_codex_hid_status(
+                &json!([{"id": 0, "e": 2, "status": "running", "priority": 50}]),
+                30,
+            )
+            .unwrap();
+        assert!(board.assignment("t3-finished").is_none());
+        assert!(board.assignment("codex-hid:0").is_some());
     }
 
     #[test]
